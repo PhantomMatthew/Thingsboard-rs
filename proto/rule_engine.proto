@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package tb.ruleengine;
+
+import "common.proto";
+
+// 规则引擎消息
+message TbMsgProto {
+  string id = 1;                    // 消息 UUID
+  string queue_name = 2;            // 目标队列（默认 Main）
+  string type = 3;                  // POST_TELEMETRY_REQUEST / POST_ATTRIBUTES_REQUEST / CONNECT_EVENT ...
+  string originator_id = 4;         // 分区 key
+  tb.common.EntityType originator_type = 5;
+  string tenant_id = 6;
+  string customer_id = 7;
+  string data_json = 8;             // 消息体 JSON（遥测 kvs、属性 kvs、RPC 调用等）
+  map<string, string> metadata = 9;
+  string rule_chain_id = 10;        // 指定入口规则链（可空 = 租户根链）
+  string rule_node_id = 11;         // 指定入口节点（checkpoint 用）
+  int64 ts = 12;
+}
+
+message ToRuleEngineMsg {
+  string tenant_id = 1;
+  TbMsgProto tb_msg = 2;
+}

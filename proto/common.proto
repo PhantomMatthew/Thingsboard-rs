@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package tb.common;
+
+enum EntityType {
+  ENTITY_TYPE_UNSPECIFIED = 0;
+  TENANT = 1;
+  CUSTOMER = 2;
+  USER = 3;
+  DEVICE = 4;
+  DEVICE_PROFILE = 5;
+  ASSET = 6;
+  ASSET_PROFILE = 7;
+  DASHBOARD = 8;
+  RULE_CHAIN = 9;
+  RULE_NODE = 10;
+  OTA_PACKAGE = 11;
+  ALARM = 12;
+  EDGE = 13;
+}
+
+enum AttributeScope {
+  SCOPE_UNSPECIFIED = 0;
+  CLIENT_SCOPE = 1;
+  SERVER_SCOPE = 2;
+  SHARED_SCOPE = 3;
+}
+
+enum CredentialsType {
+  CREDENTIALS_TYPE_UNSPECIFIED = 0;
+  ACCESS_TOKEN = 1;
+  X509_CERTIFICATE = 2;
+  MQTT_BASIC = 3;
+}
+
+enum OtaPackageType {
+  OTA_TYPE_UNSPECIFIED = 0;
+  FIRMWARE = 1;
+  SOFTWARE = 2;
+}
+
+// 遥测/属性通用值
+message KeyValueProto {
+  int32 key_id = 1;     // key_dictionary  interning 后的 id
+  oneof value {
+    bool bool_v = 2;
+    string str_v = 3;
+    int64 long_v = 4;
+    double dbl_v = 5;
+    string json_v = 6;
+  }
+}
+
+message TsKvProto {
+  int64 ts = 1; // epoch millis
+  KeyValueProto kv = 2;
+}

@@ -1,0 +1,135 @@
+syntax = "proto3";
+
+package tb.core;
+
+import "common.proto";
+
+// ---- Transport → Core 异步消息（tb_core topic）----
+
+message SessionInfoProto {
+  string node_id = 1;        // transport 节点 id
+  string session_id = 2;     // UUID
+  string tenant_id = 3;
+  string device_id = 4;
+  string device_profile_id = 5;
+  string device_name = 6;
+  string device_type = 7;
+  bool is_gateway = 8;
+  string gateway_session_id = 9; // 子设备会话时指向网关物理会话
+}
+
+message ToCoreMsg {
+  string tenant_id = 1;
+  string entity_id = 2;   // 分区 key：设备/资产 id
+  oneof msg {
+    SessionOpenMsg session_open = 3;
+    SessionCloseMsg session_close = 4;
+    SubscribeAttributesMsg subscribe_attributes = 5;
+    SubscribeRpcMsg subscribe_rpc = 6;
+    DeviceActivityMsg device_activity = 7;
+    RpcResponseMsg rpc_response = 8;
+    ClaimDeviceMsg claim_device = 9;
+    GetAttributesRequestMsg get_attributes = 10;
+    UplinkNotificationMsg uplink_notification = 11;
+  }
+}
+
+message SessionOpenMsg {
+  SessionInfoProto session = 1;
+}
+
+message SessionCloseMsg {
+  SessionInfoProto session = 1;
+  string reason = 2;
+}
+
+message SubscribeAttributesMsg {
+  SessionInfoProto session = 1;
+  bool subscribe = 2;
+}
+
+message SubscribeRpcMsg {
+  SessionInfoProto session = 1;
+  bool subscribe = 2;
+}
+
+message DeviceActivityMsg {
+  SessionInfoProto session = 1;
+  int64 last_activity_ts = 2;
+}
+
+message RpcResponseMsg {
+  SessionInfoProto session = 1;
+  int32 request_id = 2;
+  string payload_json = 3;
+  string error = 4; // 空表示成功
+}
+
+message ClaimDeviceMsg {
+  SessionInfoProto session = 1;
+  string secret_key = 2;
+  int64 duration_ms = 3;
+}
+
+message GetAttributesRequestMsg {
+  SessionInfoProto session = 1;
+  int32 request_id = 2;
+  repeated string client_keys = 3;
+  repeated string shared_keys = 4;
+}
+
+message UplinkNotificationMsg {
+  SessionInfoProto session = 1;
+  int32 uplink_msg_id = 2;
+}
+
+// ---- Core → Transport 通知（tb_transport.notifications.<node_id>）----
+
+message ToTransportMsg {
+  string session_id = 1;
+  string entity_id = 2;
+  oneof msg {
+    SessionCloseNotification session_close_notification = 3;
+    AttributeUpdateNotification attribute_update = 4;
+    GetAttributesResponseMsg get_attributes_response = 5;
+    ToDeviceRpcRequestMsg to_device_rpc = 6;
+    ToServerRpcResponseMsg to_server_rpc_response = 7;
+    EntityUpdatedMsg entity_updated = 8;
+  }
+}
+
+message SessionCloseNotification {
+  string reason = 1;
+}
+
+message AttributeUpdateNotification {
+  tb.common.AttributeScope scope = 1;
+  repeated tb.common.KeyValueProto attributes = 2;
+}
+
+message GetAttributesResponseMsg {
+  int32 request_id = 1;
+  repeated tb.common.KeyValueProto client_attributes = 2;
+  repeated tb.common.KeyValueProto shared_attributes = 3;
+  string error = 4;
+}
+
+message ToDeviceRpcRequestMsg {
+  int32 request_id = 1;
+  string method = 2;
+  string params_json = 3;
+  int64 expiration_ts = 4; // 超时未响应作废
+  bool persisted = 5;
+}
+
+message ToServerRpcResponseMsg {
+  int32 request_id = 1;
+  string payload_json = 2;
+  string error = 3;
+}
+
+message EntityUpdatedMsg {
+  tb.common.EntityType entity_type = 1;
+  string entity_id = 2;
+  string update_kind = 3; // CREATED / UPDATED / DELETED / CREDENTIALS_UPDATED
+}

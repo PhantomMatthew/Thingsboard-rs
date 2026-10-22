@@ -1,0 +1,104 @@
+syntax = "proto3";
+
+package tb.transport;
+
+import "common.proto";
+
+// ---- Transport → Core 同步请求/响应 API ----
+
+message TransportApiRequestMsg {
+  string request_id = 1; // UUID，响应原样带回
+  oneof request {
+    ValidateTokenRequest validate_token = 2;
+    ValidateMqttBasicRequest validate_mqtt_basic = 3;
+    ValidateX509Request validate_x509 = 4;
+    GetDeviceProfileRequest get_device_profile = 5;
+    GetOrCreateGatewayDeviceRequest get_or_create_gateway_device = 6;
+    GetOtaPackageRequest get_ota_package = 7;
+  }
+}
+
+message TransportApiResponseMsg {
+  string request_id = 1;
+  oneof response {
+    ValidateCredentialsResponse validate_credentials = 2;
+    DeviceProfileProto device_profile = 3;
+    DeviceInfoProto gateway_device = 4;
+    OtaPackageProto ota_package = 5;
+    TransportApiError error = 6;
+  }
+}
+
+message ValidateTokenRequest {
+  string token = 1; // device access token
+}
+
+message ValidateMqttBasicRequest {
+  string client_id = 1;
+  string username = 2;
+  string password = 3;
+}
+
+message ValidateX509Request {
+  string cert_hash = 1; // 客户端证书 SHA3-256 hex
+}
+
+message GetDeviceProfileRequest {
+  string device_profile_id = 1;
+}
+
+message GetOrCreateGatewayDeviceRequest {
+  string gateway_id = 1;      // 网关设备 entity id
+  string tenant_id = 2;
+  string device_name = 3;     // 子设备名
+  string device_type = 4;     // 可选，默认 "default"
+}
+
+message GetOtaPackageRequest {
+  string tenant_id = 1;
+  string device_profile_id = 2;
+  tb.common.OtaPackageType type = 3;
+  string current_title = 4;
+  string current_version = 5;
+}
+
+message ValidateCredentialsResponse {
+  bool valid = 1;
+  DeviceInfoProto device = 2;      // valid=true 时填充
+  DeviceProfileProto profile = 3;
+  string credentials_body = 4;     // 凭证原文（如 MQTT_BASIC JSON）
+}
+
+message DeviceInfoProto {
+  string device_id = 1;
+  string tenant_id = 2;
+  string customer_id = 3; // 可空
+  string device_profile_id = 4;
+  string device_name = 5;
+  string device_type = 6;
+}
+
+message DeviceProfileProto {
+  string device_profile_id = 1;
+  string tenant_id = 2;
+  string name = 3;
+  string transport_type = 4; // DEFAULT / MQTT / HTTP / COAP ...
+  bool provision_enabled = 5;
+  string profile_data_json = 6;  // 档案完整配置（JSON）
+}
+
+message OtaPackageProto {
+  string ota_package_id = 1;
+  string title = 2;
+  string version = 3;
+  string tag = 4;
+  string file_name = 5;
+  string content_type = 6;
+  string checksum = 7;   // sha256 hex
+  int64 size = 8;
+}
+
+message TransportApiError {
+  int32 code = 1;
+  string message = 2;
+}

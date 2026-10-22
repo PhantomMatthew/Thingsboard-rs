@@ -1,0 +1,19 @@
+[package]
+name = "tb-dao"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tb-common = { path = "../tb-common" }
+
+[dev-dependencies]
+tokio.workspace = true

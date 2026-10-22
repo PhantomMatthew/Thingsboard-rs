@@ -1,0 +1,15 @@
+[package]
+name = "tb-queue"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+rdkafka.workspace = true
+tb-common = { path = "../tb-common" }

@@ -1,0 +1,117 @@
+//! 分页请求/响应结构，对齐 ThingsBoard 的 PageLink / PageData。
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageLink {
+    pub page: i64,
+    pub page_size: i64,
+    pub text_search: Option<String>,
+    pub sort_property: Option<String>,
+    /// ASC / DESC（大小写不敏感，非法值按 DESC 处理）。
+    pub sort_order: Option<String>,
+}
+
+impl PageLink {
+    pub fn new(page: i64, page_size: i64) -> Self {
+        Self {
+            page,
+            page_size,
+            text_search: None,
+            sort_property: None,
+            sort_order: None,
+        }
+    }
+
+    pub fn offset(&self) -> i64 {
+        self.page.max(0) * self.page_size.max(1)
+    }
+
+    pub fn limit(&self) -> i64 {
+        self.page_size.max(1)
+    }
+
+    /// 排序列白名单校验：命中白名单返回该列，否则回退 created_time。
+    pub fn sort_column<'a>(&self, allowed: &'a [&'a str]) -> &'a str {
+        match &self.sort_property {
+            Some(p) => allowed
+                .iter()
+                .copied()
+                .find(|c| c == p)
+                .unwrap_or("created_time"),
+            None => "created_time",
+        }
+    }
+
+    pub fn sort_order_sql(&self) -> &'static str {
+        match self.sort_order.as_deref() {
+            Some(o) if o.eq_ignore_ascii_case("asc") => "ASC",
+            _ => "DESC",
+        }
+    }
+
+    /// ILIKE 匹配模式（小写，配合 LOWER(column)）。
+    pub fn search_pattern(&self) -> Option<String> {
+        self.text_search
+            .as_ref()
+            .map(|t| format!("%{}%", t.to_lowercase()))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageData<T> {
+    pub data: Vec<T>,
+    pub total_pages: i64,
+    pub total_elements: i64,
+    pub has_next: bool,
+}
+
+impl<T> PageData<T> {
+    pub fn new(data: Vec<T>, total_elements: i64, page: i64, page_size: i64) -> Self {
+        let page_size = page_size.max(1);
+        let total_pages = (total_elements + page_size - 1) / page_size;
+        Self {
+            data,
+            total_pages,
+            total_elements,
+            has_next: page + 1 < total_pages,
+        }
+    }
+}
+
+impl<T> Default for PageData<T> {
+    fn default() -> Self {
+        Self {
+            data: Vec::new(),
+            total_pages: 0,
+            total_elements: 0,
+            has_next: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sort_column_whitelist() {
+        let mut link = PageLink::new(0, 10);
+        assert_eq!(link.sort_column(&["name", "title"]), "created_time");
+        link.sort_property = Some("name".into());
+        assert_eq!(link.sort_column(&["name", "title"]), "name");
+        link.sort_property = Some("name; DROP TABLE tenant;--".into());
+        assert_eq!(link.sort_column(&["name", "title"]), "created_time");
+    }
+
+    #[test]
+    fn page_data_flags() {
+        let p = PageData::new(vec![1, 2], 5, 0, 2);
+        assert_eq!(p.total_pages, 3);
+        assert!(p.has_next);
+        let p = PageData::new(vec![5], 5, 2, 2);
+        assert!(!p.has_next);
+    }
+}

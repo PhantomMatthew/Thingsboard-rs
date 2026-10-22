@@ -1,0 +1,57 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/tb-common",
+    "crates/tb-proto",
+    "crates/tb-queue",
+    "crates/tb-dao",
+    "crates/tb-script",
+    "services/tb-auth",
+    "services/tb-core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+prost = "0.14"
+prost-build = "0.14"
+bytes = "1"
+futures = "0.3"
+async-trait = "0.1"
+anyhow = "1"
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+sqlx = { version = "0.8", features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "uuid",
+    "chrono",
+    "json",
+    "migrate",
+] }
+rdkafka = { version = "0.38", features = ["tokio"] }
+jsonwebtoken = "10"
+bcrypt = "0.17"
+moka = { version = "0.12", features = ["future"] }
+redis = { version = "0.32", features = ["tokio-comp"] }
+rhai = "1"
+config = "0.15"
+once_cell = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,11 @@
+[package]
+name = "tb-script"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+rhai.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tb-common = { path = "../tb-common" }
