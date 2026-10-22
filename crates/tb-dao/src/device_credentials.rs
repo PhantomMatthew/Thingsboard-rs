@@ -89,12 +89,11 @@ impl DeviceCredentialsDao {
         let mut tx = self.pool.begin().await.map_err(TbError::db)?;
 
         let mut d = device.clone();
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM device WHERE id = $1)")
-                .bind(d.id)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(TbError::db)?;
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM device WHERE id = $1)")
+            .bind(d.id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(TbError::db)?;
         if exists {
             sqlx::query(
                 "UPDATE device SET tenant_id=$2, customer_id=$3, device_profile_id=$4, name=$5, \

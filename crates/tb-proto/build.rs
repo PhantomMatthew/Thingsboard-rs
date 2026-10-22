@@ -1,6 +1,5 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let proto_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../proto");
+    let proto_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../proto");
 
     let files = [
         proto_dir.join("common.proto"),
@@ -13,7 +12,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("cargo:rerun-if-changed={}", f.display());
     }
 
-    prost_build::Config::new()
-        .compile_protos(&files, &[proto_dir])?;
+    prost_build::Config::new().compile_protos(&files, &[proto_dir])?;
     Ok(())
 }

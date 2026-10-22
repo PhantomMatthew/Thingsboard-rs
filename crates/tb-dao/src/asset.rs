@@ -5,8 +5,8 @@ use tb_common::{TbError, TbResult};
 use uuid::Uuid;
 
 use crate::models::Asset;
-use crate::page::{PageData, PageLink};
 use crate::now_ms;
+use crate::page::{PageData, PageLink};
 
 pub struct AssetDao {
     pool: PgPool,
@@ -106,7 +106,12 @@ impl AssetDao {
         .fetch_all(&self.pool)
         .await
         .map_err(TbError::db)?;
-        Ok(PageData::new(data, total, page_link.page, page_link.page_size))
+        Ok(PageData::new(
+            data,
+            total,
+            page_link.page,
+            page_link.page_size,
+        ))
     }
 
     pub async fn find_by_customer_id(
@@ -141,6 +146,11 @@ impl AssetDao {
         .fetch_all(&self.pool)
         .await
         .map_err(TbError::db)?;
-        Ok(PageData::new(data, total, page_link.page, page_link.page_size))
+        Ok(PageData::new(
+            data,
+            total,
+            page_link.page,
+            page_link.page_size,
+        ))
     }
 }

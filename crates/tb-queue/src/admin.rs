@@ -5,11 +5,7 @@ use rdkafka::config::ClientConfig;
 use crate::QueueError;
 
 /// 创建 topic（幂等，已存在则忽略）。
-pub async fn ensure_topic(
-    brokers: &str,
-    topic: &str,
-    partitions: i32,
-) -> Result<(), QueueError> {
+pub async fn ensure_topic(brokers: &str, topic: &str, partitions: i32) -> Result<(), QueueError> {
     let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
         .set("bootstrap.servers", brokers)
         .create()?;

@@ -25,11 +25,7 @@ pub struct StreamQueueConsumer {
 }
 
 impl StreamQueueConsumer {
-    pub fn new(
-        brokers: &str,
-        group_id: &str,
-        topics: &[&str],
-    ) -> Result<Self, QueueError> {
+    pub fn new(brokers: &str, group_id: &str, topics: &[&str]) -> Result<Self, QueueError> {
         let inner: StreamConsumer = ClientConfig::new()
             .set("bootstrap.servers", brokers)
             .set("group.id", group_id)

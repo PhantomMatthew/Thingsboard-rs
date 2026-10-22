@@ -23,3 +23,6 @@ tb-proto = { path = "../../crates/tb-proto" }
 tb-queue = { path = "../../crates/tb-queue" }
 tb-dao = { path = "../../crates/tb-dao" }
 tb-auth = { path = "../tb-auth" }
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json"] }

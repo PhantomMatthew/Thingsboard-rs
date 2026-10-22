@@ -5,8 +5,8 @@ use tb_common::{TbError, TbResult};
 use uuid::Uuid;
 
 use crate::models::{User, UserCredentials};
-use crate::page::{PageData, PageLink};
 use crate::now_ms;
+use crate::page::{PageData, PageLink};
 
 pub struct UserDao {
     pool: PgPool,
@@ -116,7 +116,12 @@ impl UserDao {
         .fetch_all(&self.pool)
         .await
         .map_err(TbError::db)?;
-        Ok(PageData::new(data, total, page_link.page, page_link.page_size))
+        Ok(PageData::new(
+            data,
+            total,
+            page_link.page,
+            page_link.page_size,
+        ))
     }
 
     pub async fn find_by_customer_id(
@@ -151,7 +156,12 @@ impl UserDao {
         .fetch_all(&self.pool)
         .await
         .map_err(TbError::db)?;
-        Ok(PageData::new(data, total, page_link.page, page_link.page_size))
+        Ok(PageData::new(
+            data,
+            total,
+            page_link.page,
+            page_link.page_size,
+        ))
     }
 }
 
@@ -192,12 +202,10 @@ impl UserCredentialsDao {
     }
 
     pub async fn find_by_user_id(&self, user_id: Uuid) -> TbResult<Option<UserCredentials>> {
-        sqlx::query_as::<_, UserCredentials>(
-            "SELECT * FROM user_credentials WHERE user_id = $1",
-        )
-        .bind(user_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(TbError::db)
+        sqlx::query_as::<_, UserCredentials>("SELECT * FROM user_credentials WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(TbError::db)
     }
 }

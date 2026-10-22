@@ -332,7 +332,9 @@ impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for EntityRelation {
                 .parse()
                 .map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
             to_id: row.try_get("to_id")?,
-            to_type: to_type.parse().map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
+            to_type: to_type
+                .parse()
+                .map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
             relation_type_group: row.try_get("relation_type_group")?,
             relation_type: row.try_get("relation_type")?,
             additional_info: row.try_get("additional_info")?,

@@ -120,11 +120,7 @@ mod tests {
 
     #[test]
     fn entity_type_roundtrip() {
-        for t in [
-            EntityType::Tenant,
-            EntityType::Device,
-            EntityType::Alarm,
-        ] {
+        for t in [EntityType::Tenant, EntityType::Device, EntityType::Alarm] {
             assert_eq!(EntityType::from_str(t.as_str()).unwrap(), t);
         }
     }

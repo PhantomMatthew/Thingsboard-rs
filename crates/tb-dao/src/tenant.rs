@@ -5,8 +5,8 @@ use tb_common::{TbError, TbResult};
 use uuid::Uuid;
 
 use crate::models::{Tenant, TenantProfile};
-use crate::page::{PageData, PageLink};
 use crate::now_ms;
+use crate::page::{PageData, PageLink};
 
 pub struct TenantDao {
     pool: PgPool,
@@ -109,7 +109,12 @@ impl TenantDao {
         .fetch_all(&self.pool)
         .await
         .map_err(TbError::db)?;
-        Ok(PageData::new(data, total, page_link.page, page_link.page_size))
+        Ok(PageData::new(
+            data,
+            total,
+            page_link.page,
+            page_link.page_size,
+        ))
     }
 }
 

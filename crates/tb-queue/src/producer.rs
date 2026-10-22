@@ -34,9 +34,7 @@ impl QueueProducer for KafkaQueueProducer {
     async fn send(&self, topic: &str, key: &str, payload: Bytes) -> Result<(), QueueError> {
         self.inner
             .send(
-                FutureRecord::to(topic)
-                    .key(key)
-                    .payload(payload.as_ref()),
+                FutureRecord::to(topic).key(key).payload(payload.as_ref()),
                 Duration::from_secs(10),
             )
             .await

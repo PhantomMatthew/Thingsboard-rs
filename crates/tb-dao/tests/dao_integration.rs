@@ -121,7 +121,10 @@ async fn tenant_customer_user_cascade() -> TbResult<()> {
     };
     let user = user_dao.save(&user).await?;
 
-    let found = user_dao.find_by_email(&email).await?.expect("user by email");
+    let found = user_dao
+        .find_by_email(&email)
+        .await?
+        .expect("user by email");
     assert_eq!(found.id, user.id);
     assert_eq!(found.authority, Authority::CustomerUser);
 
@@ -164,7 +167,10 @@ async fn device_with_credentials_transaction() -> TbResult<()> {
         .save(&new_device_profile(tenant.id, &uniq("profile"), true))
         .await?;
 
-    let default = profile_dao.find_default(tenant.id).await?.expect("default profile");
+    let default = profile_dao
+        .find_default(tenant.id)
+        .await?
+        .expect("default profile");
     assert_eq!(default.id, profile.id);
 
     let device = new_device(tenant.id, profile.id, &uniq("device"));
@@ -209,7 +215,9 @@ async fn device_with_credentials_transaction() -> TbResult<()> {
         credentials_id: Some(new_token.clone()),
         credentials_value: None,
     };
-    cred_dao.save_device_with_credentials(&device2, &cred2).await?;
+    cred_dao
+        .save_device_with_credentials(&device2, &cred2)
+        .await?;
     let reloaded = cred_dao.find_by_device_id(saved_device.id).await?.unwrap();
     assert_eq!(reloaded.credentials_id.as_deref(), Some(new_token.as_str()));
 
@@ -284,12 +292,20 @@ async fn relation_crud() -> TbResult<()> {
     relation_dao.save(&relation).await?;
 
     let found = relation_dao
-        .find_relation(from_id, EntityType::Device, to_id, EntityType::Asset, "Contains")
+        .find_relation(
+            from_id,
+            EntityType::Device,
+            to_id,
+            EntityType::Asset,
+            "Contains",
+        )
         .await?
         .expect("exact relation");
     assert_eq!(found.relation_type_group, "COMMON");
 
-    let by_from = relation_dao.find_by_from(from_id, EntityType::Device).await?;
+    let by_from = relation_dao
+        .find_by_from(from_id, EntityType::Device)
+        .await?;
     assert_eq!(by_from.len(), 1);
     let by_to = relation_dao.find_by_to(to_id, EntityType::Asset).await?;
     assert_eq!(by_to.len(), 1);
@@ -297,7 +313,13 @@ async fn relation_crud() -> TbResult<()> {
     assert!(relation_dao.delete(&relation).await?);
     assert!(
         relation_dao
-            .find_relation(from_id, EntityType::Device, to_id, EntityType::Asset, "Contains")
+            .find_relation(
+                from_id,
+                EntityType::Device,
+                to_id,
+                EntityType::Asset,
+                "Contains"
+            )
             .await?
             .is_none()
     );
