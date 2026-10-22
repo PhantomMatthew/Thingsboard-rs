@@ -184,8 +184,7 @@ async fn save_timeseries(
     let entity_type = EntityType::from_str(&entity_type)?;
     check_entity_access(&state, &user, entity_type, entity_id).await?;
     let entries = payload.into_entries(now_ms());
-    state.timeseries_dao.save(entity_id, &entries).await?;
-    telemetry_cache::update_latest(&state, entity_id, &entries).await;
+    telemetry_cache::save_with_latest(&state, entity_id, &entries).await?;
     Ok(StatusCode::OK)
 }
 

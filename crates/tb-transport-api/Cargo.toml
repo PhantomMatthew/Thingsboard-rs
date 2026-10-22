@@ -1,0 +1,19 @@
+[package]
+name = "tb-transport-api"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+prost.workspace = true
+bytes.workspace = true
+moka.workspace = true
+tb-common = { path = "../tb-common" }
+tb-proto = { path = "../tb-proto" }
+tb-queue = { path = "../tb-queue" }

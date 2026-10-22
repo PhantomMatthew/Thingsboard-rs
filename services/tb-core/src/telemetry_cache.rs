@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
-use tb_common::TsKvEntry;
+use tb_common::{TbResult, TsKvEntry};
 use uuid::Uuid;
 
 use crate::AppState;
@@ -126,6 +126,17 @@ pub async fn update_latest(state: &AppState, entity_id: Uuid, entries: &[TsKvEnt
     if let Err(e) = conn.expire::<_, bool>(&key, TTL_SECS).await {
         tracing::warn!("redis EXPIRE failed: {e}");
     }
+}
+
+/// 遥测落库 + latest 缓存 write-through（REST 路由与 Kafka ingest 共用）。
+pub async fn save_with_latest(
+    state: &AppState,
+    entity_id: Uuid,
+    entries: &[TsKvEntry],
+) -> TbResult<()> {
+    state.timeseries_dao.save(entity_id, entries).await?;
+    update_latest(state, entity_id, entries).await;
+    Ok(())
 }
 
 /// 全量删除部分 key 后同步剔除缓存 field（保留 __full__ 标记）。

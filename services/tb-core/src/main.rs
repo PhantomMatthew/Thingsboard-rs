@@ -34,8 +34,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState::new(pool, Arc::new(JwtTokenFactory::from_env()));
     tb_core::seed::seed(&state).await?;
 
+    let transport_api = tb_core::transport_api::start_transport_api(state.clone()).await;
+    let ingest = tb_core::telemetry_ingest::start_telemetry_ingest(state.clone()).await;
+
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!(port, "tb-core listening");
-    axum::serve(listener, build_router(state)).await?;
+    axum::serve(listener, build_router(state))
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
+    transport_api.abort();
+    ingest.abort();
     Ok(())
 }

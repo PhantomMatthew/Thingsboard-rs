@@ -2808,6 +2808,7 @@ name = "tb-core"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
  "chrono",
  "prost",
  "redis",
@@ -2878,6 +2879,47 @@ dependencies = [
  "serde_json",
  "tb-common",
  "thiserror",
+]
+
+[[package]]
+name = "tb-transport-api"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "chrono",
+ "moka",
+ "prost",
+ "serde_json",
+ "tb-common",
+ "tb-proto",
+ "tb-queue",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "tb-transport-http"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tb-auth",
+ "tb-common",
+ "tb-core",
+ "tb-dao",
+ "tb-proto",
+ "tb-queue",
+ "tb-transport-api",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

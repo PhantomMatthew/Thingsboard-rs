@@ -6,8 +6,10 @@ members = [
     "crates/tb-queue",
     "crates/tb-dao",
     "crates/tb-script",
+    "crates/tb-transport-api",
     "services/tb-auth",
     "services/tb-core",
+    "services/tb-transport-http",
 ]
 
 [workspace.package]
