@@ -1,0 +1,34 @@
+[package]
+name = "tb-transport-mqtt"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+bytes.workspace = true
+prost.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+dashmap.workspace = true
+tb-common = { path = "../../crates/tb-common" }
+tb-proto = { path = "../../crates/tb-proto" }
+tb-queue = { path = "../../crates/tb-queue" }
+tb-transport-api = { path = "../../crates/tb-transport-api" }
+
+[dev-dependencies]
+rumqttc = "0.24"
+axum.workspace = true
+reqwest = { version = "0.12", features = ["json"] }
+tokio.workspace = true
+tb-core = { path = "../tb-core" }
+tb-auth = { path = "../tb-auth" }
+tb-dao = { path = "../../crates/tb-dao" }
+sqlx.workspace = true

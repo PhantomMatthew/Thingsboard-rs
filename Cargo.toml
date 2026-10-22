@@ -10,6 +10,7 @@ members = [
     "services/tb-auth",
     "services/tb-core",
     "services/tb-transport-http",
+    "services/tb-transport-mqtt",
 ]
 
 [workspace.package]
@@ -53,6 +54,7 @@ redis = { version = "0.32", features = ["tokio-comp", "connection-manager"] }
 rhai = "1"
 config = "0.15"
 once_cell = "1"
+dashmap = "6"
 
 [profile.release]
 lto = "thin"
