@@ -1,7 +1,7 @@
 //! 单连接会话：CONNECT 认证 → tb_core session_open → topic 路由 → session_close。
 //! topic 约定对齐 Java MqttTopics（v1/devices/me/...）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -33,6 +33,7 @@ pub const TOPIC_TELEMETRY: &str = "v1/devices/me/telemetry";
 pub const TOPIC_ATTRIBUTES: &str = "v1/devices/me/attributes";
 pub const TOPIC_ATTRIBUTES_REQUEST_PREFIX: &str = "v1/devices/me/attributes/request/";
 pub const TOPIC_RPC_REQUEST_PREFIX: &str = "v1/devices/me/rpc/request/";
+pub const TOPIC_RPC_RESPONSE_PREFIX: &str = "v1/devices/me/rpc/response/";
 pub const TOPIC_RPC_SUBSCRIBE: &str = "v1/devices/me/rpc/request/+";
 
 pub async fn run(socket: TcpStream, peer: SocketAddr, state: TransportState) {
@@ -144,6 +145,7 @@ async fn connect(
         attributes_qos: Arc::new(AtomicU8::new(UNSUBSCRIBED)),
         rpc_qos: Arc::new(AtomicU8::new(UNSUBSCRIBED)),
         next_packet_id: 0,
+        inflight: HashSet::new(),
     };
     state.sessions.insert(
         session.info.session_id.clone(),
@@ -211,6 +213,8 @@ struct Session {
     attributes_qos: Arc<AtomicU8>,
     rpc_qos: Arc<AtomicU8>,
     next_packet_id: u16,
+    /// 下行 QoS1 未 ack 的 packet_id 集合（PUBACK 清除；断连即整会话丢弃，无需重传）。
+    inflight: HashSet<u16>,
 }
 
 impl Session {
@@ -269,7 +273,9 @@ async fn serve(
                 if let MqttPacket::Publish(p) = &mut packet
                     && p.qos == 1 && p.packet_id.is_none()
                 {
-                    p.packet_id = Some(session.alloc_packet_id());
+                    let packet_id = session.alloc_packet_id();
+                    p.packet_id = Some(packet_id);
+                    session.inflight.insert(packet_id);
                 }
                 if let Err(e) = framed.send(packet).await {
                     return format!("downlink send failed: {e}");
@@ -299,7 +305,13 @@ async fn handle(
 ) -> Result<(), String> {
     match packet {
         MqttPacket::Publish(p) => handle_publish(framed, state, session, p).await,
-        MqttPacket::PubAck(_) => Ok(()),
+        MqttPacket::PubAck(packet_id) => {
+            // 下行 QoS1 的设备 ack：清 inflight；未知 id 仅记录（可能为重发 ack）。
+            if !session.inflight.remove(&packet_id) {
+                tracing::debug!(packet_id, "PUBACK for unknown packet");
+            }
+            Ok(())
+        }
         MqttPacket::Subscribe { packet_id, filters } => {
             let mut granted = Vec::with_capacity(filters.len());
             for (filter, qos) in filters {
@@ -448,6 +460,24 @@ async fn handle_publish(
             Err(e) => tracing::warn!(request_id, "bad rpc payload: {e}"),
         }
         report_activity(state, session).await;
+    } else if let Some(request_id) = topic.strip_prefix(TOPIC_RPC_RESPONSE_PREFIX) {
+        // 服务端 RPC 的设备响应：回流 tb_core 完成 pending。
+        match request_id.parse::<i32>() {
+            Ok(request_id) => {
+                send_core(
+                    state,
+                    &session.device,
+                    core_pb::to_core_msg::Msg::RpcResponse(core_pb::RpcResponseMsg {
+                        session: Some(session.info.clone()),
+                        request_id,
+                        payload_json: String::from_utf8_lossy(&p.payload).into_owned(),
+                        error: String::new(),
+                    }),
+                )
+                .await;
+            }
+            Err(_) => tracing::warn!(topic, "bad rpc response request id"),
+        }
     } else if topic.starts_with(TOPIC_ATTRIBUTES_REQUEST_PREFIX) {
         // Phase 5 补全 get_attributes 请求/响应。
         tracing::debug!(topic, "attributes request not supported yet");

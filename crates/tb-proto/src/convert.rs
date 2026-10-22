@@ -27,6 +27,11 @@ impl TryFrom<pb::AttributeScope> for AttributeScope {
 }
 
 pub fn kv_to_proto(key_id: i32, value: &KvValue) -> pb::KeyValueProto {
+    kv_to_proto_named(key_id, "", value)
+}
+
+/// 带 key 字符串版本：下行通知/查询响应需要设备可读 key。
+pub fn kv_to_proto_named(key_id: i32, key: &str, value: &KvValue) -> pb::KeyValueProto {
     use pb::key_value_proto::Value;
     let v = match value {
         KvValue::Bool(b) => Value::BoolV(*b),
@@ -37,6 +42,7 @@ pub fn kv_to_proto(key_id: i32, value: &KvValue) -> pb::KeyValueProto {
     };
     pb::KeyValueProto {
         key_id,
+        key: key.to_string(),
         value: Some(v),
     }
 }

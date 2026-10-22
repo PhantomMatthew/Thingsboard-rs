@@ -15,6 +15,7 @@ message TransportApiRequestMsg {
     GetDeviceProfileRequest get_device_profile = 5;
     GetOrCreateGatewayDeviceRequest get_or_create_gateway_device = 6;
     GetOtaPackageRequest get_ota_package = 7;
+    GetAttributesRequest get_attributes = 8;
   }
 }
 
@@ -26,7 +27,19 @@ message TransportApiResponseMsg {
     DeviceInfoProto gateway_device = 4;
     OtaPackageProto ota_package = 5;
     TransportApiError error = 6;
+    GetAttributesResponse get_attributes_response = 7;
   }
+}
+
+message GetAttributesRequest {
+  string device_id = 1;
+  repeated string client_keys = 2;
+  repeated string shared_keys = 3;
+}
+
+message GetAttributesResponse {
+  repeated tb.common.KeyValueProto client_attributes = 1;
+  repeated tb.common.KeyValueProto shared_attributes = 2;
 }
 
 message ValidateTokenRequest {

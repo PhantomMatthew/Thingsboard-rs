@@ -1,6 +1,8 @@
 //! tb-core：REST API 服务（租户/客户/用户/设备/资产等实体管理）。
 
 pub mod auth_middleware;
+pub mod core_consumer;
+pub mod device_session;
 pub mod routes;
 pub mod seed;
 pub mod state;

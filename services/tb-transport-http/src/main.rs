@@ -1,7 +1,6 @@
 //! tb-transport-http 可执行入口。
 
-use tb_transport_api::TransportApiClient;
-use tb_transport_http::{TransportState, build_router};
+use tb_transport_http::{TransportState, build_router, downlink};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,8 +18,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(8088);
 
-    let transport_api = TransportApiClient::new(&brokers, &node_id)?;
-    let state = TransportState { transport_api };
+    let state = TransportState::new(&brokers, &node_id)?;
+    tokio::spawn(downlink::run(state.clone()));
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!(port, node_id, "tb-transport-http listening");

@@ -1,22 +1,59 @@
-//! tb-transport-http：设备 HTTP 接入（无状态）。
-//! 凭证校验走 transport-api（Kafka 请求/响应，带 60s 缓存），
-//! 遥测/属性/RPC 封装为 ToRuleEngineMsg 发到 tb_rule_engine.Main。
+//! tb-transport-http：设备 HTTP 接入。
+//! 上行：遥测/属性/RPC 经 transport-api 或 tb_rule_engine.Main；
+//! 同步能力：GET attributes 走 transport-api 请求/响应；GET rpc 长轮询
+//! （注册临时会话 → subscribe_rpc → 等本节点 notifications consumer 推 to_device_rpc）。
+
+pub mod downlink;
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use bytes::Bytes;
+use dashmap::DashMap;
+use prost::Message as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tb_common::{KvEntry, KvValue, TbError, TsKvEntry};
+use tb_proto::core as core_pb;
+use tb_proto::transport as pb;
+use tb_queue::{KafkaQueueProducer, QueueError, QueueProducer as _, TbTopic};
 use tb_transport_api::TransportApiClient;
+use tokio::sync::mpsc;
+use uuid::Uuid;
+
+const LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 长轮询会话：session_id → to_device_rpc 投递通道。
+pub type RpcSessions = Arc<DashMap<String, mpsc::Sender<core_pb::ToDeviceRpcRequestMsg>>>;
 
 #[derive(Clone)]
 pub struct TransportState {
     pub transport_api: TransportApiClient,
+    pub producer: KafkaQueueProducer,
+    pub node_id: String,
+    pub brokers: String,
+    pub rpc_sessions: RpcSessions,
+    /// GET rpc 长轮询时长（测试可调小）。
+    pub long_poll_timeout: Duration,
+}
+
+impl TransportState {
+    pub fn new(brokers: &str, node_id: &str) -> Result<Self, QueueError> {
+        Ok(Self {
+            transport_api: TransportApiClient::new(brokers, node_id)?,
+            producer: KafkaQueueProducer::new(brokers, &format!("tb-transport-http-{node_id}"))?,
+            node_id: node_id.to_string(),
+            brokers: brokers.to_string(),
+            rpc_sessions: Arc::new(DashMap::new()),
+            long_poll_timeout: LONG_POLL_TIMEOUT,
+        })
+    }
 }
 
 pub fn build_router(state: TransportState) -> Router {
@@ -28,7 +65,8 @@ pub fn build_router(state: TransportState) -> Router {
             post(post_attributes).get(get_attributes),
         )
         .route("/api/v1/{token}/claim", post(claim))
-        .route("/api/v1/{token}/rpc", post(post_rpc))
+        .route("/api/v1/{token}/rpc", post(post_rpc).get(get_rpc))
+        .route("/api/v1/{token}/rpc/{requestId}", post(post_rpc_response))
         .with_state(state)
 }
 
@@ -66,6 +104,41 @@ async fn validate(
     }
     resp.device
         .ok_or_else(|| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "missing device info".into()))
+}
+
+fn session_info(state: &TransportState, device: &pb::DeviceInfoProto, session_id: &str) -> core_pb::SessionInfoProto {
+    core_pb::SessionInfoProto {
+        node_id: state.node_id.clone(),
+        session_id: session_id.to_string(),
+        tenant_id: device.tenant_id.clone(),
+        device_id: device.device_id.clone(),
+        device_profile_id: device.device_profile_id.clone(),
+        device_name: device.device_name.clone(),
+        device_type: device.device_type.clone(),
+        is_gateway: false,
+        gateway_session_id: String::new(),
+    }
+}
+
+async fn send_core(
+    state: &TransportState,
+    device: &pb::DeviceInfoProto,
+    msg: core_pb::to_core_msg::Msg,
+) -> Result<(), ApiError> {
+    let m = core_pb::ToCoreMsg {
+        tenant_id: device.tenant_id.clone(),
+        entity_id: device.device_id.clone(),
+        msg: Some(msg),
+    };
+    state
+        .producer
+        .send(
+            TbTopic::CORE,
+            &device.device_id,
+            Bytes::from(m.encode_to_vec()),
+        )
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,20 +223,51 @@ async fn post_attributes(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AttributesQuery {
-    #[allow(dead_code)]
     client_keys: Option<String>,
-    #[allow(dead_code)]
     shared_keys: Option<String>,
 }
 
-/// Phase 3a 简化：同步会话查询在 Phase 5 实现，这里返回空集。
+fn split_keys(raw: &Option<String>) -> Vec<String> {
+    raw.as_deref()
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn kvs_to_json(kvs: &[tb_proto::common::KeyValueProto]) -> Value {
+    let mut map = serde_json::Map::new();
+    for kv in kvs {
+        if let Some((key, value)) = tb_proto::convert::kv_from_proto(kv, kv.key.clone()) {
+            map.insert(key, serde_json::to_value(&value).unwrap_or_default());
+        }
+    }
+    Value::Object(map)
+}
+
+/// GET attributes：经 transport-api 同步查询 tb-core（CLIENT_SCOPE + SHARED_SCOPE）。
 async fn get_attributes(
     State(state): State<TransportState>,
     Path(token): Path<String>,
-    Query(_query): Query<AttributesQuery>,
+    Query(query): Query<AttributesQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    validate(&state, &token).await?;
-    Ok(Json(json!({})))
+    let device = validate(&state, &token).await?;
+    let resp = state
+        .transport_api
+        .get_attributes(
+            &device.device_id,
+            split_keys(&query.client_keys),
+            split_keys(&query.shared_keys),
+        )
+        .await?;
+    Ok(Json(json!({
+        "client": kvs_to_json(&resp.client_attributes),
+        "shared": kvs_to_json(&resp.shared_attributes),
+    })))
 }
 
 async fn claim() -> StatusCode {
@@ -195,4 +299,67 @@ async fn post_rpc(
         )
         .await?;
     Ok(StatusCode::ACCEPTED)
+}
+
+/// GET rpc 长轮询：注册临时会话并 subscribe_rpc，等 notifications consumer 推 to_device_rpc；
+/// 超时返回空 200。结束时发 session_close 清理 core 侧注册表。
+async fn get_rpc(
+    State(state): State<TransportState>,
+    Path(token): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let device = validate(&state, &token).await?;
+    let session_id = Uuid::now_v7().to_string();
+    let (tx, mut rx) = mpsc::channel(4);
+    state.rpc_sessions.insert(session_id.clone(), tx);
+    let info = session_info(&state, &device, &session_id);
+    send_core(
+        &state,
+        &device,
+        core_pb::to_core_msg::Msg::SubscribeRpc(core_pb::SubscribeRpcMsg {
+            session: Some(info.clone()),
+            subscribe: true,
+        }),
+    )
+    .await?;
+    let result = match tokio::time::timeout(state.long_poll_timeout, rx.recv()).await {
+        Ok(Some(rpc)) => {
+            let params: Value =
+                serde_json::from_str(&rpc.params_json).unwrap_or(Value::Null);
+            json!({"id": rpc.request_id, "method": rpc.method, "params": params})
+        }
+        _ => json!({}),
+    };
+    state.rpc_sessions.remove(&session_id);
+    send_core(
+        &state,
+        &device,
+        core_pb::to_core_msg::Msg::SessionClose(core_pb::SessionCloseMsg {
+            session: Some(info),
+            reason: "http long-poll ended".into(),
+        }),
+    )
+    .await?;
+    Ok(Json(result))
+}
+
+/// POST rpc/{requestId}：设备回服务端 RPC 响应 → tb_core rpc_response 完成 pending。
+async fn post_rpc_response(
+    State(state): State<TransportState>,
+    Path((token, request_id)): Path<(String, i32)>,
+    Json(payload): Json<Value>,
+) -> Result<StatusCode, ApiError> {
+    let device = validate(&state, &token).await?;
+    let info = session_info(&state, &device, "");
+    send_core(
+        &state,
+        &device,
+        core_pb::to_core_msg::Msg::RpcResponse(core_pb::RpcResponseMsg {
+            session: Some(info),
+            request_id,
+            payload_json: payload.to_string(),
+            error: String::new(),
+        }),
+    )
+    .await?;
+    Ok(StatusCode::OK)
 }

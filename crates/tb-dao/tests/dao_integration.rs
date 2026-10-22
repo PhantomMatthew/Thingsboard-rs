@@ -368,12 +368,12 @@ async fn alarm_latest_and_paged() -> TbResult<()> {
     assert_eq!(latest.start_ts, 1002);
 
     let page = alarm_dao
-        .find_by_tenant(tenant.id, Some(originator), &PageLink::new(0, 10))
+        .find_by_tenant(tenant.id, Some(originator), None, None, None, &PageLink::new(0, 10))
         .await?;
     assert_eq!(page.total_elements, 3);
 
     let all = alarm_dao
-        .find_by_tenant(tenant.id, None, &PageLink::new(0, 100))
+        .find_by_tenant(tenant.id, None, None, None, None, &PageLink::new(0, 100))
         .await?;
     assert!(all.total_elements >= 3);
 

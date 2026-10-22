@@ -121,6 +121,11 @@ async fn handle_request(
                 },
             )
         }
+        Some(Request::GetAttributes(r)) => {
+            pb::transport_api_response_msg::Response::GetAttributesResponse(
+                get_attributes(state, &r).await,
+            )
+        }
         other => {
             tracing::debug!(?other, "unsupported transport-api request");
             pb::transport_api_response_msg::Response::Error(pb::TransportApiError {
@@ -137,6 +142,46 @@ fn invalid_credentials() -> pb::ValidateCredentialsResponse {
         device: None,
         profile: None,
         credentials_body: String::new(),
+    }
+}
+
+/// 设备属性同步查询（HTTP transport GET attributes 用）：client/shared 两组，带 key 字符串。
+async fn get_attributes(state: &AppState, r: &pb::GetAttributesRequest) -> pb::GetAttributesResponse {
+    let empty = pb::GetAttributesResponse::default();
+    let Ok(device_id) = uuid::Uuid::parse_str(&r.device_id) else {
+        tracing::warn!(device_id = r.device_id, "get_attributes with bad device_id");
+        return empty;
+    };
+    let filter = |keys: &[String]| (!keys.is_empty()).then(|| keys.to_vec());
+    let client = state
+        .attributes_dao
+        .find(
+            device_id,
+            tb_common::AttributeScope::ClientScope,
+            filter(&r.client_keys).as_deref(),
+        )
+        .await;
+    let shared = state
+        .attributes_dao
+        .find(
+            device_id,
+            tb_common::AttributeScope::SharedScope,
+            filter(&r.shared_keys).as_deref(),
+        )
+        .await;
+    let (Ok(client), Ok(shared)) = (client, shared) else {
+        tracing::warn!("get_attributes dao failed");
+        return empty;
+    };
+    let to_proto = |entries: Vec<tb_common::KvEntry>| -> Vec<tb_proto::common::KeyValueProto> {
+        entries
+            .into_iter()
+            .map(|e| tb_proto::convert::kv_to_proto_named(0, &e.key, &e.value))
+            .collect()
+    };
+    pb::GetAttributesResponse {
+        client_attributes: to_proto(client),
+        shared_attributes: to_proto(shared),
     }
 }
 

@@ -1,5 +1,6 @@
 //! 下行通知：消费 tb_transport.notifications.<node_id>，按 session_id 路由到在线会话。
-//! Phase 3b 处理 attribute_update / to_device_rpc / session_close_notification，其余 debug 忽略。
+//! 处理 attribute_update（KeyValueProto.key 字符串，value 缺省=删除→JSON null）/
+//! to_device_rpc / session_close_notification，其余 debug 忽略。
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -55,14 +56,19 @@ async fn handle(registry: &SessionRegistry, payload: Bytes) {
             if qos == UNSUBSCRIBED {
                 return;
             }
-            // proto 仅携带 key_id，key 反查待 Phase 5 core 侧补齐；先按 id 字符串下发。
+            // value 缺省 = 删除通知，JSON null；key 用字符串（core 侧已带）。
             let mut body = serde_json::Map::new();
             for kv in &n.attributes {
-                if let Some((key, value)) =
-                    tb_proto::convert::kv_from_proto(kv, kv.key_id.to_string())
-                {
-                    body.insert(key, serde_json::to_value(&value).unwrap_or_default());
-                }
+                let key = if kv.key.is_empty() {
+                    kv.key_id.to_string()
+                } else {
+                    kv.key.clone()
+                };
+                let value = match tb_proto::convert::kv_from_proto(kv, key.clone()) {
+                    Some((_, v)) => serde_json::to_value(&v).unwrap_or_default(),
+                    None => serde_json::Value::Null,
+                };
+                body.insert(key, value);
             }
             send(
                 handle,

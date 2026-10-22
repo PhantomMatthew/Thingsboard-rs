@@ -13,6 +13,9 @@ use tb_auth::{ApiError, AuthUser};
 use tb_common::{AttributeScope, EntityType, KvEntry, KvValue, TbError, TbResult, TsKvEntry};
 use tb_dao::Aggregation;
 use tb_dao::models::Authority;
+use tb_proto::common as common_pb;
+use tb_proto::core as core_pb;
+use tb_queue::{QueueProducer as _, TbTopic};
 use uuid::Uuid;
 
 use crate::AppState;
@@ -119,8 +122,56 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+/// SHARED_SCOPE 变更下行：推给该设备所有订阅了属性更新的在线会话（按各自 node 发 Kafka）。
+/// value 为 None 表示删除通知。
+async fn notify_shared_attribute_update(
+    state: &AppState,
+    entity_type: EntityType,
+    entity_id: Uuid,
+    attributes: Vec<common_pb::KeyValueProto>,
+) {
+    if entity_type != EntityType::Device || attributes.is_empty() {
+        return;
+    }
+    let sessions = state.device_sessions.attribute_sessions(entity_id);
+    if sessions.is_empty() {
+        return;
+    }
+    let producer = match state.queue_producer().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("queue producer unavailable, attribute update dropped: {e}");
+            return;
+        }
+    };
+    use prost::Message as _;
+    for session in sessions {
+        let msg = core_pb::ToTransportMsg {
+            session_id: session.session_id.clone(),
+            entity_id: entity_id.to_string(),
+            msg: Some(core_pb::to_transport_msg::Msg::AttributeUpdate(
+                core_pb::AttributeUpdateNotification {
+                    scope: common_pb::AttributeScope::SharedScope as i32,
+                    attributes: attributes.clone(),
+                },
+            )),
+        };
+        let topic = TbTopic::transport_notifications(&session.node_id);
+        if let Err(e) = producer
+            .send(
+                &topic,
+                &session.session_id,
+                bytes::Bytes::from(msg.encode_to_vec()),
+            )
+            .await
+        {
+            tracing::warn!(session_id = session.session_id, "attribute update send failed: {e}");
+        }
+    }
+}
+
 /// 实体存在性 + 租户/客户归属校验；仅支持 DEVICE/ASSET。
-async fn check_entity_access(
+pub(crate) async fn check_entity_access(
     state: &AppState,
     user: &AuthUser,
     entity_type: EntityType,
@@ -344,6 +395,14 @@ async fn save_attributes(
         .attributes_dao
         .save(entity_id, scope, &entries)
         .await?;
+    if scope == AttributeScope::SharedScope {
+        let mut kvs = Vec::with_capacity(entries.len());
+        for e in &entries {
+            let key_id = state.key_dictionary_dao.get_or_create_id(&e.key).await?;
+            kvs.push(tb_proto::convert::kv_to_proto_named(key_id, &e.key, &e.value));
+        }
+        notify_shared_attribute_update(&state, entity_type, entity_id, kvs).await;
+    }
     Ok(StatusCode::OK)
 }
 
@@ -404,5 +463,18 @@ async fn delete_attributes(
         .filter(|k| !k.is_empty())
         .ok_or_else(|| TbError::InvalidInput("keys are required".into()))?;
     let deleted = state.attributes_dao.delete(entity_id, scope, &keys).await?;
+    if deleted > 0 && scope == AttributeScope::SharedScope {
+        let mut kvs = Vec::with_capacity(keys.len());
+        for key in &keys {
+            let key_id = state.key_dictionary_dao.get_or_create_id(key).await?;
+            // value 缺省 = 删除通知。
+            kvs.push(common_pb::KeyValueProto {
+                key_id,
+                key: key.clone(),
+                value: None,
+            });
+        }
+        notify_shared_attribute_update(&state, entity_type, entity_id, kvs).await;
+    }
     Ok(Json(json!({"deleted": deleted})))
 }

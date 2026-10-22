@@ -35,6 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tb_core::seed::seed(&state).await?;
 
     let transport_api = tb_core::transport_api::start_transport_api(state.clone()).await;
+    let core_consumer = tb_core::core_consumer::start_core_consumer(state.clone()).await;
     // Phase 4 起遥测落库由 tb-rule-engine 接管；TB_INGEST_ENABLED=true 时才开旧直通 ingest。
     let ingest_enabled = std::env::var("TB_INGEST_ENABLED")
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
@@ -53,6 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
     transport_api.abort();
+    core_consumer.abort();
     if let Some(ingest) = ingest {
         ingest.abort();
     }

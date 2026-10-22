@@ -12,7 +12,6 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tb_auth::JwtTokenFactory;
 use tb_core::{AppState, build_router};
-use tb_transport_api::TransportApiClient;
 
 pub const ADMIN_URL: &str = "postgres://thingsboard:thingsboard@localhost:5433/postgres";
 pub const KAFKA_BROKERS: &str = "localhost:29092";
@@ -60,6 +59,11 @@ pub async fn start_servers() -> (String, String) {
         &format!("tb-core-transport-api-{run_id}"),
     )
     .await;
+    let _core_consumer = tb_core::core_consumer::start_core_consumer_for_group(
+        state.clone(),
+        &format!("tb-core-main-{run_id}"),
+    )
+    .await;
     let _ingest = tb_core::telemetry_ingest::start_telemetry_ingest_for_group(
         state.clone(),
         &format!("tb-core-ingest-{run_id}"),
@@ -74,11 +78,11 @@ pub async fn start_servers() -> (String, String) {
         axum::serve(listener, build_router(state)).await.unwrap();
     });
 
-    let node_id = format!("test-http-{}", uuid::Uuid::now_v7());
-    let client = TransportApiClient::new(KAFKA_BROKERS, &node_id).expect("transport api client");
-    let transport_state = tb_transport_http::TransportState {
-        transport_api: client,
-    };
+    let node_id = format!("test-http-{}", uuid::Uuid::now_v7().simple());
+    let mut transport_state = tb_transport_http::TransportState::new(KAFKA_BROKERS, &node_id)
+        .expect("http transport state");
+    transport_state.long_poll_timeout = Duration::from_secs(5);
+    tokio::spawn(tb_transport_http::downlink::run(transport_state.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind random port");
@@ -190,3 +194,7 @@ pub async fn poll_until(timeout: Duration, mut f: impl AsyncFnMut() -> bool) {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
+
+/// 进程内测试串行化锁：共享 Kafka 下并行测试的多个 core 实例会互相抢答
+/// transport-api 校验请求（各自测试库数据不同），导致随机 valid=false 串扰。
+pub static INTEGRATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

@@ -15,6 +15,11 @@ pub const ADMIN_URL: &str = "postgres://thingsboard:thingsboard@localhost:5433/p
 pub const TEST_URL: &str = "postgres://thingsboard:thingsboard@localhost:5433/thingsboard_test";
 
 pub async fn start_server() -> String {
+    start_server_with_pool().await.0
+}
+
+/// 同 start_server，但额外返回测试库连接池（测试需直接走 DAO 造数时）。
+pub async fn start_server_with_pool() -> (String, PgPool) {
     let admin = PgPoolOptions::new()
         .max_connections(1)
         .connect(ADMIN_URL)
@@ -38,7 +43,7 @@ pub async fn start_server() -> String {
     tb_dao::migrate(&pool).await.expect("migrate test db");
 
     let factory = Arc::new(JwtTokenFactory::new("test-secret", 900, 604800));
-    let state = AppState::new(pool, factory);
+    let state = AppState::new(pool.clone(), factory);
     tb_core::seed::seed(&state).await.expect("seed");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -48,7 +53,7 @@ pub async fn start_server() -> String {
     tokio::spawn(async move {
         axum::serve(listener, build_router(state)).await.unwrap();
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), pool)
 }
 
 pub async fn login(client: &Client, base: &str, username: &str, password: &str) -> Value {

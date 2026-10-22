@@ -131,30 +131,78 @@ impl AlarmDao {
         .map_err(TbError::db)
     }
 
+    /// ack：ACTIVE_UNACK → ACTIVE_ACK；已 ack 幂等返回；已 CLEARED 报错。
+    pub async fn ack(&self, id: Uuid) -> TbResult<Alarm> {
+        let mut alarm = self
+            .find_by_id(id)
+            .await?
+            .ok_or_else(|| TbError::NotFound(format!("alarm {id}")))?;
+        use crate::models::AlarmStatus as S;
+        match alarm.status {
+            S::ActiveUnack => {
+                alarm.status = S::ActiveAck;
+                alarm.ack_ts = Some(now_ms());
+                self.save(&alarm).await
+            }
+            S::ActiveAck => Ok(alarm),
+            S::ClearedUnack | S::ClearedAck => Err(TbError::InvalidInput(
+                "alarm already cleared, cannot ack".into(),
+            )),
+        }
+    }
+
+    /// clear：ACTIVE_* → CLEARED_*（保留 ack 位）；已 CLEARED 幂等返回。
+    pub async fn clear(&self, id: Uuid) -> TbResult<Alarm> {
+        let mut alarm = self
+            .find_by_id(id)
+            .await?
+            .ok_or_else(|| TbError::NotFound(format!("alarm {id}")))?;
+        use crate::models::AlarmStatus as S;
+        match alarm.status {
+            S::ActiveUnack => alarm.status = S::ClearedUnack,
+            S::ActiveAck => alarm.status = S::ClearedAck,
+            S::ClearedUnack | S::ClearedAck => return Ok(alarm),
+        }
+        alarm.clear_ts = Some(now_ms());
+        alarm.end_ts = now_ms();
+        self.save(&alarm).await
+    }
+
+    /// 租户级/实体级分页查询，支持 status 与 startTs/endTs 过滤。
     pub async fn find_by_tenant(
         &self,
         tenant_id: Uuid,
         originator_id: Option<Uuid>,
+        status: Option<crate::models::AlarmStatus>,
+        start_ts: Option<i64>,
+        end_ts: Option<i64>,
         page_link: &PageLink,
     ) -> TbResult<PageData<Alarm>> {
         let sort = page_link.sort_column(&["created_time", "start_ts", "severity", "status"]);
         let order = page_link.sort_order_sql();
-        let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM alarm WHERE tenant_id = $1 \
-             AND ($2::uuid IS NULL OR originator_id = $2)",
-        )
-        .bind(tenant_id)
-        .bind(originator_id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(TbError::db)?;
-        let data = sqlx::query_as::<_, Alarm>(&format!(
-            "SELECT * FROM alarm WHERE tenant_id = $1 \
+        let cond = "tenant_id = $1 \
              AND ($2::uuid IS NULL OR originator_id = $2) \
-             ORDER BY {sort} {order} LIMIT $3 OFFSET $4"
+             AND ($3::varchar IS NULL OR status = $3) \
+             AND ($4::bigint IS NULL OR start_ts >= $4) \
+             AND ($5::bigint IS NULL OR start_ts <= $5)";
+        let status_str = status.map(|s| s.as_str().to_string());
+        let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM alarm WHERE {cond}"))
+            .bind(tenant_id)
+            .bind(originator_id)
+            .bind(&status_str)
+            .bind(start_ts)
+            .bind(end_ts)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(TbError::db)?;
+        let data = sqlx::query_as::<_, Alarm>(&format!(
+            "SELECT * FROM alarm WHERE {cond} ORDER BY {sort} {order} LIMIT $6 OFFSET $7"
         ))
         .bind(tenant_id)
         .bind(originator_id)
+        .bind(&status_str)
+        .bind(start_ts)
+        .bind(end_ts)
         .bind(page_link.limit())
         .bind(page_link.offset())
         .fetch_all(&self.pool)

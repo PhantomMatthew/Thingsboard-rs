@@ -1,10 +1,12 @@
 //! REST 路由汇总。分页参数对齐 ThingsBoard：page/pageSize/textSearch/sortProperty/sortOrder。
 
+pub mod alarm;
 pub mod asset;
 pub mod asset_profile;
 pub mod customer;
 pub mod device;
 pub mod device_profile;
+pub mod rpc;
 pub mod rule_chain;
 pub mod telemetry;
 pub mod tenant;
@@ -27,6 +29,8 @@ pub fn api_router() -> Router<AppState> {
         .merge(asset_profile::router())
         .merge(rule_chain::router())
         .merge(telemetry::router())
+        .merge(alarm::router())
+        .merge(rpc::router())
 }
 
 #[derive(Debug, Deserialize)]

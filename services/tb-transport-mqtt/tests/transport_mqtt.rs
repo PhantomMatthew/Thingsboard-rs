@@ -101,6 +101,7 @@ async fn connect_until_success(addr: SocketAddr, client_id: &str, username: &str
 
 #[tokio::test]
 async fn mqtt_transport_telemetry_and_attributes() {
+    let _guard = INTEGRATION_LOCK.lock().await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let (core, mqtt_addr) = start_servers().await;
     let (admin_token, _tenant_id) =
@@ -294,6 +295,7 @@ async fn mqtt_transport_telemetry_and_attributes() {
 
 #[tokio::test]
 async fn mqtt_transport_rejects_bad_token() {
+    let _guard = INTEGRATION_LOCK.lock().await;
     let (_core, mqtt_addr) = start_servers().await;
 
     // 冷启动期间认证请求可能超时断连，轮询直到拿到明确的 CONNACK 拒绝

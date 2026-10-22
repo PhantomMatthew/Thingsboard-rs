@@ -6,12 +6,16 @@ use std::sync::Arc;
 use sqlx::PgPool;
 use tb_auth::{AuthService, JwtTokenFactory};
 use tb_dao::{
-    AssetDao, AssetProfileDao, AttributesDao, CustomerDao, DashboardDao, DeviceCredentialsDao,
-    DeviceDao, DeviceProfileDao, KeyDictionaryDao, RelationDao, RuleChainDao, RuleNodeDao,
-    TenantDao, TenantProfileDao, TimeseriesDao, UserCredentialsDao, UserDao,
+    AlarmDao, AssetDao, AssetProfileDao, AttributesDao, CustomerDao, DashboardDao,
+    DeviceCredentialsDao, DeviceDao, DeviceProfileDao, KeyDictionaryDao, RelationDao, RuleChainDao,
+    RuleNodeDao, TenantDao, TenantProfileDao, TimeseriesDao, UserCredentialsDao, UserDao,
 };
+use tb_queue::KafkaQueueProducer;
+
+use crate::device_session::SharedDeviceSessionRegistry;
 
 const DEFAULT_REDIS_URL: &str = "redis://localhost:16379";
+const DEFAULT_KAFKA_BROKERS: &str = "localhost:29092";
 
 pub struct AppStateInner {
     pub pool: PgPool,
@@ -32,8 +36,12 @@ pub struct AppStateInner {
     pub key_dictionary_dao: KeyDictionaryDao,
     pub timeseries_dao: TimeseriesDao,
     pub attributes_dao: AttributesDao,
+    pub alarm_dao: AlarmDao,
+    pub device_sessions: SharedDeviceSessionRegistry,
     pub redis: redis::Client,
     redis_conn: tokio::sync::OnceCell<redis::aio::ConnectionManager>,
+    kafka_producer: tokio::sync::OnceCell<KafkaQueueProducer>,
+    kafka_brokers: String,
     pub auth_service: Arc<AuthService>,
     pub jwt_factory: Arc<JwtTokenFactory>,
 }
@@ -57,6 +65,8 @@ impl AppState {
         let redis_url = std::env::var("TB_REDIS_URL").unwrap_or_else(|_| DEFAULT_REDIS_URL.into());
         let redis = redis::Client::open(redis_url.as_str())
             .unwrap_or_else(|_| redis::Client::open(DEFAULT_REDIS_URL).unwrap());
+        let kafka_brokers =
+            std::env::var("TB_KAFKA_BROKERS").unwrap_or_else(|_| DEFAULT_KAFKA_BROKERS.into());
         Self {
             inner: Arc::new(AppStateInner {
                 tenant_dao: TenantDao::new(pool.clone()),
@@ -75,9 +85,13 @@ impl AppState {
                 rule_node_dao: RuleNodeDao::new(pool.clone()),
                 timeseries_dao: TimeseriesDao::new(pool.clone(), key_dictionary_dao.clone()),
                 attributes_dao: AttributesDao::new(pool.clone(), key_dictionary_dao.clone()),
+                alarm_dao: AlarmDao::new(pool.clone()),
+                device_sessions: crate::device_session::DeviceSessionRegistry::new_shared(),
                 key_dictionary_dao,
                 redis,
                 redis_conn: tokio::sync::OnceCell::new(),
+                kafka_producer: tokio::sync::OnceCell::new(),
+                kafka_brokers,
                 auth_service: AuthService::new(pool.clone(), jwt_factory.clone()),
                 jwt_factory,
                 pool,
@@ -91,6 +105,16 @@ impl AppState {
             .get_or_try_init(|| redis::aio::ConnectionManager::new(self.redis.clone()))
             .await
             .cloned()
+    }
+
+    /// 惰性建立 Kafka producer（下行通知/RPC 下发用）。
+    pub async fn queue_producer(&self) -> tb_common::TbResult<&KafkaQueueProducer> {
+        self.kafka_producer
+            .get_or_try_init(|| async {
+                KafkaQueueProducer::new(&self.kafka_brokers, "tb-core-rest")
+                    .map_err(tb_common::TbError::internal)
+            })
+            .await
     }
 }
 

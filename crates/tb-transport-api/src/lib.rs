@@ -204,6 +204,34 @@ impl TransportApiClient {
         }
     }
 
+    /// 设备属性同步查询（HTTP GET attributes 用）。
+    pub async fn get_attributes(
+        &self,
+        device_id: &str,
+        client_keys: Vec<String>,
+        shared_keys: Vec<String>,
+    ) -> TbResult<pb::GetAttributesResponse> {
+        let resp = self
+            .request(pb::transport_api_request_msg::Request::GetAttributes(
+                pb::GetAttributesRequest {
+                    device_id: device_id.to_string(),
+                    client_keys,
+                    shared_keys,
+                },
+            ))
+            .await?;
+        match resp.response {
+            Some(pb::transport_api_response_msg::Response::GetAttributesResponse(v)) => Ok(v),
+            Some(pb::transport_api_response_msg::Response::Error(e)) => Err(TbError::Internal(
+                format!("transport-api error {}: {}", e.code, e.message),
+            )),
+            other => {
+                tracing::warn!(?other, "unexpected transport-api response");
+                Err(TbError::Internal("unexpected transport-api response".into()))
+            }
+        }
+    }
+
     /// 遥测上行：每个 ts 分组一条消息，data_json 为 {"ts":ms,"values":{...}}。
     pub async fn publish_telemetry(
         &self,

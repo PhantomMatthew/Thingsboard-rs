@@ -49,6 +49,7 @@ message KeyValueProto {
     double dbl_v = 5;
     string json_v = 6;
   }
+  string key = 7;     // key 字符串（与 key_id 并存；下行通知/查询响应必带）
 }
 
 message TsKvProto {

@@ -11,6 +11,7 @@ use common::*;
 
 #[tokio::test]
 async fn http_transport_telemetry_and_attributes() {
+    let _guard = INTEGRATION_LOCK.lock().await;
     // 禁系统代理，避免本机代理拦截 localhost 请求。
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let (core, transport) = start_servers().await;
@@ -107,7 +108,7 @@ async fn http_transport_telemetry_and_attributes() {
     })
     .await;
 
-    // 设备侧拉属性（Phase 3a 返回空集）
+    // 设备侧拉属性（Phase 5 起返回真实 client/shared 分组）
     let resp = client
         .get(format!(
             "{transport}/api/v1/TEST_TOKEN/attributes?clientKeys=firmware"
@@ -116,7 +117,10 @@ async fn http_transport_telemetry_and_attributes() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(resp.json::<Value>().await.unwrap(), json!({}));
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        json!({"client": {"firmware": "1.0"}, "shared": {}})
+    );
 
     // RPC 上行（无响应等待 → 202）
     let resp = client
@@ -139,6 +143,7 @@ async fn http_transport_telemetry_and_attributes() {
 
 #[tokio::test]
 async fn http_transport_rejects_bad_token() {
+    let _guard = INTEGRATION_LOCK.lock().await;
     // 禁系统代理，避免本机代理拦截 localhost 请求。
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let (_core, transport) = start_servers().await;

@@ -60,6 +60,11 @@ pub async fn start_servers() -> (String, SocketAddr) {
         &format!("tb-core-transport-api-{run_id}"),
     )
     .await;
+    let _core_consumer = tb_core::core_consumer::start_core_consumer_for_group(
+        state.clone(),
+        &format!("tb-core-main-{run_id}"),
+    )
+    .await;
     let _ingest = tb_core::telemetry_ingest::start_telemetry_ingest_for_group(
         state.clone(),
         &format!("tb-core-ingest-{run_id}"),
@@ -185,3 +190,7 @@ pub async fn poll_until(timeout: Duration, mut f: impl AsyncFnMut() -> bool) {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
+
+/// 进程内测试串行化锁：共享 Kafka 下并行测试的多个 core 实例会互相抢答
+/// transport-api 校验请求（各自测试库数据不同），导致随机 valid=false 串扰。
+pub static INTEGRATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
