@@ -17,6 +17,7 @@ axum.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 sqlx.workspace = true
+redis.workspace = true
 prost.workspace = true
 tb-common = { path = "../../crates/tb-common" }
 tb-proto = { path = "../../crates/tb-proto" }

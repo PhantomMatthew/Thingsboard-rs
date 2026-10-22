@@ -1,69 +1,12 @@
 //! tb-core REST API 端到端集成测试。
 //! 使用专属测试库 thingsboard_test（每次 DROP/CREATE），不污染开发库。
 
-use std::sync::Arc;
+mod common;
 
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
-use sqlx::PgPool;
-use sqlx::postgres::PgPoolOptions;
-use tb_auth::JwtTokenFactory;
-use tb_core::{AppState, build_router};
 
-const ADMIN_URL: &str = "postgres://thingsboard:thingsboard@localhost:5433/postgres";
-const TEST_URL: &str = "postgres://thingsboard:thingsboard@localhost:5433/thingsboard_test";
-
-async fn start_server() -> String {
-    let admin = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(ADMIN_URL)
-        .await
-        .expect("connect admin db");
-    sqlx::query("DROP DATABASE IF EXISTS thingsboard_test WITH (FORCE)")
-        .execute(&admin)
-        .await
-        .expect("drop test db");
-    sqlx::query("CREATE DATABASE thingsboard_test")
-        .execute(&admin)
-        .await
-        .expect("create test db");
-    admin.close().await;
-
-    let pool: PgPool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(TEST_URL)
-        .await
-        .expect("connect test db");
-    tb_dao::migrate(&pool).await.expect("migrate test db");
-
-    let factory = Arc::new(JwtTokenFactory::new("test-secret", 900, 604800));
-    let state = AppState::new(pool, factory);
-    tb_core::seed::seed(&state).await.expect("seed");
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind random port");
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, build_router(state)).await.unwrap();
-    });
-    format!("http://{addr}")
-}
-
-async fn login(client: &Client, base: &str, username: &str, password: &str) -> Value {
-    let resp = client
-        .post(format!("{base}/api/auth/login"))
-        .json(&json!({ "username": username, "password": password }))
-        .send()
-        .await
-        .expect("login request");
-    assert_eq!(resp.status(), StatusCode::OK, "login {username}");
-    resp.json().await.unwrap()
-}
-
-fn bearer(token: &str) -> String {
-    format!("Bearer {token}")
-}
+use common::{bearer, login, start_server};
 
 #[tokio::test]
 async fn rest_api_end_to_end() {

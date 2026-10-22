@@ -6,9 +6,12 @@ use std::sync::Arc;
 use sqlx::PgPool;
 use tb_auth::{AuthService, JwtTokenFactory};
 use tb_dao::{
-    AssetDao, AssetProfileDao, CustomerDao, DashboardDao, DeviceCredentialsDao, DeviceDao,
-    DeviceProfileDao, RelationDao, TenantDao, TenantProfileDao, UserCredentialsDao, UserDao,
+    AssetDao, AssetProfileDao, AttributesDao, CustomerDao, DashboardDao, DeviceCredentialsDao,
+    DeviceDao, DeviceProfileDao, KeyDictionaryDao, RelationDao, TenantDao, TenantProfileDao,
+    TimeseriesDao, UserCredentialsDao, UserDao,
 };
+
+const DEFAULT_REDIS_URL: &str = "redis://localhost:16379";
 
 pub struct AppStateInner {
     pub pool: PgPool,
@@ -24,6 +27,11 @@ pub struct AppStateInner {
     pub asset_profile_dao: AssetProfileDao,
     pub dashboard_dao: DashboardDao,
     pub relation_dao: RelationDao,
+    pub key_dictionary_dao: KeyDictionaryDao,
+    pub timeseries_dao: TimeseriesDao,
+    pub attributes_dao: AttributesDao,
+    pub redis: redis::Client,
+    redis_conn: tokio::sync::OnceCell<redis::aio::ConnectionManager>,
     pub auth_service: Arc<AuthService>,
     pub jwt_factory: Arc<JwtTokenFactory>,
 }
@@ -43,6 +51,10 @@ impl Deref for AppState {
 
 impl AppState {
     pub fn new(pool: PgPool, jwt_factory: Arc<JwtTokenFactory>) -> Self {
+        let key_dictionary_dao = KeyDictionaryDao::new(pool.clone());
+        let redis_url = std::env::var("TB_REDIS_URL").unwrap_or_else(|_| DEFAULT_REDIS_URL.into());
+        let redis = redis::Client::open(redis_url.as_str())
+            .unwrap_or_else(|_| redis::Client::open(DEFAULT_REDIS_URL).unwrap());
         Self {
             inner: Arc::new(AppStateInner {
                 tenant_dao: TenantDao::new(pool.clone()),
@@ -57,11 +69,24 @@ impl AppState {
                 asset_profile_dao: AssetProfileDao::new(pool.clone()),
                 dashboard_dao: DashboardDao::new(pool.clone()),
                 relation_dao: RelationDao::new(pool.clone()),
+                timeseries_dao: TimeseriesDao::new(pool.clone(), key_dictionary_dao.clone()),
+                attributes_dao: AttributesDao::new(pool.clone(), key_dictionary_dao.clone()),
+                key_dictionary_dao,
+                redis,
+                redis_conn: tokio::sync::OnceCell::new(),
                 auth_service: AuthService::new(pool.clone(), jwt_factory.clone()),
                 jwt_factory,
                 pool,
             }),
         }
+    }
+
+    /// 惰性建立并复用 Redis 连接（自动重连）；首次失败不影响后续重试。
+    pub async fn redis_manager(&self) -> redis::RedisResult<redis::aio::ConnectionManager> {
+        self.redis_conn
+            .get_or_try_init(|| redis::aio::ConnectionManager::new(self.redis.clone()))
+            .await
+            .cloned()
     }
 }
 

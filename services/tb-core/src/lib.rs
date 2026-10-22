@@ -4,6 +4,7 @@ pub mod auth_middleware;
 pub mod routes;
 pub mod seed;
 pub mod state;
+pub mod telemetry_cache;
 
 use axum::Router;
 use tb_auth::AuthState;

@@ -13,6 +13,7 @@ uuid.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+moka.workspace = true
 tb-common = { path = "../tb-common" }
 
 [dev-dependencies]

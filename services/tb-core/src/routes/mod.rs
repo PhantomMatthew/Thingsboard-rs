@@ -5,6 +5,7 @@ pub mod asset_profile;
 pub mod customer;
 pub mod device;
 pub mod device_profile;
+pub mod telemetry;
 pub mod tenant;
 pub mod user;
 
@@ -23,6 +24,7 @@ pub fn api_router() -> Router<AppState> {
         .merge(device_profile::router())
         .merge(asset::router())
         .merge(asset_profile::router())
+        .merge(telemetry::router())
 }
 
 #[derive(Debug, Deserialize)]
