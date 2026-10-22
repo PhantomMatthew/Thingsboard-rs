@@ -5,10 +5,12 @@ members = [
     "crates/tb-proto",
     "crates/tb-queue",
     "crates/tb-dao",
+    "crates/tb-rule-engine",
     "crates/tb-script",
     "crates/tb-transport-api",
     "services/tb-auth",
     "services/tb-core",
+    "services/tb-rule-engine",
     "services/tb-transport-http",
     "services/tb-transport-mqtt",
 ]

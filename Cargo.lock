@@ -719,7 +719,7 @@ checksum = "da0e4dd2a88388a1f4ccc7c9ce104604dab68d9f408dc34cd45823d5a9069095"
 dependencies = [
  "futures-core",
  "futures-sink",
- "spin",
+ "spin 0.9.9",
 ]
 
 [[package]]
@@ -1336,7 +1336,7 @@ version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 dependencies = [
- "spin",
+ "spin 0.9.9",
 ]
 
 [[package]]
@@ -1507,6 +1507,15 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "tempfile",
+]
+
+[[package]]
+name = "no-std-compat"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b93853da6d84c2e3c7d730d6473e8817692dd89be387eb01b94d7f108ecb5b8c"
+dependencies = [
+ "spin 0.5.2",
 ]
 
 [[package]]
@@ -2117,6 +2126,7 @@ dependencies = [
  "ahash",
  "bitflags",
  "compact_str",
+ "no-std-compat",
  "num-traits",
  "once_cell",
  "rhai_codegen",
@@ -2560,6 +2570,12 @@ dependencies = [
 
 [[package]]
 name = "spin"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e63cff320ae2c57904679ba7cb63280a3dc4613885beafb148ee7bf9aa9042d"
+
+[[package]]
+name = "spin"
 version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
@@ -2925,6 +2941,7 @@ dependencies = [
  "tb-dao",
  "tb-proto",
  "tb-queue",
+ "tb-rule-engine",
  "thiserror 2.0.21",
  "tokio",
  "tower",
@@ -2959,6 +2976,7 @@ dependencies = [
  "prost-build",
  "serde_json",
  "tb-common",
+ "uuid",
 ]
 
 [[package]]
@@ -2976,9 +2994,53 @@ dependencies = [
 ]
 
 [[package]]
+name = "tb-rule-engine"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "moka",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tb-common",
+ "tb-dao",
+ "tb-queue",
+ "tb-script",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "tb-rule-engine-server"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "chrono",
+ "prost",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tb-auth",
+ "tb-common",
+ "tb-core",
+ "tb-dao",
+ "tb-proto",
+ "tb-queue",
+ "tb-rule-engine",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "tb-script"
 version = "0.1.0"
 dependencies = [
+ "moka",
  "rhai",
  "serde_json",
  "tb-common",

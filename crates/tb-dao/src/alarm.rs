@@ -114,6 +114,23 @@ impl AlarmDao {
         .map_err(TbError::db)
     }
 
+    /// originator+type 维度的最新告警（规则引擎 create_alarm 判重用）。
+    pub async fn find_latest_by_originator_and_type(
+        &self,
+        originator_id: Uuid,
+        alarm_type: &str,
+    ) -> TbResult<Option<Alarm>> {
+        sqlx::query_as::<_, Alarm>(
+            "SELECT * FROM alarm WHERE originator_id = $1 AND type = $2 \
+             ORDER BY created_time DESC LIMIT 1",
+        )
+        .bind(originator_id)
+        .bind(alarm_type)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(TbError::db)
+    }
+
     pub async fn find_by_tenant(
         &self,
         tenant_id: Uuid,

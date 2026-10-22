@@ -58,6 +58,7 @@ async fn save_tenant(
         }
         None => (Uuid::now_v7(), 0),
     };
+    let is_new = req.id.is_none();
     let tenant_profile_id = match req.tenant_profile_id {
         Some(p) => Some(p),
         None => state.tenant_profile_dao.find_default().await?.map(|p| p.id),
@@ -78,7 +79,11 @@ async fn save_tenant(
         additional_info: req.additional_info,
         tenant_profile_id,
     };
-    Ok(Json(state.tenant_dao.save(&tenant).await?))
+    let saved = state.tenant_dao.save(&tenant).await?;
+    if is_new {
+        crate::routes::rule_chain::seed_default_root_chain(&state, saved.id).await?;
+    }
+    Ok(Json(saved))
 }
 
 async fn get_tenant(

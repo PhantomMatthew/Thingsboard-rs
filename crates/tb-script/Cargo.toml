@@ -5,7 +5,8 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
-rhai.workspace = true
+rhai = { workspace = true, features = ["sync"] }
 serde_json.workspace = true
 thiserror.workspace = true
+moka = { workspace = true, features = ["sync"] }
 tb-common = { path = "../tb-common" }

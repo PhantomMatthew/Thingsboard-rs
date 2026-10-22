@@ -35,7 +35,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tb_core::seed::seed(&state).await?;
 
     let transport_api = tb_core::transport_api::start_transport_api(state.clone()).await;
-    let ingest = tb_core::telemetry_ingest::start_telemetry_ingest(state.clone()).await;
+    // Phase 4 起遥测落库由 tb-rule-engine 接管；TB_INGEST_ENABLED=true 时才开旧直通 ingest。
+    let ingest_enabled = std::env::var("TB_INGEST_ENABLED")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    let ingest = if ingest_enabled {
+        Some(tb_core::telemetry_ingest::start_telemetry_ingest(state.clone()).await)
+    } else {
+        None
+    };
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!(port, "tb-core listening");
@@ -45,6 +53,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
     transport_api.abort();
-    ingest.abort();
+    if let Some(ingest) = ingest {
+        ingest.abort();
+    }
     Ok(())
 }

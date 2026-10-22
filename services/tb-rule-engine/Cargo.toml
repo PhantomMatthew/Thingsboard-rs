@@ -1,0 +1,31 @@
+[package]
+name = "tb-rule-engine-server"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tb-rule-engine"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+prost.workspace = true
+bytes.workspace = true
+sqlx.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tb-common = { path = "../../crates/tb-common" }
+tb-proto = { path = "../../crates/tb-proto" }
+tb-queue = { path = "../../crates/tb-queue" }
+tb-dao = { path = "../../crates/tb-dao" }
+tb-rule-engine = { path = "../../crates/tb-rule-engine" }
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tb-auth = { path = "../tb-auth" }
+tb-core = { path = "../tb-core" }

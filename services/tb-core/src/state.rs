@@ -7,8 +7,8 @@ use sqlx::PgPool;
 use tb_auth::{AuthService, JwtTokenFactory};
 use tb_dao::{
     AssetDao, AssetProfileDao, AttributesDao, CustomerDao, DashboardDao, DeviceCredentialsDao,
-    DeviceDao, DeviceProfileDao, KeyDictionaryDao, RelationDao, TenantDao, TenantProfileDao,
-    TimeseriesDao, UserCredentialsDao, UserDao,
+    DeviceDao, DeviceProfileDao, KeyDictionaryDao, RelationDao, RuleChainDao, RuleNodeDao,
+    TenantDao, TenantProfileDao, TimeseriesDao, UserCredentialsDao, UserDao,
 };
 
 const DEFAULT_REDIS_URL: &str = "redis://localhost:16379";
@@ -27,6 +27,8 @@ pub struct AppStateInner {
     pub asset_profile_dao: AssetProfileDao,
     pub dashboard_dao: DashboardDao,
     pub relation_dao: RelationDao,
+    pub rule_chain_dao: RuleChainDao,
+    pub rule_node_dao: RuleNodeDao,
     pub key_dictionary_dao: KeyDictionaryDao,
     pub timeseries_dao: TimeseriesDao,
     pub attributes_dao: AttributesDao,
@@ -69,6 +71,8 @@ impl AppState {
                 asset_profile_dao: AssetProfileDao::new(pool.clone()),
                 dashboard_dao: DashboardDao::new(pool.clone()),
                 relation_dao: RelationDao::new(pool.clone()),
+                rule_chain_dao: RuleChainDao::new(pool.clone()),
+                rule_node_dao: RuleNodeDao::new(pool.clone()),
                 timeseries_dao: TimeseriesDao::new(pool.clone(), key_dictionary_dao.clone()),
                 attributes_dao: AttributesDao::new(pool.clone(), key_dictionary_dao.clone()),
                 key_dictionary_dao,

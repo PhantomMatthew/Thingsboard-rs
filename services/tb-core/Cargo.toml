@@ -24,6 +24,7 @@ tb-common = { path = "../../crates/tb-common" }
 tb-proto = { path = "../../crates/tb-proto" }
 tb-queue = { path = "../../crates/tb-queue" }
 tb-dao = { path = "../../crates/tb-dao" }
+tb-rule-engine = { path = "../../crates/tb-rule-engine" }
 tb-auth = { path = "../tb-auth" }
 
 [dev-dependencies]
