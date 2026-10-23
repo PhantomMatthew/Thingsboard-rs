@@ -1,0 +1,30 @@
+[package]
+name = "tb-transport-coap"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+bytes.workspace = true
+prost.workspace = true
+dashmap.workspace = true
+coap-lite.workspace = true
+tb-common = { path = "../../crates/tb-common" }
+tb-proto = { path = "../../crates/tb-proto" }
+tb-queue = { path = "../../crates/tb-queue" }
+tb-transport-api = { path = "../../crates/tb-transport-api" }
+
+[dev-dependencies]
+axum.workspace = true
+reqwest = { version = "0.12", features = ["json"] }
+tb-core = { path = "../tb-core" }
+tb-auth = { path = "../tb-auth" }
+tb-dao = { path = "../../crates/tb-dao" }
+sqlx.workspace = true
