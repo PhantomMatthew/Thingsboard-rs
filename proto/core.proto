@@ -3,6 +3,7 @@ syntax = "proto3";
 package tb.core;
 
 import "common.proto";
+import "transport_api.proto";
 
 // ---- Transport → Core 异步消息（tb_core topic）----
 
@@ -95,7 +96,14 @@ message ToTransportMsg {
     ToDeviceRpcRequestMsg to_device_rpc = 6;
     ToServerRpcResponseMsg to_server_rpc_response = 7;
     EntityUpdatedMsg entity_updated = 8;
+    OtaUpdateNotification ota_update = 9;
   }
+}
+
+// OTA 固件/软件绑定更新通知：transport 向设备推送 fw_* 元信息。
+message OtaUpdateNotification {
+  tb.common.OtaPackageType ota_type = 1;
+  tb.transport.OtaPackageProto ota_package = 2; // 空（缺省）表示解绑
 }
 
 message SessionCloseNotification {

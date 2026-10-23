@@ -46,7 +46,10 @@ pub async fn run(socket: TcpStream, peer: SocketAddr, state: TransportState) {
     };
     let session_id = session.info.session_id.clone();
     let reason = serve(&mut framed, &state, &mut session).await;
+    // 网关断开：全部子设备逻辑会话一并关闭。
+    crate::gateway::close_all_sub_devices(&state, &mut session, &reason).await;
     state.sessions.remove(&session_id);
+    state.ota_packages.invalidate(&session_id).await;
     send_core(
         &state,
         &session.device,
@@ -105,6 +108,19 @@ async fn connect(
         .await;
         return None;
     }
+    // provisioning 会话：username="provision"，不认证不注册设备会话。
+    if connect.username.as_deref() == Some(crate::provision::PROVISION_USERNAME) {
+        send(
+            framed,
+            MqttPacket::ConnAck {
+                session_present: false,
+                return_code: connack_code::ACCEPTED,
+            },
+        )
+        .await;
+        crate::provision::serve(framed, state).await;
+        return None;
+    }
     let Some((device, _profile)) = authenticate(state, &connect).await else {
         send(
             framed,
@@ -136,14 +152,22 @@ async fn connect(
         is_gateway: false,
         gateway_session_id: String::new(),
     };
+    let is_gateway = serde_json::from_str::<serde_json::Value>(&device.additional_info_json)
+        .ok()
+        .and_then(|v| v.get("gateway").and_then(|g| g.as_bool()))
+        .unwrap_or(false);
     let (tx, rx) = mpsc::channel(DOWNLINK_CHANNEL_SIZE);
     let session = Session {
         info,
         device,
         keep_alive: connect.keep_alive,
+        tx: tx.clone(),
         rx,
+        is_gateway,
+        sub_devices: HashMap::new(),
         attributes_qos: Arc::new(AtomicU8::new(UNSUBSCRIBED)),
         rpc_qos: Arc::new(AtomicU8::new(UNSUBSCRIBED)),
+        gateway_rpc_qos: Arc::new(AtomicU8::new(UNSUBSCRIBED)),
         next_packet_id: 0,
         inflight: HashSet::new(),
     };
@@ -153,6 +177,7 @@ async fn connect(
             tx,
             attributes_qos: session.attributes_qos.clone(),
             rpc_qos: session.rpc_qos.clone(),
+            gateway_device: None,
         },
     );
     send_core(
@@ -205,13 +230,27 @@ async fn authenticate(
     }
 }
 
-struct Session {
-    info: core_pb::SessionInfoProto,
-    device: pb::DeviceInfoProto,
+/// 网关子设备的逻辑会话。
+pub struct SubDevice {
+    pub info: core_pb::SessionInfoProto,
+    pub device: pb::DeviceInfoProto,
+}
+
+pub struct Session {
+    pub info: core_pb::SessionInfoProto,
+    pub device: pb::DeviceInfoProto,
     keep_alive: u16,
+    /// 下行 channel 发送端：子设备会话复用同一物理连接。
+    pub tx: mpsc::Sender<MqttPacket>,
     rx: mpsc::Receiver<MqttPacket>,
+    /// additional_info.gateway=true：允许 v1/gateway/* topic。
+    pub is_gateway: bool,
+    /// 子设备名 → 逻辑会话。
+    pub sub_devices: HashMap<String, SubDevice>,
     attributes_qos: Arc<AtomicU8>,
     rpc_qos: Arc<AtomicU8>,
+    /// v1/gateway/rpc 的订阅等级（应用到全部子设备会话）。
+    pub gateway_rpc_qos: Arc<AtomicU8>,
     next_packet_id: u16,
     /// 下行 QoS1 未 ack 的 packet_id 集合（PUBACK 清除；断连即整会话丢弃，无需重传）。
     inflight: HashSet<u16>,
@@ -224,13 +263,13 @@ impl Session {
     }
 }
 
-async fn send(framed: &mut Framed<TcpStream, MqttCodec>, packet: MqttPacket) {
+pub(crate) async fn send(framed: &mut Framed<TcpStream, MqttCodec>, packet: MqttPacket) {
     if let Err(e) = framed.send(packet).await {
         tracing::debug!("send failed: {e}");
     }
 }
 
-async fn send_core(
+pub(crate) async fn send_core(
     state: &TransportState,
     device: &pb::DeviceInfoProto,
     msg: core_pb::to_core_msg::Msg,
@@ -343,6 +382,17 @@ async fn handle(
                         )
                         .await;
                     }
+                    crate::gateway::TOPIC_RPC => {
+                        if !session.is_gateway {
+                            granted.push(0x80);
+                            continue;
+                        }
+                        crate::gateway::subscribe_rpc(state, session, granted_qos).await;
+                    }
+                    crate::ota::TOPIC_FW_SUBSCRIBE => {
+                        // 订阅即视为 OTA 就绪：主动检查并推 fw_* 元信息。
+                        crate::ota::check_firmware(framed, state, session).await;
+                    }
                     other => tracing::debug!(topic = other, "ignored subscribe"),
                 }
                 granted.push(granted_qos);
@@ -402,13 +452,32 @@ async fn handle(
 async fn handle_publish(
     framed: &mut Framed<TcpStream, MqttCodec>,
     state: &TransportState,
-    session: &Session,
+    session: &mut Session,
     p: PublishPacket,
 ) -> Result<(), String> {
     if p.qos == 2 {
         return Err("qos 2 unsupported".into());
     }
     let topic = p.topic.as_str();
+    if topic.starts_with("v1/gateway/") {
+        if !session.is_gateway {
+            return Err("gateway api not allowed for non-gateway device".into());
+        }
+        let packet_id = (p.qos == 1).then_some(p.packet_id).flatten();
+        crate::gateway::handle_publish(framed, state, session, p).await;
+        if let Some(packet_id) = packet_id {
+            send(framed, MqttPacket::PubAck(packet_id)).await;
+        }
+        return Ok(());
+    }
+    if let Some(rest) = topic.strip_prefix(crate::ota::TOPIC_FW_REQUEST_PREFIX) {
+        let packet_id = (p.qos == 1).then_some(p.packet_id).flatten();
+        crate::ota::handle_chunk_request(framed, state, session, rest, &p.payload).await;
+        if let Some(packet_id) = packet_id {
+            send(framed, MqttPacket::PubAck(packet_id)).await;
+        }
+        return Ok(());
+    }
     if topic == TOPIC_TELEMETRY {
         match parse_telemetry(&p.payload) {
             Ok(entries) => {
@@ -527,7 +596,7 @@ struct TsValues {
     values: HashMap<String, KvValue>,
 }
 
-fn parse_telemetry(payload: &[u8]) -> Result<Vec<TsKvEntry>, serde_json::Error> {
+pub(crate) fn parse_telemetry(payload: &[u8]) -> Result<Vec<TsKvEntry>, serde_json::Error> {
     let now = chrono::Utc::now().timestamp_millis();
     let parsed: TelemetryPayload = serde_json::from_slice(payload)?;
     Ok(match parsed {

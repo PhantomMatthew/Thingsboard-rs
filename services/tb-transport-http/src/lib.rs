@@ -67,6 +67,8 @@ pub fn build_router(state: TransportState) -> Router {
         .route("/api/v1/{token}/claim", post(claim))
         .route("/api/v1/{token}/rpc", post(post_rpc).get(get_rpc))
         .route("/api/v1/{token}/rpc/{requestId}", post(post_rpc_response))
+        .route("/api/v1/{token}/firmware", get(get_firmware))
+        .route("/api/v1/provision", post(provision))
         .with_state(state)
 }
 
@@ -362,4 +364,84 @@ async fn post_rpc_response(
     )
     .await?;
     Ok(StatusCode::OK)
+}
+
+const DEFAULT_CHUNK_SIZE: i32 = 16 * 1024;
+
+#[derive(Debug, Deserialize)]
+struct FirmwareQuery {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    chunk: Option<i32>,
+    #[serde(default)]
+    size: Option<i32>,
+}
+
+/// GET firmware：按设备当前 title/version 查可更新包，返回指定分块二进制。
+async fn get_firmware(
+    State(state): State<TransportState>,
+    Path(token): Path<String>,
+    Query(query): Query<FirmwareQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let device = validate(&state, &token).await?;
+    let package = state
+        .transport_api
+        .get_ota_package(
+            &device.tenant_id,
+            &device.device_profile_id,
+            tb_proto::common::OtaPackageType::Firmware,
+            &query.title,
+            &query.version,
+        )
+        .await?
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no firmware update".into()))?;
+    let chunk = state
+        .transport_api
+        .get_ota_chunk(
+            &package.ota_package_id,
+            query.chunk.unwrap_or(0).max(0),
+            query.size.filter(|s| *s > 0).unwrap_or(DEFAULT_CHUNK_SIZE),
+        )
+        .await?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        chunk,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProvisionRequest {
+    device_name: String,
+    provision_device_key: String,
+    provision_device_secret: String,
+}
+
+/// POST /api/v1/provision：无 token，profile provisionConfiguration 校验。
+async fn provision(
+    State(state): State<TransportState>,
+    Json(req): Json<ProvisionRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let resp = state
+        .transport_api
+        .provision_device(
+            "",
+            &req.device_name,
+            &req.provision_device_key,
+            &req.provision_device_secret,
+        )
+        .await?;
+    if resp.status == "SUCCESS" {
+        Ok(Json(json!({
+            "status": "SUCCESS",
+            "credentialsType": resp.credentials_type,
+            "credentialsValue": resp.credentials_value,
+            "deviceName": resp.device_name,
+        })))
+    } else {
+        Ok(Json(json!({"status": "FAILURE", "errorMsg": resp.error_msg})))
+    }
 }

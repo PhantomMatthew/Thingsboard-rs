@@ -18,6 +18,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 thiserror.workspace = true
 dashmap.workspace = true
+moka.workspace = true
 tb-common = { path = "../../crates/tb-common" }
 tb-proto = { path = "../../crates/tb-proto" }
 tb-queue = { path = "../../crates/tb-queue" }
@@ -26,7 +27,7 @@ tb-transport-api = { path = "../../crates/tb-transport-api" }
 [dev-dependencies]
 rumqttc = "0.24"
 axum.workspace = true
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "multipart"] }
 tokio.workspace = true
 tb-core = { path = "../tb-core" }
 tb-auth = { path = "../tb-auth" }

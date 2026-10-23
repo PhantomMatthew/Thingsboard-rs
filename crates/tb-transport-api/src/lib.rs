@@ -287,6 +287,128 @@ impl TransportApiClient {
             .await
     }
 
+    /// 网关子设备 get-or-create。
+    pub async fn get_or_create_gateway_device(
+        &self,
+        gateway: &pb::DeviceInfoProto,
+        device_name: &str,
+        device_type: &str,
+    ) -> TbResult<pb::DeviceInfoProto> {
+        let resp = self
+            .request(
+                pb::transport_api_request_msg::Request::GetOrCreateGatewayDevice(
+                    pb::GetOrCreateGatewayDeviceRequest {
+                        gateway_id: gateway.device_id.clone(),
+                        tenant_id: gateway.tenant_id.clone(),
+                        device_name: device_name.to_string(),
+                        device_type: device_type.to_string(),
+                    },
+                ),
+            )
+            .await?;
+        match resp.response {
+            Some(pb::transport_api_response_msg::Response::GatewayDevice(d)) => Ok(d),
+            Some(pb::transport_api_response_msg::Response::Error(e)) => Err(TbError::Internal(
+                format!("transport-api error {}: {}", e.code, e.message),
+            )),
+            other => {
+                tracing::warn!(?other, "unexpected transport-api response");
+                Err(TbError::Internal("unexpected transport-api response".into()))
+            }
+        }
+    }
+
+    /// 查该档案下可更新的 OTA 包元数据；404 → Ok(None)。
+    pub async fn get_ota_package(
+        &self,
+        tenant_id: &str,
+        device_profile_id: &str,
+        ota_type: tb_proto::common::OtaPackageType,
+        current_title: &str,
+        current_version: &str,
+    ) -> TbResult<Option<pb::OtaPackageProto>> {
+        let resp = self
+            .request(pb::transport_api_request_msg::Request::GetOtaPackage(
+                pb::GetOtaPackageRequest {
+                    tenant_id: tenant_id.to_string(),
+                    device_profile_id: device_profile_id.to_string(),
+                    r#type: ota_type as i32,
+                    current_title: current_title.to_string(),
+                    current_version: current_version.to_string(),
+                },
+            ))
+            .await?;
+        match resp.response {
+            Some(pb::transport_api_response_msg::Response::OtaPackage(p)) => Ok(Some(p)),
+            Some(pb::transport_api_response_msg::Response::Error(e)) if e.code == 404 => Ok(None),
+            Some(pb::transport_api_response_msg::Response::Error(e)) => Err(TbError::Internal(
+                format!("transport-api error {}: {}", e.code, e.message),
+            )),
+            other => {
+                tracing::warn!(?other, "unexpected transport-api response");
+                Err(TbError::Internal("unexpected transport-api response".into()))
+            }
+        }
+    }
+
+    /// 拉取 OTA 数据分块；越界返回空。
+    pub async fn get_ota_chunk(
+        &self,
+        ota_package_id: &str,
+        chunk_index: i32,
+        chunk_size: i32,
+    ) -> TbResult<Bytes> {
+        let resp = self
+            .request(pb::transport_api_request_msg::Request::GetOtaChunk(
+                pb::GetOtaChunkRequest {
+                    ota_package_id: ota_package_id.to_string(),
+                    chunk_index,
+                    chunk_size,
+                },
+            ))
+            .await?;
+        match resp.response {
+            Some(pb::transport_api_response_msg::Response::OtaChunk(c)) => Ok(c.data.into()),
+            Some(pb::transport_api_response_msg::Response::Error(e)) => Err(TbError::Internal(
+                format!("transport-api error {}: {}", e.code, e.message),
+            )),
+            other => {
+                tracing::warn!(?other, "unexpected transport-api response");
+                Err(TbError::Internal("unexpected transport-api response".into()))
+            }
+        }
+    }
+
+    /// 设备 provisioning：返回 SUCCESS/FAILURE 及凭证。
+    pub async fn provision_device(
+        &self,
+        tenant_id: &str,
+        device_name: &str,
+        provision_device_key: &str,
+        provision_device_secret: &str,
+    ) -> TbResult<pb::ProvisionDeviceResponse> {
+        let resp = self
+            .request(pb::transport_api_request_msg::Request::ProvisionDevice(
+                pb::ProvisionDeviceRequest {
+                    tenant_id: tenant_id.to_string(),
+                    device_name: device_name.to_string(),
+                    provision_device_key: provision_device_key.to_string(),
+                    provision_device_secret: provision_device_secret.to_string(),
+                },
+            ))
+            .await?;
+        match resp.response {
+            Some(pb::transport_api_response_msg::Response::ProvisionResponse(r)) => Ok(r),
+            Some(pb::transport_api_response_msg::Response::Error(e)) => Err(TbError::Internal(
+                format!("transport-api error {}: {}", e.code, e.message),
+            )),
+            other => {
+                tracing::warn!(?other, "unexpected transport-api response");
+                Err(TbError::Internal("unexpected transport-api response".into()))
+            }
+        }
+    }
+
     async fn publish(
         &self,
         device: &pb::DeviceInfoProto,

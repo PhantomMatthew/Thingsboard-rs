@@ -16,6 +16,8 @@ message TransportApiRequestMsg {
     GetOrCreateGatewayDeviceRequest get_or_create_gateway_device = 6;
     GetOtaPackageRequest get_ota_package = 7;
     GetAttributesRequest get_attributes = 8;
+    ProvisionDeviceRequest provision_device = 9;
+    GetOtaChunkRequest get_ota_chunk = 10;
   }
 }
 
@@ -28,6 +30,8 @@ message TransportApiResponseMsg {
     OtaPackageProto ota_package = 5;
     TransportApiError error = 6;
     GetAttributesResponse get_attributes_response = 7;
+    ProvisionDeviceResponse provision_response = 8;
+    GetOtaChunkResponse ota_chunk = 9;
   }
 }
 
@@ -75,6 +79,32 @@ message GetOtaPackageRequest {
   string current_version = 5;
 }
 
+message GetOtaChunkRequest {
+  string ota_package_id = 1;
+  int32 chunk_index = 2;
+  int32 chunk_size = 3;
+}
+
+message GetOtaChunkResponse {
+  bytes data = 1; // 切片结果；越界为空
+}
+
+// 设备 provisioning：key/secret 对设备档案 profile_data.provisionConfiguration 校验。
+message ProvisionDeviceRequest {
+  string tenant_id = 1; // 可空：空则全局按 provision key 匹配档案
+  string device_name = 2;
+  string provision_device_key = 3;
+  string provision_device_secret = 4;
+}
+
+message ProvisionDeviceResponse {
+  string status = 1;           // SUCCESS / FAILURE
+  string credentials_type = 2; // ACCESS_TOKEN
+  string credentials_value = 3;
+  string device_name = 4;
+  string error_msg = 5;
+}
+
 message ValidateCredentialsResponse {
   bool valid = 1;
   DeviceInfoProto device = 2;      // valid=true 时填充
@@ -89,6 +119,7 @@ message DeviceInfoProto {
   string device_profile_id = 4;
   string device_name = 5;
   string device_type = 6;
+  string additional_info_json = 7; // 设备 additional_info（网关标记等）
 }
 
 message DeviceProfileProto {

@@ -91,9 +91,35 @@ impl OtaPackageDao {
         Ok(res.rows_affected() > 0)
     }
 
-    pub async fn find_by_tenant_id(
+    /// 该档案下指定类型的最新 OTA 包：同 title（非空时）且版本与当前不同。
+    pub async fn find_latest(
         &self,
         tenant_id: Uuid,
+        device_profile_id: Uuid,
+        r#type: &str,
+        current_title: &str,
+        current_version: &str,
+    ) -> TbResult<Option<OtaPackage>> {
+        sqlx::query_as::<_, OtaPackage>(
+            "SELECT * FROM ota_package WHERE tenant_id = $1 AND device_profile_id = $2 \
+             AND type = $3 AND ($4 = '' OR title = $4) AND version != $5 \
+             ORDER BY created_time DESC LIMIT 1",
+        )
+        .bind(tenant_id)
+        .bind(device_profile_id)
+        .bind(r#type)
+        .bind(current_title)
+        .bind(current_version)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(TbError::db)
+    }
+
+    pub async fn find_by_tenant_id_filtered(
+        &self,
+        tenant_id: Uuid,
+        device_profile_id: Option<Uuid>,
+        r#type: Option<&str>,
         page_link: &PageLink,
     ) -> TbResult<PageData<OtaPackage>> {
         let sort = page_link.sort_column(&["title", "version", "created_time"]);
@@ -101,20 +127,28 @@ impl OtaPackageDao {
         let pattern = page_link.search_pattern();
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM ota_package WHERE tenant_id = $1 \
-             AND ($2::text IS NULL OR LOWER(title) LIKE $2)",
+             AND ($2::text IS NULL OR LOWER(title) LIKE $2) \
+             AND ($3::uuid IS NULL OR device_profile_id = $3) \
+             AND ($4::text IS NULL OR type = $4)",
         )
         .bind(tenant_id)
         .bind(&pattern)
+        .bind(device_profile_id)
+        .bind(r#type)
         .fetch_one(&self.pool)
         .await
         .map_err(TbError::db)?;
         let data = sqlx::query_as::<_, OtaPackage>(&format!(
             "SELECT * FROM ota_package WHERE tenant_id = $1 \
              AND ($2::text IS NULL OR LOWER(title) LIKE $2) \
-             ORDER BY {sort} {order} LIMIT $3 OFFSET $4"
+             AND ($3::uuid IS NULL OR device_profile_id = $3) \
+             AND ($4::text IS NULL OR type = $4) \
+             ORDER BY {sort} {order} LIMIT $5 OFFSET $6"
         ))
         .bind(tenant_id)
         .bind(&pattern)
+        .bind(device_profile_id)
+        .bind(r#type)
         .bind(page_link.limit())
         .bind(page_link.offset())
         .fetch_all(&self.pool)

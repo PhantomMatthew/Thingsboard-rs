@@ -5,6 +5,9 @@
 
 pub mod codec;
 pub mod downlink;
+pub mod gateway;
+pub mod ota;
+pub mod provision;
 pub mod session;
 
 use std::sync::Arc;
@@ -22,10 +25,12 @@ use crate::codec::MqttPacket;
 pub const UNSUBSCRIBED: u8 = 0xFF;
 
 /// 在线会话句柄：下行包经 tx 交给会话 task；qos 原子位记录已授予的订阅等级。
+/// gateway_device 非空表示这是网关子设备的逻辑会话（下行 RPC 包装成 v1/gateway/rpc）。
 pub struct SessionHandle {
     pub tx: mpsc::Sender<MqttPacket>,
     pub attributes_qos: Arc<AtomicU8>,
     pub rpc_qos: Arc<AtomicU8>,
+    pub gateway_device: Option<String>,
 }
 
 pub type SessionRegistry = Arc<DashMap<String, SessionHandle>>;
@@ -37,6 +42,8 @@ pub struct TransportState {
     pub node_id: String,
     pub brokers: String,
     pub sessions: SessionRegistry,
+    /// session_id → 当前可更新的固件包元数据（OTA 分块请求用）。
+    pub ota_packages: moka::future::Cache<String, tb_proto::transport::OtaPackageProto>,
 }
 
 impl TransportState {
@@ -47,6 +54,9 @@ impl TransportState {
             node_id: node_id.to_string(),
             brokers: brokers.to_string(),
             sessions: Arc::new(DashMap::new()),
+            ota_packages: moka::future::Cache::builder()
+                .time_to_live(std::time::Duration::from_secs(3600))
+                .build(),
         })
     }
 }

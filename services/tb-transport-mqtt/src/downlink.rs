@@ -11,7 +11,7 @@ use tb_proto::core as core_pb;
 use tb_queue::{QueueConsumer as _, StreamQueueConsumer, TbTopic};
 
 use crate::codec::{MqttPacket, PublishPacket};
-use crate::{SessionRegistry, TransportState, UNSUBSCRIBED, session};
+use crate::{TransportState, UNSUBSCRIBED, session};
 
 pub async fn run(state: TransportState) {
     let topic = TbTopic::transport_notifications(&state.node_id);
@@ -30,7 +30,7 @@ pub async fn run(state: TransportState) {
     };
     loop {
         match consumer.recv().await {
-            Ok(msg) => handle(&state.sessions, msg.payload).await,
+            Ok(msg) => handle(&state, msg.payload).await,
             Err(e) => {
                 tracing::error!("notifications consumer error: {e}");
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -39,7 +39,8 @@ pub async fn run(state: TransportState) {
     }
 }
 
-async fn handle(registry: &SessionRegistry, payload: Bytes) {
+async fn handle(state: &TransportState, payload: Bytes) {
+    let registry = &state.sessions;
     let Ok(msg) = core_pb::ToTransportMsg::decode(payload) else {
         tracing::warn!("undecodable transport notification");
         return;
@@ -91,10 +92,36 @@ async fn handle(registry: &SessionRegistry, payload: Bytes) {
             }
             let params: serde_json::Value =
                 serde_json::from_str(&rpc.params_json).unwrap_or(serde_json::Value::Null);
-            let body = serde_json::json!({"method": rpc.method, "params": params});
+            // 网关子设备会话：包装成 v1/gateway/rpc {"device","data":{"id","method","params"}}。
+            let (topic, body) = match &handle.gateway_device {
+                Some(name) => (
+                    crate::gateway::TOPIC_RPC.to_string(),
+                    serde_json::json!({
+                        "device": name,
+                        "data": {"id": rpc.request_id, "method": rpc.method, "params": params},
+                    }),
+                ),
+                None => (
+                    format!("{}{}", session::TOPIC_RPC_REQUEST_PREFIX, rpc.request_id),
+                    serde_json::json!({"method": rpc.method, "params": params}),
+                ),
+            };
+            send(handle, topic, body.to_string().into_bytes(), qos).await;
+        }
+        core_pb::to_transport_msg::Msg::OtaUpdate(n) => {
+            let Some(handle) = registry.get(&msg.session_id) else {
+                return;
+            };
+            let Some(pkg) = n.ota_package else {
+                return;
+            };
+            state.ota_packages.insert(msg.session_id.clone(), pkg.clone()).await;
+            let body = crate::ota::fw_attributes_body(&pkg);
+            let qos = handle.attributes_qos.load(Ordering::Relaxed);
+            let qos = if qos == UNSUBSCRIBED { 0 } else { qos };
             send(
                 handle,
-                format!("{}{}", session::TOPIC_RPC_REQUEST_PREFIX, rpc.request_id),
+                session::TOPIC_ATTRIBUTES.to_string(),
                 body.to_string().into_bytes(),
                 qos,
             )

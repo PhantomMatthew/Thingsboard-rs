@@ -7,8 +7,9 @@ use sqlx::PgPool;
 use tb_auth::{AuthService, JwtTokenFactory};
 use tb_dao::{
     AlarmDao, AssetDao, AssetProfileDao, AttributesDao, CustomerDao, DashboardDao,
-    DeviceCredentialsDao, DeviceDao, DeviceProfileDao, KeyDictionaryDao, RelationDao, RuleChainDao,
-    RuleNodeDao, TenantDao, TenantProfileDao, TimeseriesDao, UserCredentialsDao, UserDao,
+    DeviceCredentialsDao, DeviceDao, DeviceProfileDao, KeyDictionaryDao, OtaPackageDao,
+    RelationDao, RuleChainDao, RuleNodeDao, TenantDao, TenantProfileDao, TimeseriesDao,
+    UserCredentialsDao, UserDao,
 };
 use tb_queue::KafkaQueueProducer;
 
@@ -37,6 +38,7 @@ pub struct AppStateInner {
     pub timeseries_dao: TimeseriesDao,
     pub attributes_dao: AttributesDao,
     pub alarm_dao: AlarmDao,
+    pub ota_package_dao: OtaPackageDao,
     pub device_sessions: SharedDeviceSessionRegistry,
     pub redis: redis::Client,
     redis_conn: tokio::sync::OnceCell<redis::aio::ConnectionManager>,
@@ -86,6 +88,7 @@ impl AppState {
                 timeseries_dao: TimeseriesDao::new(pool.clone(), key_dictionary_dao.clone()),
                 attributes_dao: AttributesDao::new(pool.clone(), key_dictionary_dao.clone()),
                 alarm_dao: AlarmDao::new(pool.clone()),
+                ota_package_dao: OtaPackageDao::new(pool.clone()),
                 device_sessions: crate::device_session::DeviceSessionRegistry::new_shared(),
                 key_dictionary_dao,
                 redis,

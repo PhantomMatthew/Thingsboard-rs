@@ -83,6 +83,24 @@ impl DeviceProfileDao {
         .map_err(TbError::db)
     }
 
+    /// 按 provision key 匹配档案（provisioning 用）；tenant_id 为 None 时全局查找。
+    pub async fn find_by_provision_key(
+        &self,
+        tenant_id: Option<Uuid>,
+        key: &str,
+    ) -> TbResult<Option<DeviceProfile>> {
+        sqlx::query_as::<_, DeviceProfile>(
+            "SELECT * FROM device_profile WHERE provision_type != 'DISABLED' \
+             AND profile_data->'provisionConfiguration'->>'provisionDeviceKey' = $1 \
+             AND ($2::uuid IS NULL OR tenant_id = $2) LIMIT 1",
+        )
+        .bind(key)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(TbError::db)
+    }
+
     pub async fn delete_by_id(&self, id: Uuid) -> TbResult<bool> {
         let res = sqlx::query("DELETE FROM device_profile WHERE id = $1")
             .bind(id)

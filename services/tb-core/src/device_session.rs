@@ -105,6 +105,14 @@ impl DeviceSessionRegistry {
             .unwrap_or_default()
     }
 
+    /// 设备全部在线会话（OTA 通知等不限订阅的场景）。
+    pub fn any_sessions(&self, device_id: Uuid) -> Vec<SessionEntry> {
+        self.sessions
+            .get(&device_id)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// 节流窗口内是否已写过 activity（30s 一次）。
     pub fn activity_throttled(&self, device_id: Uuid, now: i64) -> bool {
         const WINDOW_MS: i64 = 30_000;

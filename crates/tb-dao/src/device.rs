@@ -78,6 +78,24 @@ impl DeviceDao {
             .map_err(TbError::db)
     }
 
+    pub async fn find_by_name(&self, tenant_id: Uuid, name: &str) -> TbResult<Option<Device>> {
+        sqlx::query_as::<_, Device>("SELECT * FROM device WHERE tenant_id = $1 AND name = $2")
+            .bind(tenant_id)
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(TbError::db)
+    }
+
+    /// 档案下全部设备 id（profile 级 OTA 绑定后批量通知用）。
+    pub async fn find_ids_by_profile_id(&self, device_profile_id: Uuid) -> TbResult<Vec<Uuid>> {
+        sqlx::query_scalar("SELECT id FROM device WHERE device_profile_id = $1")
+            .bind(device_profile_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(TbError::db)
+    }
+
     pub async fn delete_by_id(&self, id: Uuid) -> TbResult<bool> {
         let res = sqlx::query("DELETE FROM device WHERE id = $1")
             .bind(id)

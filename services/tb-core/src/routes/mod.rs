@@ -6,6 +6,7 @@ pub mod asset_profile;
 pub mod customer;
 pub mod device;
 pub mod device_profile;
+pub mod ota;
 pub mod rpc;
 pub mod rule_chain;
 pub mod telemetry;
@@ -31,6 +32,7 @@ pub fn api_router() -> Router<AppState> {
         .merge(telemetry::router())
         .merge(alarm::router())
         .merge(rpc::router())
+        .merge(ota::router())
 }
 
 #[derive(Debug, Deserialize)]
