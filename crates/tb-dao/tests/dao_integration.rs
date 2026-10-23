@@ -384,3 +384,54 @@ async fn alarm_latest_and_paged() -> TbResult<()> {
     tenant_dao.delete_by_id(tenant.id).await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn rule_node_debug_event_dao() -> TbResult<()> {
+    let pool = setup().await;
+    let dao = tb_dao::RuleNodeDebugEventDao::new(pool.clone());
+    let node_id = Uuid::now_v7();
+    let chain_id = Uuid::now_v7();
+    let tenant_id = Uuid::now_v7();
+
+    let mut e = tb_dao::RuleNodeDebugEvent::new(
+        tenant_id,
+        chain_id,
+        node_id,
+        Uuid::now_v7(),
+        "IN",
+        Some(serde_json::json!({"a": 1})),
+        None,
+        None,
+    );
+    dao.save(&e).await?;
+    e.ts += 10;
+    let mut out = e.clone();
+    out.id = Uuid::now_v7();
+    out.event_type = "OUT".into();
+    out.error = Some("boom".into());
+    dao.save(&out).await?;
+
+    let page = dao
+        .find_by_node(node_id, None, None, &PageLink::new(0, 10))
+        .await?;
+    assert_eq!(page.total_elements, 2);
+    assert_eq!(page.data[0].event_type, "OUT"); // ts desc
+    assert_eq!(page.data[0].error.as_deref(), Some("boom"));
+
+    // startTs 过滤
+    let page = dao
+        .find_by_node(node_id, Some(out.ts), None, &PageLink::new(0, 10))
+        .await?;
+    assert_eq!(page.total_elements, 1);
+
+    // 清理
+    let removed = dao.delete_older_than(out.ts + 1).await?;
+    assert!(removed >= 2);
+    assert_eq!(
+        dao.find_by_node(node_id, None, None, &PageLink::new(0, 10))
+            .await?
+            .total_elements,
+        0
+    );
+    Ok(())
+}

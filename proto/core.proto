@@ -32,7 +32,16 @@ message ToCoreMsg {
     ClaimDeviceMsg claim_device = 9;
     GetAttributesRequestMsg get_attributes = 10;
     UplinkNotificationMsg uplink_notification = 11;
+    RpcRequestMsg rpc_request = 12;
   }
+}
+
+// 规则引擎 action.rpc_oneway 的下行 RPC 请求（oneway 语义，不等响应）。
+message RpcRequestMsg {
+  string device_id = 1;
+  string method = 2;
+  string params_json = 3;
+  string request_id = 4; // 可空；为空时 core 自行分配
 }
 
 message SessionOpenMsg {

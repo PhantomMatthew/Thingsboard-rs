@@ -160,6 +160,21 @@ impl ScriptEngine {
         }
         dynamic_to_json(&result)
     }
+
+    /// 返回字符串的脚本（如 external.kafka 的 key_script）；标量值转字符串。
+    pub fn eval_string(
+        &self,
+        script: &str,
+        msg: &Value,
+        metadata: &HashMap<String, String>,
+        msg_type: &str,
+    ) -> Result<String, ScriptError> {
+        let result = self.run(script, msg, metadata, msg_type)?;
+        if let Ok(s) = result.clone().into_string() {
+            return Ok(s);
+        }
+        dynamic_to_json(&result).map(|v| v.to_string())
+    }
 }
 
 fn metadata_to_dynamic(metadata: &HashMap<String, String>) -> Dynamic {

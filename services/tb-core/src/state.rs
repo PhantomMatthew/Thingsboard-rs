@@ -8,8 +8,8 @@ use tb_auth::{AuthService, JwtTokenFactory};
 use tb_dao::{
     AlarmDao, AssetDao, AssetProfileDao, AttributesDao, CustomerDao, DashboardDao,
     DeviceCredentialsDao, DeviceDao, DeviceProfileDao, KeyDictionaryDao, OtaPackageDao,
-    RelationDao, RuleChainDao, RuleNodeDao, TenantDao, TenantProfileDao, TimeseriesDao,
-    UserCredentialsDao, UserDao,
+    RelationDao, RuleChainDao, RuleNodeDao, RuleNodeDebugEventDao, TenantDao, TenantProfileDao,
+    TimeseriesDao, UserCredentialsDao, UserDao,
 };
 use tb_queue::KafkaQueueProducer;
 
@@ -34,6 +34,7 @@ pub struct AppStateInner {
     pub relation_dao: RelationDao,
     pub rule_chain_dao: RuleChainDao,
     pub rule_node_dao: RuleNodeDao,
+    pub rule_node_debug_event_dao: RuleNodeDebugEventDao,
     pub key_dictionary_dao: KeyDictionaryDao,
     pub timeseries_dao: TimeseriesDao,
     pub attributes_dao: AttributesDao,
@@ -85,6 +86,7 @@ impl AppState {
                 relation_dao: RelationDao::new(pool.clone()),
                 rule_chain_dao: RuleChainDao::new(pool.clone()),
                 rule_node_dao: RuleNodeDao::new(pool.clone()),
+                rule_node_debug_event_dao: RuleNodeDebugEventDao::new(pool.clone()),
                 timeseries_dao: TimeseriesDao::new(pool.clone(), key_dictionary_dao.clone()),
                 attributes_dao: AttributesDao::new(pool.clone(), key_dictionary_dao.clone()),
                 alarm_dao: AlarmDao::new(pool.clone()),

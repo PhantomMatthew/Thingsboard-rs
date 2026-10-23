@@ -12,6 +12,13 @@ use tb_rule_engine::RuleEngineService;
 pub const DEFAULT_GROUP: &str = "tb-rule-engine";
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(30);
 
+fn parse_uuid(s: &str) -> Option<uuid::Uuid> {
+    if s.is_empty() {
+        return None;
+    }
+    uuid::Uuid::parse_str(s).ok()
+}
+
 pub async fn start_rule_engine(brokers: &str, pool: PgPool, queue_name: &str) -> tokio::task::JoinHandle<()> {
     start_rule_engine_for_group(brokers, pool, queue_name, DEFAULT_GROUP, DEFAULT_CACHE_TTL).await
 }
@@ -27,6 +34,9 @@ pub async fn start_rule_engine_for_group(
     let topic = TbTopic::rule_engine(queue_name);
     if let Err(e) = tb_queue::admin::ensure_topic(brokers, &topic, 10).await {
         tracing::warn!("ensure rule engine topic failed: {e}");
+    }
+    if let Err(e) = tb_queue::admin::ensure_topic(brokers, TbTopic::RULE_ENGINE_DLQ, 10).await {
+        tracing::warn!("ensure rule engine DLQ topic failed: {e}");
     }
     let producer = KafkaQueueProducer::new(brokers, "tb-rule-engine")
         .expect("kafka producer init failed");
@@ -53,11 +63,20 @@ pub async fn start_rule_engine_for_group(
                     let Some(tb_msg) = to_re.tb_msg else {
                         continue;
                     };
+                    // checkpoint 恢复：rule_chain_id + rule_node_id 非空时从指定节点继续。
+                    let resume = parse_uuid(&tb_msg.rule_chain_id)
+                        .zip(parse_uuid(&tb_msg.rule_node_id));
                     match tb_proto::convert::tb_msg_from_proto(&tb_msg) {
                         Ok(m) => {
                             let msg_type = m.msg_type.clone();
                             let msg_id = m.id;
-                            match engine.handle(m).await {
+                            let result = match resume {
+                                Some((chain_id, node_id)) => {
+                                    engine.handle_at(m, chain_id, node_id).await
+                                }
+                                None => engine.handle(m).await,
+                            };
+                            match result {
                                 Ok(()) => {
                                     tracing::debug!(%msg_id, %msg_type, "rule engine handled")
                                 }

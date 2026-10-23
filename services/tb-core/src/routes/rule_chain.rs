@@ -22,6 +22,39 @@ pub fn router() -> Router<AppState> {
         .route("/api/ruleChain/{id}", get(get_rule_chain).delete(delete_rule_chain))
         .route("/api/ruleChain/{id}/nodes", get(get_nodes).put(put_nodes))
         .route("/api/ruleChains", get(list_rule_chains))
+        .route("/api/ruleNode/{ruleNodeId}/events", get(get_node_debug_events))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebugEventsQuery {
+    pub page: Option<i64>,
+    pub page_size: Option<i64>,
+    pub start_ts: Option<i64>,
+    pub end_ts: Option<i64>,
+}
+
+/// 规则节点 debug 事件查询（TENANT_ADMIN；租户校验经 rule_node → rule_chain）。
+async fn get_node_debug_events(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(node_id): Path<Uuid>,
+    Query(query): Query<DebugEventsQuery>,
+) -> Result<Json<PageData<tb_dao::RuleNodeDebugEvent>>, ApiError> {
+    require_authority(&user, &[Authority::TenantAdmin])?;
+    let node = state
+        .rule_node_dao
+        .find_by_id(node_id)
+        .await?
+        .ok_or_else(|| TbError::NotFound(format!("rule node {node_id}")))?;
+    load_chain(&state, &user, node.rule_chain_id).await?;
+    let page_link = PageLink::new(query.page.unwrap_or(0), query.page_size.unwrap_or(10));
+    Ok(Json(
+        state
+            .rule_node_debug_event_dao
+            .find_by_node(node_id, query.start_ts, query.end_ts, &page_link)
+            .await?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]

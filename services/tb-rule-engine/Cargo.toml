@@ -13,6 +13,7 @@ tokio.workspace = true
 prost.workspace = true
 bytes.workspace = true
 sqlx.workspace = true
+uuid.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tb-common = { path = "../../crates/tb-common" }
@@ -23,6 +24,7 @@ tb-rule-engine = { path = "../../crates/tb-rule-engine" }
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }
+axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true

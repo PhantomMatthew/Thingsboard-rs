@@ -3032,13 +3032,21 @@ name = "tb-rule-engine"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
+ "bytes",
  "chrono",
+ "dashmap",
+ "futures",
  "moka",
+ "prost",
+ "reqwest",
+ "rumqttc",
  "serde",
  "serde_json",
  "sqlx",
  "tb-common",
  "tb-dao",
+ "tb-proto",
  "tb-queue",
  "tb-script",
  "tokio",
@@ -3050,6 +3058,7 @@ dependencies = [
 name = "tb-rule-engine-server"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "bytes",
  "chrono",
  "prost",

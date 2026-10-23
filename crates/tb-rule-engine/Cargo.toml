@@ -5,6 +5,7 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+tokio.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -13,10 +14,18 @@ uuid.workspace = true
 chrono.workspace = true
 tracing.workspace = true
 moka.workspace = true
+dashmap.workspace = true
+futures.workspace = true
+prost.workspace = true
+bytes.workspace = true
+reqwest = { version = "0.12", features = ["json"] }
+rumqttc = "0.24"
 tb-common = { path = "../tb-common" }
 tb-dao = { path = "../tb-dao" }
 tb-script = { path = "../tb-script" }
 tb-queue = { path = "../tb-queue" }
+tb-proto = { path = "../tb-proto" }
 
 [dev-dependencies]
 tokio.workspace = true
+axum.workspace = true

@@ -215,6 +215,7 @@ async fn chain_execute_routes_and_drops() {
     let switch = make_node(chain_id, "filter.msg_type_switch", json!({}));
     let save = make_node(chain_id, "action.save_timeseries", json!({}));
     let state = RuleChainState {
+        chain_id,
         nodes: [
             (
                 switch.id,

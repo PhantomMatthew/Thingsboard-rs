@@ -4,7 +4,7 @@
 use prost::Message as _;
 use tb_common::{AttributeScope, KvEntry, KvValue};
 use tb_proto::core as pb;
-use tb_queue::{KafkaQueueProducer, QueueConsumer, StreamQueueConsumer, TbTopic};
+use tb_queue::{KafkaQueueProducer, QueueConsumer, QueueProducer, StreamQueueConsumer, TbTopic};
 use uuid::Uuid;
 
 use crate::AppState;
@@ -27,7 +27,7 @@ pub async fn start_core_consumer_for_group(
     }
     let group_id = group_id.to_string();
     tokio::spawn(async move {
-        let _producer = match KafkaQueueProducer::new(&brokers, &group_id) {
+        let producer = match KafkaQueueProducer::new(&brokers, &group_id) {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!("core consumer producer init failed: {e}");
@@ -49,7 +49,7 @@ pub async fn start_core_consumer_for_group(
                         tracing::warn!("undecodable ToCoreMsg");
                         continue;
                     };
-                    handle(&state, m).await;
+                    handle(&state, &producer, m).await;
                 }
                 Err(e) => {
                     tracing::error!("tb_core consumer error: {e}");
@@ -74,7 +74,7 @@ async fn write_server_attributes(state: &AppState, device_id: Uuid, entries: Vec
     }
 }
 
-async fn handle(state: &AppState, msg: pb::ToCoreMsg) {
+async fn handle(state: &AppState, producer: &KafkaQueueProducer, msg: pb::ToCoreMsg) {
     use pb::to_core_msg::Msg;
     let Some(oneof) = msg.msg else { return };
     match oneof {
@@ -202,6 +202,42 @@ async fn handle(state: &AppState, msg: pb::ToCoreMsg) {
         }
         Msg::ClaimDevice(_) => {
             tracing::debug!("claim_device not implemented");
+        }
+        Msg::RpcRequest(m) => {
+            // 规则引擎 action.rpc_oneway 的下行 RPC：oneway 语义，不注册 pending。
+            let Ok(device_id) = Uuid::parse_str(&m.device_id) else {
+                tracing::warn!(device_id = %m.device_id, "rpc_request: bad device_id");
+                return;
+            };
+            let Some(session) = state.device_sessions.rpc_session(device_id) else {
+                tracing::warn!(%device_id, method = %m.method, "rpc_request: device offline or not subscribed");
+                return;
+            };
+            let request_id = state.device_sessions.next_rpc_request_id();
+            let to_transport = pb::ToTransportMsg {
+                session_id: session.session_id.clone(),
+                entity_id: device_id.to_string(),
+                msg: Some(pb::to_transport_msg::Msg::ToDeviceRpc(
+                    pb::ToDeviceRpcRequestMsg {
+                        request_id,
+                        method: m.method,
+                        params_json: m.params_json,
+                        expiration_ts: chrono::Utc::now().timestamp_millis() + 60_000,
+                        persisted: false,
+                    },
+                )),
+            };
+            let topic = TbTopic::transport_notifications(&session.node_id);
+            if let Err(e) = producer
+                .send(
+                    &topic,
+                    &session.session_id,
+                    bytes::Bytes::from(to_transport.encode_to_vec()),
+                )
+                .await
+            {
+                tracing::error!("rpc_request dispatch failed: {e}");
+            }
         }
         other => tracing::debug!(?other, "ignored ToCoreMsg"),
     }

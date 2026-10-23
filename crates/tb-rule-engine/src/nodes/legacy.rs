@@ -1,4 +1,4 @@
-//! 本期内置节点实现。config 均从 rule_node.configuration JSON 反序列化。
+//! 首期 8 个节点（msg_type_switch/script/save/alarm/log/checkpoint）。
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::context::NodeContext;
 use crate::node::Node;
 
-fn json_to_kv(v: serde_json::Value) -> KvValue {
+pub(crate) fn json_to_kv(v: serde_json::Value) -> KvValue {
     match v {
         serde_json::Value::Bool(b) => KvValue::Bool(b),
         serde_json::Value::Number(n) => {
@@ -25,7 +25,7 @@ fn json_to_kv(v: serde_json::Value) -> KvValue {
     }
 }
 
-fn parse_scope(s: &str) -> TbResult<AttributeScope> {
+pub(crate) fn parse_scope(s: &str) -> TbResult<AttributeScope> {
     match s {
         "CLIENT_SCOPE" => Ok(AttributeScope::ClientScope),
         "SERVER_SCOPE" => Ok(AttributeScope::ServerScope),
@@ -36,7 +36,7 @@ fn parse_scope(s: &str) -> TbResult<AttributeScope> {
     }
 }
 
-fn parse_config<T: for<'de> Deserialize<'de>>(config: &serde_json::Value) -> TbResult<T> {
+pub(crate) fn parse_config<T: for<'de> Deserialize<'de>>(config: &serde_json::Value) -> TbResult<T> {
     serde_json::from_value(config.clone())
         .map_err(|e| TbError::InvalidInput(format!("bad node configuration: {e}")))
 }
@@ -409,8 +409,8 @@ impl Node for LogNode {
     }
 }
 
-/// flow.checkpoint：透传→"Success"。
-// TODO(Phase 7)：真正实现 requeue 语义（把消息发回 kafka 队列并携带 rule_node_id 入口）。
+/// flow.checkpoint：节点本身透传 "Success"；requeue 语义由 chain::execute 特判实现
+/// （消息携带 rule_chain_id + 下一跳 rule_node_id 发回 kafka 队列，不再本地转发）。
 pub struct CheckpointNode;
 
 #[async_trait]

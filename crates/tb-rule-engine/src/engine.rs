@@ -23,6 +23,8 @@ pub struct RuleEngineService {
     chain_dao: RuleChainDao,
     /// tenant_id → 根链执行状态（None 表示该租户无根链，走内置默认链）。
     chain_cache: moka::future::Cache<Uuid, Option<Arc<RuleChainState>>>,
+    /// chain_id → 链执行状态（checkpoint 恢复入口按 chain_id 加载）。
+    chain_by_id: moka::future::Cache<Uuid, Option<Arc<RuleChainState>>>,
 }
 
 impl RuleEngineService {
@@ -42,6 +44,9 @@ impl RuleEngineService {
             chain_cache: moka::future::Cache::builder()
                 .time_to_live(cache_ttl)
                 .build(),
+            chain_by_id: moka::future::Cache::builder()
+                .time_to_live(cache_ttl)
+                .build(),
         }
     }
 
@@ -57,6 +62,32 @@ impl RuleEngineService {
             None => self.default_chain(msg).await,
         }
         Ok(())
+    }
+
+    /// checkpoint 恢复入口：从指定链的指定节点继续执行。
+    pub async fn handle_at(&self, msg: TbMsg, chain_id: Uuid, node_id: Uuid) -> TbResult<()> {
+        match self.chain_by_id(chain_id).await? {
+            Some(state) => {
+                if state.nodes.contains_key(&node_id) {
+                    chain::execute(&self.ctx, &state, node_id, msg).await;
+                } else {
+                    tracing::warn!(%chain_id, %node_id, "checkpoint target node not in chain, dropped");
+                }
+            }
+            None => {
+                tracing::warn!(%chain_id, "checkpoint target chain not found, dropped");
+            }
+        }
+        Ok(())
+    }
+
+    async fn chain_by_id(&self, chain_id: Uuid) -> TbResult<Option<Arc<RuleChainState>>> {
+        if let Some(cached) = self.chain_by_id.get(&chain_id).await {
+            return Ok(cached);
+        }
+        let loaded = self.loader.load(chain_id).await?.map(Arc::new);
+        self.chain_by_id.insert(chain_id, loaded.clone()).await;
+        Ok(loaded)
     }
 
     async fn root_chain(&self, tenant_id: Uuid) -> TbResult<Option<Arc<RuleChainState>>> {
