@@ -4,10 +4,12 @@ pub mod alarm;
 pub mod asset;
 pub mod asset_profile;
 pub mod audit;
+pub mod calculated_field;
 pub mod customer;
 pub mod device;
 pub mod device_profile;
 pub mod edqs;
+pub mod oauth2;
 pub mod ota;
 pub mod rpc;
 pub mod rule_chain;
@@ -33,6 +35,8 @@ pub fn api_router() -> Router<AppState> {
         .merge(asset_profile::router())
         .merge(rule_chain::router())
         .merge(telemetry::router())
+        .merge(oauth2::router())
+        .merge(calculated_field::router())
         .merge(alarm::router())
         .merge(rpc::router())
         .merge(ota::router())

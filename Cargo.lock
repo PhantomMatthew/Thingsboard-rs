@@ -2960,6 +2960,7 @@ dependencies = [
  "chrono",
  "jsonwebtoken",
  "moka",
+ "reqwest",
  "serde",
  "serde_json",
  "sqlx",
@@ -2970,6 +2971,25 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "tb-calculated"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "prost",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tb-common",
+ "tb-dao",
+ "tb-proto",
+ "tb-queue",
+ "tb-script",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -3002,12 +3022,14 @@ dependencies = [
  "sha2",
  "sqlx",
  "tb-auth",
+ "tb-calculated",
  "tb-common",
  "tb-dao",
  "tb-edqs",
  "tb-proto",
  "tb-queue",
  "tb-rule-engine",
+ "tb-rule-engine-server",
  "tb-transport-http",
  "thiserror 2.0.21",
  "tokio",
@@ -3113,6 +3135,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "tb-calculated",
  "tb-common",
  "tb-dao",
  "tb-proto",

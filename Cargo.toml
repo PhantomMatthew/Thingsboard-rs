@@ -5,6 +5,7 @@ members = [
     "crates/tb-proto",
     "crates/tb-queue",
     "crates/tb-dao",
+    "crates/tb-calculated",
     "crates/tb-rule-engine",
     "crates/tb-script",
     "crates/tb-transport-api",

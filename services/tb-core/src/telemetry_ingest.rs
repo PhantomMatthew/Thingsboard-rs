@@ -118,6 +118,7 @@ async fn handle_msg(state: &AppState, msg: &TbMsgProto) -> tb_common::TbResult<(
                 .attributes_dao
                 .save(entity_id, scope, &entries)
                 .await?;
+            crate::calculated::spawn_evaluate(state, tenant_id, entity_id, entries.clone());
             crate::edqs::publish_attribute_update(
                 state,
                 tenant_id,

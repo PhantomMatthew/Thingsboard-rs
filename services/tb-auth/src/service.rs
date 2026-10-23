@@ -24,9 +24,12 @@ pub struct TokenPair {
 }
 
 pub struct AuthService {
-    user_dao: UserDao,
-    creds_dao: UserCredentialsDao,
+    pub(crate) user_dao: UserDao,
+    pub(crate) creds_dao: UserCredentialsDao,
     factory: Arc<JwtTokenFactory>,
+    pub(crate) pool: PgPool,
+    /// OAuth2 code 换 token / userinfo 拉取（5s 超时）。
+    pub(crate) http: reqwest::Client,
     /// user_id → 锁定期内存在记录即视为锁定。
     lockout: moka::future::Cache<Uuid, ()>,
 }
@@ -35,8 +38,13 @@ impl AuthService {
     pub fn new(pool: PgPool, factory: Arc<JwtTokenFactory>) -> Arc<Self> {
         Arc::new(Self {
             user_dao: UserDao::new(pool.clone()),
-            creds_dao: UserCredentialsDao::new(pool),
+            creds_dao: UserCredentialsDao::new(pool.clone()),
             factory,
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap_or_default(),
+            pool,
             lockout: moka::future::Cache::builder()
                 .time_to_live(LOCK_DURATION)
                 .build(),
@@ -145,7 +153,7 @@ impl AuthService {
             .ok_or_else(|| TbError::NotFound(format!("user {user_id}")))
     }
 
-    fn issue_tokens(&self, user: &User) -> TbResult<TokenPair> {
+    pub fn issue_tokens(&self, user: &User) -> TbResult<TokenPair> {
         let security_user = security_user(user);
         Ok(TokenPair {
             token: self.factory.create_access_token(&security_user)?,

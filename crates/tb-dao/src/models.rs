@@ -401,6 +401,35 @@ impl sqlx::FromRow<'_, sqlx::postgres::PgRow> for Alarm {
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
+pub struct Oauth2Client {
+    pub id: Uuid,
+    pub created_time: i64,
+    /// 空 = 平台级客户端。
+    pub tenant_id: Option<Uuid>,
+    pub title: String,
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    pub authorization_uri: String,
+    pub token_uri: String,
+    pub user_info_uri: String,
+    pub redirect_uri_template: Option<String>,
+    pub scope: Option<String>,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct CalculatedField {
+    pub id: Uuid,
+    pub created_time: i64,
+    pub tenant_id: Uuid,
+    pub entity_id: Uuid,
+    pub name: String,
+    pub configuration: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 pub struct OtaPackage {
     pub id: Uuid,
     pub created_time: i64,

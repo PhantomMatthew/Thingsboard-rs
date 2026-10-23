@@ -2,6 +2,7 @@
 
 pub mod audit;
 pub mod auth_middleware;
+pub mod calculated;
 pub mod core_consumer;
 pub mod device_session;
 pub mod edqs;

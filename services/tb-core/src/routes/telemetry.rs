@@ -399,6 +399,7 @@ async fn save_attributes(
         .attributes_dao
         .save(entity_id, scope, &entries)
         .await?;
+    crate::calculated::spawn_evaluate(&state, user.0.tenant_id, entity_id, entries.clone());
     crate::edqs::publish_attribute_update(
         &state,
         user.0.tenant_id,

@@ -147,6 +147,19 @@ fn publish_edqs(ctx: &NodeContext, tenant_id: Uuid, event: edqs_pb::EdqsEventMsg
     });
 }
 
+/// 计算字段异步评估（输出落库 + EDQS 由 tb_calculated 负责）；失败仅 warn，不阻塞规则链。
+fn spawn_calculated(ctx: &NodeContext, tenant_id: Uuid, entity_id: Uuid, trigger: Vec<KvEntry>) {
+    if trigger.is_empty() {
+        return;
+    }
+    let pool = ctx.pool.clone();
+    let producer = ctx.edqs_producer.clone();
+    tokio::spawn(async move {
+        tb_calculated::evaluate_and_save(&pool, producer.as_ref(), tenant_id, entity_id, &trigger)
+            .await;
+    });
+}
+
 fn kv_proto(key: &str, value: &KvValue) -> common_pb::KeyValueProto {
     tb_proto::convert::kv_to_proto_named(0, key, value)
 }
@@ -210,6 +223,18 @@ async fn save_timeseries(ctx: &NodeContext, msg: &TbMsg) -> TbResult<()> {
         .collect();
     // TODO(Phase 8b/9)：发布 usage 统计消息到 tb_usage_stats topic，由 core 汇总进 api_usage_state。
     ctx.timeseries_dao.save(msg.originator.id, &entries).await?;
+    spawn_calculated(
+        ctx,
+        msg.tenant_id,
+        msg.originator.id,
+        entries
+            .iter()
+            .map(|e| KvEntry {
+                key: e.key.clone(),
+                value: e.value.clone(),
+            })
+            .collect(),
+    );
     publish_edqs(
         ctx,
         msg.tenant_id,
@@ -296,6 +321,7 @@ impl SaveAttributesNode {
         ctx.attributes_dao
             .save(msg.originator.id, scope, &entries)
             .await?;
+        spawn_calculated(ctx, msg.tenant_id, msg.originator.id, entries.clone());
         publish_edqs(
             ctx,
             msg.tenant_id,

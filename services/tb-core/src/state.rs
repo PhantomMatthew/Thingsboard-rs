@@ -6,10 +6,11 @@ use std::sync::Arc;
 use sqlx::PgPool;
 use tb_auth::{AuthService, JwtTokenFactory};
 use tb_dao::{
-    AlarmDao, ApiUsageStateDao, AssetDao, AssetProfileDao, AttributesDao, AuditLogDao, CustomerDao,
-    DashboardDao, DeviceCredentialsDao, DeviceDao, DeviceProfileDao, KeyDictionaryDao,
-    OtaPackageDao, RelationDao, RuleChainDao, RuleNodeDao, RuleNodeDebugEventDao, TenantDao,
-    TenantProfileDao, TimeseriesDao, UserCredentialsDao, UserDao,
+    AlarmDao, ApiUsageStateDao, AssetDao, AssetProfileDao, AttributesDao, AuditLogDao,
+    CalculatedFieldDao, CustomerDao, DashboardDao, DeviceCredentialsDao, DeviceDao,
+    DeviceProfileDao, KeyDictionaryDao, Oauth2ClientDao, OtaPackageDao, RelationDao, RuleChainDao,
+    RuleNodeDao, RuleNodeDebugEventDao, TenantDao, TenantProfileDao, TimeseriesDao,
+    UserCredentialsDao, UserDao,
 };
 use tb_queue::KafkaQueueProducer;
 use tokio::sync::mpsc;
@@ -44,6 +45,8 @@ pub struct AppStateInner {
     pub ota_package_dao: OtaPackageDao,
     pub audit_log_dao: AuditLogDao,
     pub api_usage_state_dao: ApiUsageStateDao,
+    pub oauth2_client_dao: Oauth2ClientDao,
+    pub calculated_field_dao: CalculatedFieldDao,
     pub usage: UsageTracker,
     /// login 审计事件通道（tb-auth 侧 try_send，receiver 已在 new() 启动）。
     pub audit_tx: mpsc::Sender<tb_dao::AuditLog>,
@@ -116,6 +119,8 @@ impl AppState {
                 ota_package_dao: OtaPackageDao::new(pool.clone()),
                 audit_log_dao,
                 api_usage_state_dao: ApiUsageStateDao::new(pool.clone()),
+                oauth2_client_dao: Oauth2ClientDao::new(pool.clone()),
+                calculated_field_dao: CalculatedFieldDao::new(pool.clone()),
                 usage: usage.clone(),
                 audit_tx,
                 device_sessions: crate::device_session::DeviceSessionRegistry::new_shared(),

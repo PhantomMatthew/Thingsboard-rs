@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
-use tb_common::{TbResult, TsKvEntry};
+use tb_common::{KvEntry, TbResult, TsKvEntry};
 use uuid::Uuid;
 
 use crate::AppState;
@@ -129,6 +129,7 @@ pub async fn update_latest(state: &AppState, entity_id: Uuid, entries: &[TsKvEnt
 }
 
 /// 遥测落库 + latest 缓存 write-through + 用量计数（REST 路由与 Kafka ingest 共用）。
+/// 保存成功后异步触发计算字段评估（输出经 update_latest 回写缓存）。
 pub async fn save_with_latest(
     state: &AppState,
     tenant_id: Uuid,
@@ -140,6 +141,14 @@ pub async fn save_with_latest(
     state
         .usage
         .inc_transport_msgs(tenant_id, entries.len() as i64);
+    let trigger: Vec<KvEntry> = entries
+        .iter()
+        .map(|e| KvEntry {
+            key: e.key.clone(),
+            value: e.value.clone(),
+        })
+        .collect();
+    crate::calculated::spawn_evaluate(state, tenant_id, entity_id, trigger);
     Ok(())
 }
 

@@ -128,6 +128,72 @@ pub async fn create_device(client: &Client, base: &str, token: &str, name: &str)
 /// transport-api 校验请求（各自测试库数据不同），导致随机 valid=false 串扰。
 pub static INTEGRATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// 同 start_servers_with_transport，但额外起 telemetry ingest 与 rule engine（Main 队列，
+/// 独立 group、1s 链缓存 TTL），使 transport 上行遥测完整走 Kafka → 规则链 → 落库。
+pub async fn start_servers_with_rule_engine() -> (String, String) {
+    let (base, _pool) = start_server_with_pool().await;
+    let uuid = uuid::Uuid::now_v7().simple().to_string();
+    let run_id = &uuid[20..];
+    let brokers = std::env::var("TB_KAFKA_BROKERS").unwrap_or_else(|_| "localhost:29092".into());
+    let pool: PgPool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(TEST_URL)
+        .await
+        .expect("connect test db");
+    let factory = Arc::new(JwtTokenFactory::new("test-secret", 900, 604800));
+    let state = AppState::new(pool.clone(), factory);
+    let _transport_api = tb_core::transport_api::start_transport_api_for_group(
+        state.clone(),
+        &format!("tb-core-transport-api-{run_id}"),
+    )
+    .await;
+    let _ingest = tb_core::telemetry_ingest::start_telemetry_ingest_for_group(
+        state.clone(),
+        &format!("tb-core-ingest-{run_id}"),
+    )
+    .await;
+    let _rule_engine = tb_rule_engine_server::start_rule_engine_for_group(
+        &brokers,
+        pool,
+        "Main",
+        &format!("tb-rule-engine-{run_id}"),
+        std::time::Duration::from_secs(1),
+    )
+    .await;
+
+    let node_id = format!("test-http-{run_id}");
+    let transport_state =
+        tb_transport_http::TransportState::new(&brokers, &node_id).expect("http transport state");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind random port");
+    let transport_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, tb_transport_http::build_router(transport_state))
+            .await
+            .unwrap();
+    });
+
+    // 等 Kafka consumer group 完成 join（auto.offset.reset=latest，未 join 会丢早到的消息）。
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    (base, format!("http://{transport_addr}"))
+}
+
+/// 轮询直到闭包返回 true（Kafka 异步链路用），超时 panic。
+pub async fn poll_until(timeout: std::time::Duration, mut f: impl AsyncFnMut() -> bool) {
+    let start = std::time::Instant::now();
+    loop {
+        if f().await {
+            return;
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "poll_until timed out after {timeout:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 /// 同 start_server，但额外起 transport-api server（Kafka）+ tb-transport-http。
 /// 返回 (core REST base, http transport base)。
 pub async fn start_servers_with_transport() -> (String, String) {

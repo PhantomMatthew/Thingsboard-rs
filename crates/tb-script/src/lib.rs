@@ -162,6 +162,25 @@ impl ScriptEngine {
         dynamic_to_json(&result)
     }
 
+    /// 计算字段用：参数作为顶层变量注入 scope（如 expression "tempC * 9 / 5 + 32"），
+    /// 结果转 JSON（标量或对象均可）。
+    pub fn eval_value(
+        &self,
+        script: &str,
+        vars: &HashMap<String, Value>,
+    ) -> Result<Value, ScriptError> {
+        let ast = self.compile(script)?;
+        let mut scope = Scope::new();
+        for (k, v) in vars {
+            scope.push_dynamic(k.clone(), json_to_dynamic(v));
+        }
+        let result = self
+            .engine
+            .eval_ast_with_scope::<Dynamic>(&mut scope, &ast)
+            .map_err(|e| ScriptError::Eval(e.to_string()))?;
+        dynamic_to_json(&result)
+    }
+
     /// 返回字符串的脚本（如 external.kafka 的 key_script）；标量值转字符串。
     pub fn eval_string(
         &self,
@@ -360,6 +379,20 @@ mod tests {
             .eval_filter("loop { }", &json!({}), &HashMap::new(), "T")
             .unwrap_err();
         assert!(matches!(err, ScriptError::Eval(_)));
+    }
+
+    #[test]
+    fn eval_value_with_variables() {
+        let e = engine();
+        let vars: HashMap<String, Value> = [("tempC".to_string(), json!(25))].into_iter().collect();
+        let v = e.eval_value("tempC * 9 / 5 + 32", &vars).unwrap();
+        assert_eq!(v, json!(77));
+        let v = e
+            .eval_value("tempC * 9.0 / 5.0 + 32.0", &vars)
+            .unwrap();
+        assert_eq!(v, json!(77.0));
+        assert!(e.eval_value("tempC +", &vars).is_err());
+        assert!(e.eval_value("unknown_var + 1", &vars).is_err());
     }
 
     #[test]
