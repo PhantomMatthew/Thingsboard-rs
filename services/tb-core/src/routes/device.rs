@@ -7,12 +7,13 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tb_auth::{ApiError, AuthUser};
-use tb_common::{TbError, TbResult};
+use tb_common::{EntityType, TbError, TbResult};
 use tb_dao::models::{Authority, CredentialsType, Device, DeviceCredentials, DeviceProfile};
 use tb_dao::{PageData, PageLink};
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::audit::audit;
 use crate::auth_middleware::{check_tenant_scope, require_authority};
 use crate::routes::PageQuery;
 use crate::routes::customer::load_customer;
@@ -95,7 +96,7 @@ async fn save_device(
     let token = req
         .access_token
         .unwrap_or_else(|| Uuid::now_v7().to_string());
-    if rotate_credentials {
+    let saved = if rotate_credentials {
         let credentials = DeviceCredentials {
             id: Uuid::now_v7(),
             created_time: 0,
@@ -104,14 +105,23 @@ async fn save_device(
             credentials_id: Some(token),
             credentials_value: None,
         };
-        let (saved, _) = state
+        state
             .device_credentials_dao
             .save_device_with_credentials(&device, &credentials)
-            .await?;
-        Ok(Json(saved))
+            .await?
+            .0
     } else {
-        Ok(Json(state.device_dao.save(&device).await?))
-    }
+        state.device_dao.save(&device).await?
+    };
+    audit(
+        &state,
+        &user,
+        Some((saved.id, EntityType::Device, saved.name.clone())),
+        if is_new { "CREATED" } else { "UPDATED" },
+        None,
+        "SUCCESS",
+    );
+    Ok(Json(saved))
 }
 
 async fn get_device(
@@ -133,6 +143,14 @@ async fn delete_device(
     let device = load_device(&state, id).await?;
     check_tenant_scope(&user, device.tenant_id)?;
     state.device_dao.delete_by_id(id).await?;
+    audit(
+        &state,
+        &user,
+        Some((device.id, EntityType::Device, device.name)),
+        "DELETED",
+        None,
+        "SUCCESS",
+    );
     Ok(StatusCode::OK)
 }
 

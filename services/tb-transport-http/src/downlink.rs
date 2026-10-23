@@ -49,7 +49,11 @@ async fn handle(state: &TransportState, payload: bytes::Bytes) {
             }
         }
         Some(core_pb::to_transport_msg::Msg::SessionCloseNotification(n)) => {
-            tracing::info!(session_id = msg.session_id, reason = n.reason, "kick session");
+            tracing::info!(
+                session_id = msg.session_id,
+                reason = n.reason,
+                "kick session"
+            );
             state.rpc_sessions.remove(&msg.session_id);
         }
         other => tracing::debug!(?other, "ignored transport notification"),

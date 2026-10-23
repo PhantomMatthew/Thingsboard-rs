@@ -103,7 +103,9 @@ async fn http_transport_telemetry_and_attributes() {
             attrs
                 .iter()
                 .any(|a| a["key"] == "firmware" && a["value"] == "1.0")
-                && attrs.iter().any(|a| a["key"] == "active" && a["value"] == true)
+                && attrs
+                    .iter()
+                    .any(|a| a["key"] == "active" && a["value"] == true)
         })
     })
     .await;
@@ -167,4 +169,3 @@ async fn http_transport_rejects_bad_token() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
-

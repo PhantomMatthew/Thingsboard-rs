@@ -86,8 +86,8 @@ impl IntoResponse for ApiError {
 
 impl From<TbError> for ApiError {
     fn from(e: TbError) -> Self {
-        let status = StatusCode::from_u16(e.http_status())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let status =
+            StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         ApiError(status, e.to_string())
     }
 }
@@ -104,11 +104,19 @@ async fn validate(
             "invalid access token".into(),
         ));
     }
-    resp.device
-        .ok_or_else(|| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "missing device info".into()))
+    resp.device.ok_or_else(|| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "missing device info".into(),
+        )
+    })
 }
 
-fn session_info(state: &TransportState, device: &pb::DeviceInfoProto, session_id: &str) -> core_pb::SessionInfoProto {
+fn session_info(
+    state: &TransportState,
+    device: &pb::DeviceInfoProto,
+    session_id: &str,
+) -> core_pb::SessionInfoProto {
     core_pb::SessionInfoProto {
         node_id: state.node_id.clone(),
         session_id: session_id.to_string(),
@@ -325,8 +333,7 @@ async fn get_rpc(
     .await?;
     let result = match tokio::time::timeout(state.long_poll_timeout, rx.recv()).await {
         Ok(Some(rpc)) => {
-            let params: Value =
-                serde_json::from_str(&rpc.params_json).unwrap_or(Value::Null);
+            let params: Value = serde_json::from_str(&rpc.params_json).unwrap_or(Value::Null);
             json!({"id": rpc.request_id, "method": rpc.method, "params": params})
         }
         _ => json!({}),
@@ -442,6 +449,8 @@ async fn provision(
             "deviceName": resp.device_name,
         })))
     } else {
-        Ok(Json(json!({"status": "FAILURE", "errorMsg": resp.error_msg})))
+        Ok(Json(
+            json!({"status": "FAILURE", "errorMsg": resp.error_msg}),
+        ))
     }
 }

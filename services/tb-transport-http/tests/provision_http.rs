@@ -93,7 +93,9 @@ async fn http_provision_e2e() {
             return false;
         };
         let resp = client
-            .get(format!("{core}/api/telemetry/DEVICE/{id}/values/timeseries"))
+            .get(format!(
+                "{core}/api/telemetry/DEVICE/{id}/values/timeseries"
+            ))
             .header("Authorization", bearer(&admin_token))
             .send()
             .await

@@ -26,12 +26,20 @@ async fn poll_until(timeout: Duration, mut f: impl AsyncFnMut() -> bool) {
         if f().await {
             return;
         }
-        assert!(start.elapsed() < timeout, "poll_until timed out after {timeout:?}");
+        assert!(
+            start.elapsed() < timeout,
+            "poll_until timed out after {timeout:?}"
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
-async fn send_telemetry(producer: &KafkaQueueProducer, tenant_id: Uuid, device_id: Uuid, data: serde_json::Value) {
+async fn send_telemetry(
+    producer: &KafkaQueueProducer,
+    tenant_id: Uuid,
+    device_id: Uuid,
+    data: serde_json::Value,
+) {
     let msg = ToRuleEngineMsg {
         tenant_id: tenant_id.to_string(),
         tb_msg: Some(TbMsgProto {
@@ -122,7 +130,9 @@ async fn rule_engine_e2e() {
         tenant_profile_id: None,
     };
     TenantDao::new(pool.clone()).save(&tenant).await.unwrap();
-    let chain = seed::create_default_root_chain(&pool, tenant.id).await.unwrap();
+    let chain = seed::create_default_root_chain(&pool, tenant.id)
+        .await
+        .unwrap();
 
     let _engine = tb_rule_engine_server::start_rule_engine_for_group(
         KAFKA_BROKERS,
@@ -136,18 +146,24 @@ async fn rule_engine_e2e() {
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let producer = KafkaQueueProducer::new(KAFKA_BROKERS, "re-e2e-producer").unwrap();
-    let ts_dao = TimeseriesDao::new(
-        pool.clone(),
-        tb_dao::KeyDictionaryDao::new(pool.clone()),
-    );
+    let ts_dao = TimeseriesDao::new(pool.clone(), tb_dao::KeyDictionaryDao::new(pool.clone()));
 
     // 1. 默认根链：POST_TELEMETRY_REQUEST → save_timeseries → ts_kv_latest 有值
     // （consumer group join 完成前发的消息会被 latest offset 跳过，故轮询窗口内重发）
     let device_id = Uuid::now_v7();
     poll_until(Duration::from_secs(15), || async {
-        send_telemetry(&producer, tenant.id, device_id, json!({"ts": 1000, "values": {"temperature": 25}}))
-            .await;
-        !ts_dao.find_latest(device_id, None).await.unwrap().is_empty()
+        send_telemetry(
+            &producer,
+            tenant.id,
+            device_id,
+            json!({"ts": 1000, "values": {"temperature": 25}}),
+        )
+        .await;
+        !ts_dao
+            .find_latest(device_id, None)
+            .await
+            .unwrap()
+            .is_empty()
     })
     .await;
 
@@ -172,7 +188,11 @@ async fn rule_engine_e2e() {
             chain.id,
             &nodes,
             &[
-                (switch.id, filter.id, msg_type::POST_TELEMETRY_REQUEST.to_string()),
+                (
+                    switch.id,
+                    filter.id,
+                    msg_type::POST_TELEMETRY_REQUEST.to_string(),
+                ),
                 (filter.id, alarm_node.id, "True".to_string()),
             ],
             Some(switch.id),
@@ -185,8 +205,7 @@ async fn rule_engine_e2e() {
     // temperature=80 → 产生 ACTIVE_UNACK 告警（扁平 data，重发幂等：create 后为 update，行数恒为 1）
     let hot_device = Uuid::now_v7();
     poll_until(Duration::from_secs(15), || async {
-        send_telemetry(&producer, tenant.id, hot_device, json!({"temperature": 80}))
-            .await;
+        send_telemetry(&producer, tenant.id, hot_device, json!({"temperature": 80})).await;
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM alarm WHERE originator_id = $1 AND type = 'HighTemp' \
              AND severity = 'CRITICAL' AND status = 'ACTIVE_UNACK'",
@@ -201,8 +220,13 @@ async fn rule_engine_e2e() {
 
     // temperature=10 → filter False，无新告警
     let cold_device = Uuid::now_v7();
-    send_telemetry(&producer, tenant.id, cold_device, json!({"temperature": 10}))
-        .await;
+    send_telemetry(
+        &producer,
+        tenant.id,
+        cold_device,
+        json!({"temperature": 10}),
+    )
+    .await;
     tokio::time::sleep(Duration::from_secs(3)).await;
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM alarm WHERE originator_id = $1")
         .bind(cold_device)
@@ -212,8 +236,7 @@ async fn rule_engine_e2e() {
     assert_eq!(count, 0, "cold telemetry must not create alarm");
 
     // 再发一条 hot：已 ACTIVE → Updated，不产生第二行
-    send_telemetry(&producer, tenant.id, hot_device, json!({"temperature": 90}))
-        .await;
+    send_telemetry(&producer, tenant.id, hot_device, json!({"temperature": 90})).await;
     tokio::time::sleep(Duration::from_secs(3)).await;
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM alarm WHERE originator_id = $1")
         .bind(hot_device)

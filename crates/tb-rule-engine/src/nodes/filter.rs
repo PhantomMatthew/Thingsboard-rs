@@ -58,7 +58,10 @@ impl OriginatorTypeFilterNode {
 #[async_trait]
 impl Node for OriginatorTypeFilterNode {
     async fn on_msg(&self, _ctx: &NodeContext, msg: TbMsg) -> Vec<(String, TbMsg)> {
-        let rel = if self.types.contains(&msg.originator.entity_type.as_str().to_string()) {
+        let rel = if self
+            .types
+            .contains(&msg.originator.entity_type.as_str().to_string())
+        {
             "True"
         } else {
             "False"
@@ -93,10 +96,7 @@ impl KeyExistsFilterNode {
 impl Node for KeyExistsFilterNode {
     async fn on_msg(&self, _ctx: &NodeContext, msg: TbMsg) -> Vec<(String, TbMsg)> {
         let exists = |k: &str| {
-            msg.data
-                .as_object()
-                .is_some_and(|o| o.contains_key(k))
-                || msg.metadata.contains_key(k)
+            msg.data.as_object().is_some_and(|o| o.contains_key(k)) || msg.metadata.contains_key(k)
         };
         let hit = if self.check_all {
             self.keys.iter().all(|k| exists(k))
@@ -187,7 +187,11 @@ pub struct GeoFilterNode {
 
 #[derive(Debug, Clone)]
 enum GeoShape {
-    Circle { lat: f64, lng: f64, radius_m: f64 },
+    Circle {
+        lat: f64,
+        lng: f64,
+        radius_m: f64,
+    },
     /// 顶点列表 [(lat, lng), ...]
     Polygon(Vec<(f64, f64)>),
 }

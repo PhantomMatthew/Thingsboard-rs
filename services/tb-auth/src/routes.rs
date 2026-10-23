@@ -10,15 +10,19 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 use tb_common::TbError;
+use tb_dao::audit_log::AuditLog;
+use tokio::sync::mpsc;
 
 use crate::extract::AuthUser;
 use crate::service::AuthService;
-use crate::token::JwtTokenFactory;
+use crate::token::{JwtTokenFactory, TokenType};
 
 #[derive(Clone)]
 pub struct AuthState {
     pub auth_service: Arc<AuthService>,
     pub jwt_factory: Arc<JwtTokenFactory>,
+    /// 可选审计通道（tb-core 注入，receiver 负责落库）；None 时不审计。
+    pub audit_tx: Option<mpsc::Sender<AuditLog>>,
 }
 
 impl AuthState {
@@ -26,6 +30,21 @@ impl AuthState {
         Self {
             auth_service,
             jwt_factory,
+            audit_tx: None,
+        }
+    }
+
+    pub fn with_audit_tx(mut self, audit_tx: mpsc::Sender<AuditLog>) -> Self {
+        self.audit_tx = Some(audit_tx);
+        self
+    }
+
+    /// 尽力发送审计事件；通道满/关闭仅告警，不影响主流程。
+    fn audit(&self, entry: AuditLog) {
+        if let Some(tx) = &self.audit_tx
+            && let Err(e) = tx.try_send(entry)
+        {
+            tracing::warn!("audit event dropped: {e}");
         }
     }
 }
@@ -95,11 +114,39 @@ async fn login(
     State(state): State<AuthState>,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<crate::service::TokenPair>, ApiError> {
-    let pair = state
-        .auth_service
-        .login(&req.username, &req.password)
-        .await?;
-    Ok(Json(pair))
+    match state.auth_service.login(&req.username, &req.password).await {
+        Ok(pair) => {
+            if state.audit_tx.is_some()
+                && let Ok(claims) = state
+                    .jwt_factory
+                    .parse_typed(&pair.token, TokenType::Access)
+                && let Ok(user) = claims.to_security_user()
+            {
+                state.audit(AuditLog::new(
+                    user.tenant_id,
+                    Some((user.id, "USER".into(), user.email.clone())),
+                    Some(user.id),
+                    Some(user.email),
+                    "LOGIN",
+                    None,
+                    "SUCCESS",
+                ));
+            }
+            Ok(Json(pair))
+        }
+        Err(e) => {
+            state.audit(AuditLog::new(
+                uuid::Uuid::nil(),
+                None,
+                None,
+                Some(req.username.clone()),
+                "LOGIN",
+                Some(json!({"error": e.to_string()})),
+                "FAILURE",
+            ));
+            Err(e.into())
+        }
+    }
 }
 
 async fn refresh(

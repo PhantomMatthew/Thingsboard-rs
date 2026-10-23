@@ -74,13 +74,9 @@ async fn connect_until_success(addr: SocketAddr, client_id: &str, username: &str
 }
 
 /// provision 请求并等 provision/response。
-async fn provision_request(
-    addr: SocketAddr,
-    device_name: &str,
-    key: &str,
-    secret: &str,
-) -> Value {
-    let mut session = connect_until_success(addr, &format!("prov-{device_name}"), "provision").await;
+async fn provision_request(addr: SocketAddr, device_name: &str, key: &str, secret: &str) -> Value {
+    let mut session =
+        connect_until_success(addr, &format!("prov-{device_name}"), "provision").await;
     session
         .client
         .subscribe("provision/response", QoS::AtLeastOnce)
@@ -195,7 +191,9 @@ async fn provision_e2e() {
             return false;
         };
         let resp = client
-            .get(format!("{core}/api/telemetry/DEVICE/{id}/values/timeseries"))
+            .get(format!(
+                "{core}/api/telemetry/DEVICE/{id}/values/timeseries"
+            ))
             .header("Authorization", bearer(&admin_token))
             .send()
             .await

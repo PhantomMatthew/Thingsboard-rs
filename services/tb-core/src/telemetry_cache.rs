@@ -128,14 +128,18 @@ pub async fn update_latest(state: &AppState, entity_id: Uuid, entries: &[TsKvEnt
     }
 }
 
-/// 遥测落库 + latest 缓存 write-through（REST 路由与 Kafka ingest 共用）。
+/// 遥测落库 + latest 缓存 write-through + 用量计数（REST 路由与 Kafka ingest 共用）。
 pub async fn save_with_latest(
     state: &AppState,
+    tenant_id: Uuid,
     entity_id: Uuid,
     entries: &[TsKvEntry],
 ) -> TbResult<()> {
     state.timeseries_dao.save(entity_id, entries).await?;
     update_latest(state, entity_id, entries).await;
+    state
+        .usage
+        .inc_transport_msgs(tenant_id, entries.len() as i64);
     Ok(())
 }
 

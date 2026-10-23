@@ -265,6 +265,15 @@ impl TimeseriesDao {
         tx.commit().await.map_err(TbError::db)?;
         Ok(res.rows_affected() as usize)
     }
+    /// housekeeper 用：删除 ts 早于 cutoff 的全部历史点（不动 ts_kv_latest），返回删除行数。
+    pub async fn delete_older_than(&self, ts: i64) -> TbResult<u64> {
+        let res = sqlx::query("DELETE FROM ts_kv WHERE ts < $1")
+            .bind(ts)
+            .execute(&self.pool)
+            .await
+            .map_err(TbError::db)?;
+        Ok(res.rows_affected())
+    }
 }
 
 fn row_to_entry(row: &sqlx::postgres::PgRow) -> TbResult<TsKvEntry> {

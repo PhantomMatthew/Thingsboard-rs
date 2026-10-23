@@ -116,9 +116,13 @@ async fn script_filter_relations() {
     let ctx = ctx(&pool);
     let node = ScriptFilterNode::new(&json!({"script": "msg.temperature > 50"})).unwrap();
 
-    let outs = node.on_msg(&ctx, telemetry_msg(json!({"temperature": 80}))).await;
+    let outs = node
+        .on_msg(&ctx, telemetry_msg(json!({"temperature": 80})))
+        .await;
     assert_eq!(outs[0].0, "True");
-    let outs = node.on_msg(&ctx, telemetry_msg(json!({"temperature": 10}))).await;
+    let outs = node
+        .on_msg(&ctx, telemetry_msg(json!({"temperature": 10})))
+        .await;
     assert_eq!(outs[0].0, "False");
 
     // 编译错误 → Failure
@@ -135,7 +139,9 @@ async fn script_transform_rewrites_msg() {
         "script": "msg.temperature = msg.temperature * 2; #{msg: msg, metadata: #{\"src\": \"t\"}}"
     }))
     .unwrap();
-    let outs = node.on_msg(&ctx, telemetry_msg(json!({"temperature": 21}))).await;
+    let outs = node
+        .on_msg(&ctx, telemetry_msg(json!({"temperature": 21})))
+        .await;
     assert_eq!(outs[0].0, "Success");
     assert_eq!(outs[0].1.data, json!({"temperature": 42}));
     assert_eq!(outs[0].1.metadata["src"], "t");
@@ -187,7 +193,10 @@ async fn create_alarm_creates_then_updates() {
     let first_end_ts = alarm.end_ts;
 
     // 同 originator+type 仍 ACTIVE → Updated，不产生新行
-    let msg2 = TbMsg { data: json!({"temperature": 90}), ..msg };
+    let msg2 = TbMsg {
+        data: json!({"temperature": 90}),
+        ..msg
+    };
     let outs = node.on_msg(&ctx, msg2).await;
     assert_eq!(outs[0].0, "Updated");
     let alarm = alarm_dao
@@ -219,11 +228,17 @@ async fn chain_execute_routes_and_drops() {
         nodes: [
             (
                 switch.id,
-                (switch.clone(), tb_rule_engine::registry::create_node(&switch.r#type, &json!({})).unwrap()),
+                (
+                    switch.clone(),
+                    tb_rule_engine::registry::create_node(&switch.r#type, &json!({})).unwrap(),
+                ),
             ),
             (
                 save.id,
-                (save.clone(), tb_rule_engine::registry::create_node(&save.r#type, &json!({})).unwrap()),
+                (
+                    save.clone(),
+                    tb_rule_engine::registry::create_node(&save.r#type, &json!({})).unwrap(),
+                ),
             ),
         ]
         .into_iter()
@@ -303,11 +318,15 @@ async fn engine_loads_db_root_chain() {
         tenant_profile_id: None,
     };
     TenantDao::new(pool.clone()).save(&tenant).await.unwrap();
-    let chain = seed::create_default_root_chain(&pool, tenant.id).await.unwrap();
+    let chain = seed::create_default_root_chain(&pool, tenant.id)
+        .await
+        .unwrap();
     assert!(chain.root);
 
     // 幂等
-    let again = seed::create_default_root_chain(&pool, tenant.id).await.unwrap();
+    let again = seed::create_default_root_chain(&pool, tenant.id)
+        .await
+        .unwrap();
     assert_eq!(again.id, chain.id);
 
     let producer = KafkaQueueProducer::new("localhost:29092", "tb-rule-engine-test").unwrap();
@@ -334,5 +353,8 @@ async fn engine_loads_db_root_chain() {
     let first = state.first_node_id.unwrap();
     assert_eq!(state.edges[&first].len(), 2);
 
-    TenantDao::new(pool.clone()).delete_by_id(tenant.id).await.unwrap();
+    TenantDao::new(pool.clone())
+        .delete_by_id(tenant.id)
+        .await
+        .unwrap();
 }

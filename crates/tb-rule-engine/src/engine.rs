@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sqlx::PgPool;
-use tb_common::msg::{TbMsg, msg_type};
 use tb_common::TbResult;
+use tb_common::msg::{TbMsg, msg_type};
 use tb_dao::RuleChainDao;
 use tb_queue::KafkaQueueProducer;
 use uuid::Uuid;

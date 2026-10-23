@@ -115,8 +115,10 @@ async fn send_to_dlq(
     error: String,
 ) {
     msg.metadata.insert("error".into(), error);
-    msg.metadata.insert("fromNodeId".into(), node.id.to_string());
-    msg.metadata.insert("chainId".into(), state.chain_id.to_string());
+    msg.metadata
+        .insert("fromNodeId".into(), node.id.to_string());
+    msg.metadata
+        .insert("chainId".into(), state.chain_id.to_string());
     let envelope = ToRuleEngineMsg {
         tenant_id: msg.tenant_id.to_string(),
         tb_msg: Some(tb_msg_to_proto(&msg)),
@@ -219,7 +221,10 @@ pub async fn execute(ctx: &NodeContext, state: &RuleChainState, start_node: Uuid
                 .unwrap_or_default();
             if matched.is_empty() {
                 if rel == "Failure" {
-                    let error = format!("no outgoing edge for relation 'Failure' at node '{}'", rule_node.name);
+                    let error = format!(
+                        "no outgoing edge for relation 'Failure' at node '{}'",
+                        rule_node.name
+                    );
                     send_to_dlq(ctx, state, rule_node, m, error).await;
                 } else {
                     tracing::debug!(

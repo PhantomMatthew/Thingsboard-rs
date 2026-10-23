@@ -61,6 +61,10 @@ pub async fn start_telemetry_ingest_for_group(
 }
 
 async fn handle_msg(state: &AppState, msg: &TbMsgProto) -> tb_common::TbResult<()> {
+    let tenant_id = Uuid::parse_str(&msg.tenant_id).unwrap_or_default();
+    if !tenant_id.is_nil() {
+        state.usage.inc_re_msgs(tenant_id, 1);
+    }
     match msg.r#type.as_str() {
         msg_type::POST_TELEMETRY_REQUEST => {
             let entity_id = Uuid::parse_str(&msg.originator_id).map_err(|_| {
@@ -81,7 +85,7 @@ async fn handle_msg(state: &AppState, msg: &TbMsgProto) -> tb_common::TbResult<(
                     value: json_to_kv(v),
                 })
                 .collect();
-            telemetry_cache::save_with_latest(state, entity_id, &entries).await?;
+            telemetry_cache::save_with_latest(state, tenant_id, entity_id, &entries).await?;
         }
         msg_type::POST_ATTRIBUTES_REQUEST => {
             let entity_id = Uuid::parse_str(&msg.originator_id).map_err(|_| {
@@ -109,7 +113,10 @@ async fn handle_msg(state: &AppState, msg: &TbMsgProto) -> tb_common::TbResult<(
                     value: json_to_kv(v),
                 })
                 .collect();
-            state.attributes_dao.save(entity_id, scope, &entries).await?;
+            state
+                .attributes_dao
+                .save(entity_id, scope, &entries)
+                .await?;
         }
         other => {
             tracing::debug!(msg_type = other, "ingest skipped");

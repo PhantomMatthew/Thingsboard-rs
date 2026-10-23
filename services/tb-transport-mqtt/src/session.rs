@@ -481,13 +481,11 @@ async fn handle_publish(
     if topic == TOPIC_TELEMETRY {
         match parse_telemetry(&p.payload) {
             Ok(entries) => {
-                if let Err(e) = state
+                let res = state
                     .transport_api
                     .publish_telemetry(&session.device, entries)
-                    .await
-                {
-                    tracing::warn!("publish telemetry failed: {e}");
-                }
+                    .await;
+                crate::log_publish_result(res, "publish telemetry failed");
             }
             Err(e) => tracing::warn!("bad telemetry payload: {e}"),
         }
@@ -499,13 +497,11 @@ async fn handle_publish(
                     .into_iter()
                     .map(|(key, value)| KvEntry { key, value })
                     .collect();
-                if let Err(e) = state
+                let res = state
                     .transport_api
                     .publish_attributes(&session.device, entries)
-                    .await
-                {
-                    tracing::warn!("publish attributes failed: {e}");
-                }
+                    .await;
+                crate::log_publish_result(res, "publish attributes failed");
             }
             Err(e) => tracing::warn!("bad attributes payload: {e}"),
         }

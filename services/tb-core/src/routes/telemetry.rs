@@ -165,7 +165,10 @@ async fn notify_shared_attribute_update(
             )
             .await
         {
-            tracing::warn!(session_id = session.session_id, "attribute update send failed: {e}");
+            tracing::warn!(
+                session_id = session.session_id,
+                "attribute update send failed: {e}"
+            );
         }
     }
 }
@@ -235,7 +238,7 @@ async fn save_timeseries(
     let entity_type = EntityType::from_str(&entity_type)?;
     check_entity_access(&state, &user, entity_type, entity_id).await?;
     let entries = payload.into_entries(now_ms());
-    telemetry_cache::save_with_latest(&state, entity_id, &entries).await?;
+    telemetry_cache::save_with_latest(&state, user.0.tenant_id, entity_id, &entries).await?;
     Ok(StatusCode::OK)
 }
 
@@ -399,7 +402,9 @@ async fn save_attributes(
         let mut kvs = Vec::with_capacity(entries.len());
         for e in &entries {
             let key_id = state.key_dictionary_dao.get_or_create_id(&e.key).await?;
-            kvs.push(tb_proto::convert::kv_to_proto_named(key_id, &e.key, &e.value));
+            kvs.push(tb_proto::convert::kv_to_proto_named(
+                key_id, &e.key, &e.value,
+            ));
         }
         notify_shared_attribute_update(&state, entity_type, entity_id, kvs).await;
     }

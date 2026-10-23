@@ -368,7 +368,14 @@ async fn alarm_latest_and_paged() -> TbResult<()> {
     assert_eq!(latest.start_ts, 1002);
 
     let page = alarm_dao
-        .find_by_tenant(tenant.id, Some(originator), None, None, None, &PageLink::new(0, 10))
+        .find_by_tenant(
+            tenant.id,
+            Some(originator),
+            None,
+            None,
+            None,
+            &PageLink::new(0, 10),
+        )
         .await?;
     assert_eq!(page.total_elements, 3);
 
@@ -433,5 +440,183 @@ async fn rule_node_debug_event_dao() -> TbResult<()> {
             .total_elements,
         0
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn housekeeper_cleanup() -> TbResult<()> {
+    let pool = setup().await;
+    let tenant_dao = TenantDao::new(pool.clone());
+    let key_dao = tb_dao::KeyDictionaryDao::new(pool.clone());
+    let ts_dao = tb_dao::TimeseriesDao::new(pool.clone(), key_dao);
+    let debug_dao = tb_dao::RuleNodeDebugEventDao::new(pool.clone());
+    let alarm_dao = AlarmDao::new(pool.clone());
+    let audit_dao = tb_dao::AuditLogDao::new(pool.clone());
+
+    let tenant = tenant_dao.save(&new_tenant(&uniq("tenant"))).await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let day = 24 * 3600 * 1000;
+    let old = now - 10 * day;
+    let cutoff = now - day;
+
+    // ts_kv：旧点应删，新点保留，latest 不动
+    let entity_id = Uuid::now_v7();
+    let mk = |ts: i64| tb_common::TsKvEntry {
+        ts,
+        key: "temp".into(),
+        value: tb_common::KvValue::Long(1),
+    };
+    ts_dao.save(entity_id, &[mk(old)]).await?;
+    ts_dao.save(entity_id, &[mk(now)]).await?;
+    let deleted = ts_dao.delete_older_than(cutoff).await?;
+    assert!(deleted >= 1);
+    let history = ts_dao
+        .find_history(entity_id, "temp", 0, now + 1, 10, true)
+        .await?;
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].ts, now);
+    let latest = ts_dao.find_latest(entity_id, None).await?;
+    assert_eq!(latest.len(), 1);
+
+    // debug event：旧事件应删
+    let mut ev = tb_dao::RuleNodeDebugEvent::new(
+        tenant.id,
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        "IN",
+        None,
+        None,
+        None,
+    );
+    ev.ts = old;
+    debug_dao.save(&ev).await?;
+    let removed = debug_dao.delete_older_than(cutoff).await?;
+    assert!(removed >= 1);
+
+    // alarm：仅清 CLEARED_* 且 clear_ts 早于阈值
+    let mk_alarm = |status: AlarmStatus, clear_ts: Option<i64>| Alarm {
+        id: Uuid::now_v7(),
+        created_time: 0,
+        tenant_id: tenant.id,
+        originator_id: entity_id,
+        originator_type: EntityType::Device,
+        r#type: "T".into(),
+        severity: AlarmSeverity::Minor,
+        status,
+        start_ts: old,
+        end_ts: 0,
+        ack_ts: None,
+        clear_ts,
+        details: None,
+        propagate: false,
+        propagate_to_owner: false,
+        propagate_to_tenant: false,
+        propagate_relation_types: None,
+        customer_id: None,
+        assignee_id: None,
+        assign_ts: None,
+    };
+    alarm_dao
+        .save(&mk_alarm(AlarmStatus::ClearedAck, Some(old)))
+        .await?;
+    alarm_dao
+        .save(&mk_alarm(AlarmStatus::ClearedAck, Some(now)))
+        .await?;
+    alarm_dao
+        .save(&mk_alarm(AlarmStatus::ActiveUnack, None))
+        .await?;
+    let removed = alarm_dao.delete_cleared_older_than(cutoff).await?;
+    assert_eq!(removed, 1);
+    let page = alarm_dao
+        .find_by_tenant(
+            tenant.id,
+            Some(entity_id),
+            None,
+            None,
+            None,
+            &PageLink::new(0, 10),
+        )
+        .await?;
+    assert_eq!(page.total_elements, 2);
+
+    // audit_log：save / find_by_tenant 过滤 / delete_older_than
+    let entry_old = tb_dao::audit_log::AuditLog {
+        id: Uuid::now_v7(),
+        tenant_id: tenant.id,
+        entity_id: Some(entity_id),
+        entity_type: Some("DEVICE".into()),
+        entity_name: Some("d".into()),
+        user_id: None,
+        user_email: None,
+        action_type: "DELETED".into(),
+        action_data: None,
+        action_status: "SUCCESS".into(),
+        created_time: old,
+    };
+    audit_dao.save(&entry_old).await?;
+    audit_dao
+        .save(&tb_dao::audit_log::AuditLog::new(
+            tenant.id,
+            Some((entity_id, "DEVICE".into(), "d".into())),
+            None,
+            None,
+            "CREATED",
+            None,
+            "SUCCESS",
+        ))
+        .await?;
+    let page = audit_dao
+        .find_by_tenant(
+            Some(tenant.id),
+            &tb_dao::audit_log::AuditLogFilter {
+                action_types: Some(vec!["CREATED".into()]),
+                ..Default::default()
+            },
+            &PageLink::new(0, 10),
+        )
+        .await?;
+    assert_eq!(page.total_elements, 1);
+    assert_eq!(page.data[0].action_type, "CREATED");
+    let removed = audit_dao.delete_older_than(cutoff).await?;
+    assert!(removed >= 1);
+
+    // 清理（audit_log / ts_kv 无外键级联，手动清）
+    audit_dao.delete_older_than(now + day).await?;
+    ts_dao.delete(entity_id, &["temp".into()], None).await?;
+    for a in &page.data {
+        alarm_dao.delete_by_id(a.id).await?;
+    }
+    tenant_dao.delete_by_id(tenant.id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn api_usage_state_accumulate() -> TbResult<()> {
+    let pool = setup().await;
+    let tenant_dao = TenantDao::new(pool.clone());
+    let usage_dao = tb_dao::ApiUsageStateDao::new(pool.clone());
+    let tenant = tenant_dao.save(&new_tenant(&uniq("tenant"))).await?;
+
+    let delta = tb_dao::UsageDelta {
+        transport_msgs: 5,
+        re_msgs: 2,
+        rest_requests: 0,
+    };
+    usage_dao.add_delta(tenant.id, delta).await?;
+    usage_dao.add_delta(tenant.id, delta).await?;
+    let state = usage_dao
+        .find_by_tenant(tenant.id)
+        .await?
+        .expect("usage state");
+    assert_eq!(state.transport_msgs, 10);
+    assert_eq!(state.re_msgs, 4);
+    assert!(state.updated_at > 0);
+
+    tenant_dao.delete_by_id(tenant.id).await?;
+    assert!(usage_dao.find_by_tenant(tenant.id).await?.is_none());
     Ok(())
 }

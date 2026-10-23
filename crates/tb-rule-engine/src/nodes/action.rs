@@ -199,7 +199,12 @@ impl DeduplicationNode {
             msg.data.to_string().hash(&mut hasher);
         } else {
             for f in &self.key_fields {
-                msg.data.get(f).cloned().unwrap_or(serde_json::Value::Null).to_string().hash(&mut hasher);
+                msg.data
+                    .get(f)
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null)
+                    .to_string()
+                    .hash(&mut hasher);
             }
         }
         hasher.finish()
@@ -382,12 +387,14 @@ impl RpcOnewayNode {
         let to_core = core_pb::ToCoreMsg {
             tenant_id: msg.tenant_id.to_string(),
             entity_id: device_id.clone(),
-            msg: Some(core_pb::to_core_msg::Msg::RpcRequest(core_pb::RpcRequestMsg {
-                device_id: device_id.clone(),
-                method: self.method.clone(),
-                params_json: params.to_string(),
-                request_id: String::new(),
-            })),
+            msg: Some(core_pb::to_core_msg::Msg::RpcRequest(
+                core_pb::RpcRequestMsg {
+                    device_id: device_id.clone(),
+                    method: self.method.clone(),
+                    params_json: params.to_string(),
+                    request_id: String::new(),
+                },
+            )),
         };
         ctx.kafka_producer
             .send(

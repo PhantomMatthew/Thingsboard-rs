@@ -39,7 +39,10 @@ async fn poll_until(timeout: Duration, mut f: impl AsyncFnMut() -> bool) {
         if f().await {
             return;
         }
-        assert!(start.elapsed() < timeout, "poll_until timed out after {timeout:?}");
+        assert!(
+            start.elapsed() < timeout,
+            "poll_until timed out after {timeout:?}"
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
@@ -106,7 +109,10 @@ async fn make_device(pool: &PgPool, tenant_id: Uuid, run: &str) -> Device {
         firmware_id: None,
         software_id: None,
     };
-    DeviceProfileDao::new(pool.clone()).save(&profile).await.unwrap();
+    DeviceProfileDao::new(pool.clone())
+        .save(&profile)
+        .await
+        .unwrap();
     let d = Device {
         id: Uuid::now_v7(),
         created_time: 0,
@@ -175,7 +181,12 @@ async fn send_telemetry(
         .unwrap();
 }
 
-async fn start_engine(pool: PgPool, queue: &str, run: &str, test: &str) -> tokio::task::JoinHandle<()> {
+async fn start_engine(
+    pool: PgPool,
+    queue: &str,
+    run: &str,
+    test: &str,
+) -> tokio::task::JoinHandle<()> {
     tb_rule_engine_server::start_rule_engine_for_group(
         KAFKA_BROKERS,
         pool,
@@ -191,7 +202,9 @@ async fn nodes_composition_e2e() {
     let (pool, run) = fresh_db().await;
     let tenant = make_tenant(&pool, &run).await;
     let device = make_device(&pool, tenant.id, &run).await;
-    let chain = seed::create_default_root_chain(&pool, tenant.id).await.unwrap();
+    let chain = seed::create_default_root_chain(&pool, tenant.id)
+        .await
+        .unwrap();
     let queue = format!("Re7Comp{run}");
     let _engine = start_engine(pool.clone(), &queue, &run, "comp").await;
     let producer = KafkaQueueProducer::new(KAFKA_BROKERS, "re7-comp-producer").unwrap();
@@ -200,8 +213,20 @@ async fn nodes_composition_e2e() {
 
     // switch → filter.script(>50) --True--> originator_fields --Success--> transform.script
     //   --Success--> math(MULT temperature*factor) --Success--> create_alarm
-    let switch = make_node(chain.id, "filter.msg_type_switch", "switch", json!({}), false);
-    let filter = make_node(chain.id, "filter.script", "hot", json!({"script": "msg.temperature > 50"}), false);
+    let switch = make_node(
+        chain.id,
+        "filter.msg_type_switch",
+        "switch",
+        json!({}),
+        false,
+    );
+    let filter = make_node(
+        chain.id,
+        "filter.script",
+        "hot",
+        json!({"script": "msg.temperature > 50"}),
+        false,
+    );
     let enrich = make_node(
         chain.id,
         "enrichment.originator_fields",
@@ -237,9 +262,20 @@ async fn nodes_composition_e2e() {
     chain_dao
         .save_nodes(
             chain.id,
-            &[switch.clone(), filter.clone(), enrich.clone(), transform.clone(), math.clone(), alarm_node.clone()],
             &[
-                (switch.id, filter.id, msg_type::POST_TELEMETRY_REQUEST.to_string()),
+                switch.clone(),
+                filter.clone(),
+                enrich.clone(),
+                transform.clone(),
+                math.clone(),
+                alarm_node.clone(),
+            ],
+            &[
+                (
+                    switch.id,
+                    filter.id,
+                    msg_type::POST_TELEMETRY_REQUEST.to_string(),
+                ),
                 (filter.id, enrich.id, "True".to_string()),
                 (enrich.id, transform.id, "Success".to_string()),
                 (transform.id, math.id, "Success".to_string()),
@@ -253,7 +289,14 @@ async fn nodes_composition_e2e() {
 
     // 告警创建：details 里可见 enrichment 的 metadata 与 math 的计算结果
     poll_until(Duration::from_secs(20), || async {
-        send_telemetry(&producer, &queue, tenant.id, device.id, json!({"temperature": 80})).await;
+        send_telemetry(
+            &producer,
+            &queue,
+            tenant.id,
+            device.id,
+            json!({"temperature": 80}),
+        )
+        .await;
         match alarm_dao
             .find_latest_by_originator_and_type(device.id, "HighTemp")
             .await
@@ -274,14 +317,30 @@ async fn nodes_composition_e2e() {
     .await;
 
     // 换 clear 路径：switch → filter.script(<50) --True--> clear_alarm
-    let cold_filter = make_node(chain.id, "filter.script", "cold", json!({"script": "msg.temperature < 50"}), false);
-    let clear_node = make_node(chain.id, "action.clear_alarm", "clear", json!({"alarm_type": "HighTemp"}), false);
+    let cold_filter = make_node(
+        chain.id,
+        "filter.script",
+        "cold",
+        json!({"script": "msg.temperature < 50"}),
+        false,
+    );
+    let clear_node = make_node(
+        chain.id,
+        "action.clear_alarm",
+        "clear",
+        json!({"alarm_type": "HighTemp"}),
+        false,
+    );
     chain_dao
         .save_nodes(
             chain.id,
             &[switch.clone(), cold_filter.clone(), clear_node.clone()],
             &[
-                (switch.id, cold_filter.id, msg_type::POST_TELEMETRY_REQUEST.to_string()),
+                (
+                    switch.id,
+                    cold_filter.id,
+                    msg_type::POST_TELEMETRY_REQUEST.to_string(),
+                ),
                 (cold_filter.id, clear_node.id, "True".to_string()),
             ],
             Some(switch.id),
@@ -291,7 +350,14 @@ async fn nodes_composition_e2e() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     poll_until(Duration::from_secs(20), || async {
-        send_telemetry(&producer, &queue, tenant.id, device.id, json!({"temperature": 10})).await;
+        send_telemetry(
+            &producer,
+            &queue,
+            tenant.id,
+            device.id,
+            json!({"temperature": 10}),
+        )
+        .await;
         alarm_dao
             .find_latest_by_originator_and_type(device.id, "HighTemp")
             .await
@@ -306,17 +372,35 @@ async fn dlq_e2e() {
     let (pool, run) = fresh_db().await;
     let tenant = make_tenant(&pool, &run).await;
     let device_id = Uuid::now_v7();
-    let chain = seed::create_default_root_chain(&pool, tenant.id).await.unwrap();
+    let chain = seed::create_default_root_chain(&pool, tenant.id)
+        .await
+        .unwrap();
     let chain_dao = RuleChainDao::new(pool.clone());
 
     // switch → filter.script（编译错误）-- 无 Failure 边 → DLQ
-    let switch = make_node(chain.id, "filter.msg_type_switch", "switch", json!({}), false);
-    let bad = make_node(chain.id, "filter.script", "bad", json!({"script": "msg. >"}), false);
+    let switch = make_node(
+        chain.id,
+        "filter.msg_type_switch",
+        "switch",
+        json!({}),
+        false,
+    );
+    let bad = make_node(
+        chain.id,
+        "filter.script",
+        "bad",
+        json!({"script": "msg. >"}),
+        false,
+    );
     chain_dao
         .save_nodes(
             chain.id,
             &[switch.clone(), bad.clone()],
-            &[(switch.id, bad.id, msg_type::POST_TELEMETRY_REQUEST.to_string())],
+            &[(
+                switch.id,
+                bad.id,
+                msg_type::POST_TELEMETRY_REQUEST.to_string(),
+            )],
             Some(switch.id),
         )
         .await
@@ -337,8 +421,12 @@ async fn dlq_e2e() {
         send_telemetry(&producer, &queue, tenant.id, device_id, json!({"x": 1})).await;
         let hit = match tokio::time::timeout(Duration::from_secs(2), consumer.recv()).await {
             Ok(Ok(m)) => {
-                let Ok(to_re) = ToRuleEngineMsg::decode(m.payload) else { panic!("bad dlq payload") };
-                let Some(p) = to_re.tb_msg else { panic!("dlq payload without tb_msg") };
+                let Ok(to_re) = ToRuleEngineMsg::decode(m.payload) else {
+                    panic!("bad dlq payload")
+                };
+                let Some(p) = to_re.tb_msg else {
+                    panic!("dlq payload without tb_msg")
+                };
                 p.metadata.get("chainId") == Some(&chain_id.to_string())
                     && p.metadata.get("fromNodeId") == Some(&bad.id.to_string())
                     && p.metadata.contains_key("error")
@@ -348,7 +436,10 @@ async fn dlq_e2e() {
         if hit {
             break;
         }
-        assert!(start.elapsed() < Duration::from_secs(30), "DLQ message not observed");
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "DLQ message not observed"
+        );
     }
 }
 
@@ -357,11 +448,19 @@ async fn checkpoint_resume_e2e() {
     let (pool, run) = fresh_db().await;
     let tenant = make_tenant(&pool, &run).await;
     let device_id = Uuid::now_v7();
-    let chain = seed::create_default_root_chain(&pool, tenant.id).await.unwrap();
+    let chain = seed::create_default_root_chain(&pool, tenant.id)
+        .await
+        .unwrap();
     let chain_dao = RuleChainDao::new(pool.clone());
 
     // switch → checkpoint --Success--> save_timeseries
-    let switch = make_node(chain.id, "filter.msg_type_switch", "switch", json!({}), false);
+    let switch = make_node(
+        chain.id,
+        "filter.msg_type_switch",
+        "switch",
+        json!({}),
+        false,
+    );
     let checkpoint = make_node(chain.id, "flow.checkpoint", "cp", json!({}), false);
     let save = make_node(chain.id, "action.save_timeseries", "save", json!({}), false);
     chain_dao
@@ -369,7 +468,11 @@ async fn checkpoint_resume_e2e() {
             chain.id,
             &[switch.clone(), checkpoint.clone(), save.clone()],
             &[
-                (switch.id, checkpoint.id, msg_type::POST_TELEMETRY_REQUEST.to_string()),
+                (
+                    switch.id,
+                    checkpoint.id,
+                    msg_type::POST_TELEMETRY_REQUEST.to_string(),
+                ),
                 (checkpoint.id, save.id, "Success".to_string()),
             ],
             Some(switch.id),
@@ -384,9 +487,19 @@ async fn checkpoint_resume_e2e() {
 
     // requeue 后由同一引擎 handle_at 从 save 节点恢复 → ts_kv_latest 落库
     poll_until(Duration::from_secs(30), || async {
-        send_telemetry(&producer, &queue, tenant.id, device_id, json!({"ts": 5, "values": {"temperature": 21}}))
-            .await;
-        !ts_dao.find_latest(device_id, None).await.unwrap().is_empty()
+        send_telemetry(
+            &producer,
+            &queue,
+            tenant.id,
+            device_id,
+            json!({"ts": 5, "values": {"temperature": 21}}),
+        )
+        .await;
+        !ts_dao
+            .find_latest(device_id, None)
+            .await
+            .unwrap()
+            .is_empty()
     })
     .await;
 }
@@ -403,7 +516,9 @@ async fn debug_events_rest_e2e() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        axum::serve(listener, tb_core::build_router(state)).await.unwrap();
+        axum::serve(listener, tb_core::build_router(state))
+            .await
+            .unwrap();
     });
     let base = format!("http://{addr}");
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
@@ -504,7 +619,14 @@ async fn debug_events_rest_e2e() {
     let token2 = token.clone();
     let node_id = log_node_id.clone();
     poll_until(Duration::from_secs(30), || async {
-        send_telemetry(&producer, &queue, tenant_uuid, device_id, json!({"temperature": 1})).await;
+        send_telemetry(
+            &producer,
+            &queue,
+            tenant_uuid,
+            device_id,
+            json!({"temperature": 1}),
+        )
+        .await;
         let resp = client2
             .get(format!("{base2}/api/ruleNode/{node_id}/events?pageSize=10"))
             .header("Authorization", format!("Bearer {token2}"))
@@ -515,8 +637,13 @@ async fn debug_events_rest_e2e() {
             return false;
         }
         let page: Value = resp.json().await.unwrap();
-        let Some(events) = page["data"].as_array() else { return false };
-        let types: Vec<&str> = events.iter().filter_map(|e| e["eventType"].as_str()).collect();
+        let Some(events) = page["data"].as_array() else {
+            return false;
+        };
+        let types: Vec<&str> = events
+            .iter()
+            .filter_map(|e| e["eventType"].as_str())
+            .collect();
         types.contains(&"IN") && types.contains(&"OUT")
     })
     .await;

@@ -173,7 +173,10 @@ async fn mqtt_firmware_chunks_e2e() {
                 _ => {}
             }
         }
-        assert!(start.elapsed() < Duration::from_secs(20), "fw metadata never arrived");
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "fw metadata never arrived"
+        );
     }
     let body = fw_meta.unwrap();
     assert_eq!(body["fw_title"], "fw");

@@ -115,7 +115,10 @@ async fn handle(state: &TransportState, payload: Bytes) {
             let Some(pkg) = n.ota_package else {
                 return;
             };
-            state.ota_packages.insert(msg.session_id.clone(), pkg.clone()).await;
+            state
+                .ota_packages
+                .insert(msg.session_id.clone(), pkg.clone())
+                .await;
             let body = crate::ota::fw_attributes_body(&pkg);
             let qos = handle.attributes_qos.load(Ordering::Relaxed);
             let qos = if qos == UNSUBSCRIBED { 0 } else { qos };

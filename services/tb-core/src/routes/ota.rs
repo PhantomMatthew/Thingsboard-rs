@@ -11,7 +11,7 @@ use prost::Message as _;
 use serde::Deserialize;
 use sha2::Digest as _;
 use tb_auth::{ApiError, AuthUser};
-use tb_common::{TbError, TbResult};
+use tb_common::{EntityType, TbError, TbResult};
 use tb_dao::models::{Authority, OtaPackage};
 use tb_dao::{PageData, PageLink};
 use tb_proto::common::OtaPackageType;
@@ -20,6 +20,7 @@ use tb_queue::{QueueProducer as _, TbTopic};
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::audit::audit;
 use crate::auth_middleware::{check_tenant_scope, require_authority};
 
 pub fn router() -> Router<AppState> {
@@ -131,7 +132,16 @@ async fn save_ota_package(
         data: Some(data.to_vec()),
         additional_info: None,
     };
-    Ok(Json(state.ota_package_dao.save(&package).await?))
+    let saved = state.ota_package_dao.save(&package).await?;
+    audit(
+        &state,
+        &user,
+        Some((saved.id, EntityType::OtaPackage, saved.title.clone())),
+        "CREATED",
+        None,
+        "SUCCESS",
+    );
+    Ok(Json(saved))
 }
 
 async fn get_ota_package(
@@ -154,6 +164,14 @@ async fn delete_ota_package(
     let package = load_ota(&state, id).await?;
     check_tenant_scope(&user, package.tenant_id)?;
     state.ota_package_dao.delete_by_id(id).await?;
+    audit(
+        &state,
+        &user,
+        Some((package.id, EntityType::OtaPackage, package.title)),
+        "DELETED",
+        None,
+        "SUCCESS",
+    );
     Ok(StatusCode::OK)
 }
 
@@ -168,11 +186,7 @@ async fn download_ota_package(
     let data = package
         .data
         .ok_or_else(|| TbError::NotFound("ota package data".into()))?;
-    Ok((
-        [(header::CONTENT_TYPE, "application/octet-stream")],
-        data,
-    )
-        .into_response())
+    Ok(([(header::CONTENT_TYPE, "application/octet-stream")], data).into_response())
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,7 +252,11 @@ async fn notify_ota_update(
         };
         let topic = TbTopic::transport_notifications(&session.node_id);
         producer
-            .send(&topic, &session.session_id, Bytes::from(msg.encode_to_vec()))
+            .send(
+                &topic,
+                &session.session_id,
+                Bytes::from(msg.encode_to_vec()),
+            )
             .await
             .map_err(TbError::internal)?;
     }

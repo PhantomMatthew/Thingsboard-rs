@@ -10,6 +10,7 @@ members = [
     "crates/tb-transport-api",
     "services/tb-auth",
     "services/tb-core",
+    "services/tb-housekeeper",
     "services/tb-rule-engine",
     "services/tb-transport-http",
     "services/tb-transport-mqtt",

@@ -72,7 +72,16 @@ async fn ota_api_e2e() {
     // 40000 字节固件：3 个 16KB 分块（16384 + 16384 + 7232）
     let fw_data: Vec<u8> = (0..40000u32).map(|i| (i % 253) as u8).collect();
     let expected_checksum = hex::encode(sha2::Sha256::digest(&fw_data));
-    let ota_id = upload_ota(&client, &core, &admin_token, &profile_id, "fw", "1.0", fw_data.clone()).await;
+    let ota_id = upload_ota(
+        &client,
+        &core,
+        &admin_token,
+        &profile_id,
+        "fw",
+        "1.0",
+        fw_data.clone(),
+    )
+    .await;
 
     // 元数据查询
     let resp = client
@@ -168,7 +177,10 @@ async fn ota_api_e2e() {
         received.extend_from_slice(&resp.bytes().await.unwrap());
     }
     assert_eq!(received, fw_data);
-    assert_eq!(hex::encode(sha2::Sha256::digest(&received)), expected_checksum);
+    assert_eq!(
+        hex::encode(sha2::Sha256::digest(&received)),
+        expected_checksum
+    );
 
     // 版本已是最新 → 404
     let resp = client

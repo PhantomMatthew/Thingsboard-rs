@@ -3,7 +3,9 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 use tb_common::msg::{TbMsg, msg_type};
-use tb_common::{AttributeScope, EntityId, EntityType, KvEntry, KvValue, TbError, TbResult, TsKvEntry};
+use tb_common::{
+    AttributeScope, EntityId, EntityType, KvEntry, KvValue, TbError, TbResult, TsKvEntry,
+};
 use tb_dao::models::{Alarm, AlarmSeverity, AlarmStatus};
 use uuid::Uuid;
 
@@ -36,7 +38,9 @@ pub(crate) fn parse_scope(s: &str) -> TbResult<AttributeScope> {
     }
 }
 
-pub(crate) fn parse_config<T: for<'de> Deserialize<'de>>(config: &serde_json::Value) -> TbResult<T> {
+pub(crate) fn parse_config<T: for<'de> Deserialize<'de>>(
+    config: &serde_json::Value,
+) -> TbResult<T> {
     serde_json::from_value(config.clone())
         .map_err(|e| TbError::InvalidInput(format!("bad node configuration: {e}")))
 }
@@ -71,10 +75,12 @@ impl ScriptFilterNode {
 #[async_trait]
 impl Node for ScriptFilterNode {
     async fn on_msg(&self, ctx: &NodeContext, msg: TbMsg) -> Vec<(String, TbMsg)> {
-        let rel = match ctx
-            .script_engine
-            .eval_filter(&self.script, &msg.data, &msg.metadata, &msg.msg_type)
-        {
+        let rel = match ctx.script_engine.eval_filter(
+            &self.script,
+            &msg.data,
+            &msg.metadata,
+            &msg.msg_type,
+        ) {
             Ok(true) => "True",
             Ok(false) => "False",
             Err(e) => {
@@ -106,10 +112,12 @@ impl ScriptTransformNode {
 #[async_trait]
 impl Node for ScriptTransformNode {
     async fn on_msg(&self, ctx: &NodeContext, msg: TbMsg) -> Vec<(String, TbMsg)> {
-        match ctx
-            .script_engine
-            .eval_transform(&self.script, &msg.data, &msg.metadata, &msg.msg_type)
-        {
+        match ctx.script_engine.eval_transform(
+            &self.script,
+            &msg.data,
+            &msg.metadata,
+            &msg.msg_type,
+        ) {
             Ok(out) => {
                 let mut msg = msg;
                 msg.data = out.msg;
@@ -182,6 +190,7 @@ async fn save_timeseries(ctx: &NodeContext, msg: &TbMsg) -> TbResult<()> {
             value: json_to_kv(v),
         })
         .collect();
+    // TODO(Phase 8b/9)：发布 usage 统计消息到 tb_usage_stats topic，由 core 汇总进 api_usage_state。
     ctx.timeseries_dao.save(msg.originator.id, &entries).await
 }
 
@@ -331,12 +340,9 @@ impl CreateAlarmNode {
             .alarm_dao
             .find_latest_by_originator_and_type(msg.originator.id, &self.alarm_type)
             .await?;
-        let active = existing.as_ref().is_some_and(|a| {
-            matches!(
-                a.status,
-                AlarmStatus::ActiveUnack | AlarmStatus::ActiveAck
-            )
-        });
+        let active = existing
+            .as_ref()
+            .is_some_and(|a| matches!(a.status, AlarmStatus::ActiveUnack | AlarmStatus::ActiveAck));
         if active {
             let mut alarm = existing.expect("checked above");
             alarm.end_ts = now;

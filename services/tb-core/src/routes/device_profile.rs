@@ -7,12 +7,13 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tb_auth::{ApiError, AuthUser};
-use tb_common::TbError;
+use tb_common::{EntityType, TbError};
 use tb_dao::models::{Authority, DeviceProfile};
 use tb_dao::{PageData, PageLink};
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::audit::audit;
 use crate::auth_middleware::{check_tenant_scope, require_authority};
 use crate::routes::PageQuery;
 
@@ -47,6 +48,7 @@ async fn save_profile(
     Json(req): Json<SaveDeviceProfileRequest>,
 ) -> Result<Json<DeviceProfile>, ApiError> {
     require_authority(&user, &[Authority::TenantAdmin])?;
+    let is_new = req.id.is_none();
     let (id, created_time) = match req.id {
         Some(id) => {
             let existing = load_profile(&state, id).await?;
@@ -68,7 +70,16 @@ async fn save_profile(
         firmware_id: req.firmware_id,
         software_id: req.software_id,
     };
-    Ok(Json(state.device_profile_dao.save(&profile).await?))
+    let saved = state.device_profile_dao.save(&profile).await?;
+    audit(
+        &state,
+        &user,
+        Some((saved.id, EntityType::DeviceProfile, saved.name.clone())),
+        if is_new { "CREATED" } else { "UPDATED" },
+        None,
+        "SUCCESS",
+    );
+    Ok(Json(saved))
 }
 
 async fn get_profile(
@@ -104,6 +115,14 @@ async fn delete_profile(
     let profile = load_profile(&state, id).await?;
     check_tenant_scope(&user, profile.tenant_id)?;
     state.device_profile_dao.delete_by_id(id).await?;
+    audit(
+        &state,
+        &user,
+        Some((profile.id, EntityType::DeviceProfile, profile.name)),
+        "DELETED",
+        None,
+        "SUCCESS",
+    );
     Ok(StatusCode::OK)
 }
 

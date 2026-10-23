@@ -96,12 +96,7 @@ impl DeviceSessionRegistry {
     pub fn attribute_sessions(&self, device_id: Uuid) -> Vec<SessionEntry> {
         self.sessions
             .get(&device_id)
-            .map(|s| {
-                s.iter()
-                    .filter(|e| e.sub_attributes)
-                    .cloned()
-                    .collect()
-            })
+            .map(|s| s.iter().filter(|e| e.sub_attributes).cloned().collect())
             .unwrap_or_default()
     }
 
@@ -117,8 +112,7 @@ impl DeviceSessionRegistry {
     pub fn activity_throttled(&self, device_id: Uuid, now: i64) -> bool {
         const WINDOW_MS: i64 = 30_000;
         // 注意先释放 get 读守卫再 insert，否则 DashMap 同分片死锁。
-        let throttled =
-            matches!(self.last_activity_write.get(&device_id), Some(last) if now - *last < WINDOW_MS);
+        let throttled = matches!(self.last_activity_write.get(&device_id), Some(last) if now - *last < WINDOW_MS);
         if throttled {
             true
         } else {

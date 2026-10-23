@@ -4,10 +4,12 @@
 use bytes::Bytes;
 use prost::Message as _;
 use tb_common::{EntityType, TbError, TbResult};
-use tb_dao::models::{CredentialsType, Device, DeviceCredentials, DeviceProfile, EntityRelation, OtaPackage};
+use tb_dao::models::{
+    CredentialsType, Device, DeviceCredentials, DeviceProfile, EntityRelation, OtaPackage,
+};
 use tb_proto::transport as pb;
 use tb_queue::topics::TbTopic;
-use tb_queue::{KafkaQueueProducer, QueueProducer as _, QueueConsumer, StreamQueueConsumer};
+use tb_queue::{KafkaQueueProducer, QueueConsumer, QueueProducer as _, StreamQueueConsumer};
 use uuid::Uuid;
 
 use crate::AppState;
@@ -23,8 +25,7 @@ pub async fn start_transport_api_for_group(
     state: AppState,
     group_id: &str,
 ) -> tokio::task::JoinHandle<()> {
-    let brokers =
-        std::env::var("TB_KAFKA_BROKERS").unwrap_or_else(|_| "localhost:29092".into());
+    let brokers = std::env::var("TB_KAFKA_BROKERS").unwrap_or_else(|_| "localhost:29092".into());
     if let Err(e) = tb_queue::admin::ensure_topic(
         &brokers,
         TbTopic::TRANSPORT_API_REQUESTS,
@@ -52,12 +53,12 @@ pub async fn start_transport_api_for_group(
         let mut consumer =
             match StreamQueueConsumer::new(&brokers, &group_id, &[TbTopic::TRANSPORT_API_REQUESTS])
             {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("transport-api consumer init failed: {e}");
-                return;
-            }
-        };
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("transport-api consumer init failed: {e}");
+                    return;
+                }
+            };
         tracing::info!("transport-api server started");
         loop {
             match consumer.recv().await {
@@ -186,7 +187,10 @@ fn invalid_credentials() -> pb::ValidateCredentialsResponse {
 }
 
 /// 设备属性同步查询（HTTP transport GET attributes 用）：client/shared 两组，带 key 字符串。
-async fn get_attributes(state: &AppState, r: &pb::GetAttributesRequest) -> pb::GetAttributesResponse {
+async fn get_attributes(
+    state: &AppState,
+    r: &pb::GetAttributesRequest,
+) -> pb::GetAttributesResponse {
     let empty = pb::GetAttributesResponse::default();
     let Ok(device_id) = uuid::Uuid::parse_str(&r.device_id) else {
         tracing::warn!(device_id = r.device_id, "get_attributes with bad device_id");
@@ -342,8 +346,8 @@ async fn get_or_create_gateway_device(
 ) -> TbResult<pb::DeviceInfoProto> {
     let gateway_id = Uuid::parse_str(&r.gateway_id)
         .map_err(|_| TbError::InvalidInput("bad gateway_id".into()))?;
-    let tenant_id = Uuid::parse_str(&r.tenant_id)
-        .map_err(|_| TbError::InvalidInput("bad tenant_id".into()))?;
+    let tenant_id =
+        Uuid::parse_str(&r.tenant_id).map_err(|_| TbError::InvalidInput("bad tenant_id".into()))?;
     if let Some(device) = state
         .device_dao
         .find_by_name(tenant_id, &r.device_name)
@@ -413,8 +417,8 @@ async fn get_ota_package(
     r: &pb::GetOtaPackageRequest,
 ) -> TbResult<Option<pb::OtaPackageProto>> {
     use tb_proto::common::OtaPackageType;
-    let tenant_id = Uuid::parse_str(&r.tenant_id)
-        .map_err(|_| TbError::InvalidInput("bad tenant_id".into()))?;
+    let tenant_id =
+        Uuid::parse_str(&r.tenant_id).map_err(|_| TbError::InvalidInput("bad tenant_id".into()))?;
     let profile_id = Uuid::parse_str(&r.device_profile_id)
         .map_err(|_| TbError::InvalidInput("bad device_profile_id".into()))?;
     let ota_type = match OtaPackageType::try_from(r.r#type) {
@@ -424,7 +428,13 @@ async fn get_ota_package(
     };
     let pkg = state
         .ota_package_dao
-        .find_latest(tenant_id, profile_id, ota_type, &r.current_title, &r.current_version)
+        .find_latest(
+            tenant_id,
+            profile_id,
+            ota_type,
+            &r.current_title,
+            &r.current_version,
+        )
         .await?;
     Ok(pkg.as_ref().map(ota_proto))
 }

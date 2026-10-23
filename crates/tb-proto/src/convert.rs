@@ -112,12 +112,13 @@ fn parse_uuid(field: &str, s: &str) -> tb_common::TbResult<uuid::Uuid> {
 }
 
 /// proto → tb-common 消息；空 customer_id 视为 None。
-pub fn tb_msg_from_proto(p: &crate::ruleengine::TbMsgProto) -> tb_common::TbResult<tb_common::msg::TbMsg> {
+pub fn tb_msg_from_proto(
+    p: &crate::ruleengine::TbMsgProto,
+) -> tb_common::TbResult<tb_common::msg::TbMsg> {
     let originator_type = pb::EntityType::try_from(p.originator_type)
-        .map_err(|_| tb_common::TbError::InvalidInput(format!(
-            "bad originator_type: {}",
-            p.originator_type
-        )))?
+        .map_err(|_| {
+            tb_common::TbError::InvalidInput(format!("bad originator_type: {}", p.originator_type))
+        })?
         .try_into()?;
     let customer_id = if p.customer_id.is_empty() {
         None
@@ -134,9 +135,8 @@ pub fn tb_msg_from_proto(p: &crate::ruleengine::TbMsgProto) -> tb_common::TbResu
         },
         tenant_id: parse_uuid("tenant_id", &p.tenant_id)?,
         customer_id,
-        data: serde_json::from_str(&p.data_json).map_err(|e| {
-            tb_common::TbError::InvalidInput(format!("bad data_json: {e}"))
-        })?,
+        data: serde_json::from_str(&p.data_json)
+            .map_err(|e| tb_common::TbError::InvalidInput(format!("bad data_json: {e}")))?,
         metadata: p.metadata.clone(),
         ts: p.ts,
     })

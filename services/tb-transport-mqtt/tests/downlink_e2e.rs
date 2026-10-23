@@ -223,9 +223,11 @@ async fn rpc_downlink_round_trip() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let pkt = wait_for(&mut device.rx, Duration::from_secs(10), |p| {
-        matches!(p, Packet::Publish(p) if p.topic.starts_with("v1/devices/me/rpc/request/"))
-    })
+    let pkt = wait_for(
+        &mut device.rx,
+        Duration::from_secs(10),
+        |p| matches!(p, Packet::Publish(p) if p.topic.starts_with("v1/devices/me/rpc/request/")),
+    )
     .await;
     match pkt {
         Packet::Publish(p) => {
@@ -236,8 +238,14 @@ async fn rpc_downlink_round_trip() {
     }
 
     // 未连接设备 → 404
-    let (status, _) = twoway_rpc(&client, &core, &admin_token, &uuid::Uuid::now_v7().to_string(), 500)
-        .await;
+    let (status, _) = twoway_rpc(
+        &client,
+        &core,
+        &admin_token,
+        &uuid::Uuid::now_v7().to_string(),
+        500,
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     device.client.disconnect().await.unwrap();
@@ -277,9 +285,11 @@ async fn attribute_subscription_downlink() {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        if let Some(Packet::Publish(p)) = wait_opt(&mut device.rx, Duration::from_secs(3), |p| {
-            matches!(p, Packet::Publish(p) if p.topic == "v1/devices/me/attributes")
-        })
+        if let Some(Packet::Publish(p)) = wait_opt(
+            &mut device.rx,
+            Duration::from_secs(3),
+            |p| matches!(p, Packet::Publish(p) if p.topic == "v1/devices/me/attributes"),
+        )
         .await
         {
             break serde_json::from_slice::<Value>(&p.payload).unwrap();
@@ -303,9 +313,11 @@ async fn attribute_subscription_downlink() {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        if let Some(Packet::Publish(p)) = wait_opt(&mut device.rx, Duration::from_secs(3), |p| {
-            matches!(p, Packet::Publish(p) if p.topic == "v1/devices/me/attributes")
-        })
+        if let Some(Packet::Publish(p)) = wait_opt(
+            &mut device.rx,
+            Duration::from_secs(3),
+            |p| matches!(p, Packet::Publish(p) if p.topic == "v1/devices/me/attributes"),
+        )
         .await
         {
             let v: Value = serde_json::from_slice(&p.payload).unwrap();
@@ -349,9 +361,13 @@ async fn device_activity_state() {
     let device = connect_until_success(mqtt_addr, "state-e2e-1", "STATE_TOKEN").await;
 
     poll_until(Duration::from_secs(20), async || {
-        let attrs =
-            server_attrs(client.clone(), core.clone(), admin_token.clone(), device_id.clone())
-                .await;
+        let attrs = server_attrs(
+            client.clone(),
+            core.clone(),
+            admin_token.clone(),
+            device_id.clone(),
+        )
+        .await;
         attrs.as_array().is_some_and(|a| {
             a.iter().any(|e| e["key"] == "active" && e["value"] == true)
                 && a.iter().any(|e| e["key"] == "lastConnectTime")
@@ -362,11 +378,16 @@ async fn device_activity_state() {
     device.client.disconnect().await.unwrap();
 
     poll_until(Duration::from_secs(20), async || {
-        let attrs =
-            server_attrs(client.clone(), core.clone(), admin_token.clone(), device_id.clone())
-                .await;
+        let attrs = server_attrs(
+            client.clone(),
+            core.clone(),
+            admin_token.clone(),
+            device_id.clone(),
+        )
+        .await;
         attrs.as_array().is_some_and(|a| {
-            a.iter().any(|e| e["key"] == "active" && e["value"] == false)
+            a.iter()
+                .any(|e| e["key"] == "active" && e["value"] == false)
                 && a.iter().any(|e| e["key"] == "lastDisconnectTime")
         })
     })

@@ -1,0 +1,12 @@
+[package]
+name = "tb-housekeeper"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+sqlx.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tb-dao = { path = "../../crates/tb-dao" }

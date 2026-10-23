@@ -18,6 +18,11 @@ pub const KAFKA_BROKERS: &str = "localhost:29092";
 
 /// 返回 (tb-core REST base, tb-transport-http base)。每个调用方独立测试库，可并行。
 pub async fn start_servers() -> (String, String) {
+    start_servers_with_rate_limit(0).await
+}
+
+/// 同 start_servers，rate_limit > 0 时启用租户级限流（msg/s）。
+pub async fn start_servers_with_rate_limit(rate_limit: u32) -> (String, String) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             "tb_core=debug,tb_transport_api=debug,tb_transport_http=debug,tb_queue=debug",
@@ -82,6 +87,7 @@ pub async fn start_servers() -> (String, String) {
     let mut transport_state = tb_transport_http::TransportState::new(KAFKA_BROKERS, &node_id)
         .expect("http transport state");
     transport_state.long_poll_timeout = Duration::from_secs(5);
+    transport_state.transport_api.set_rate_limit(rate_limit);
     tokio::spawn(tb_transport_http::downlink::run(transport_state.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

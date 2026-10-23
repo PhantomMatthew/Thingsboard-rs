@@ -19,7 +19,11 @@ fn parse_uuid(s: &str) -> Option<uuid::Uuid> {
     uuid::Uuid::parse_str(s).ok()
 }
 
-pub async fn start_rule_engine(brokers: &str, pool: PgPool, queue_name: &str) -> tokio::task::JoinHandle<()> {
+pub async fn start_rule_engine(
+    brokers: &str,
+    pool: PgPool,
+    queue_name: &str,
+) -> tokio::task::JoinHandle<()> {
     start_rule_engine_for_group(brokers, pool, queue_name, DEFAULT_GROUP, DEFAULT_CACHE_TTL).await
 }
 
@@ -38,8 +42,8 @@ pub async fn start_rule_engine_for_group(
     if let Err(e) = tb_queue::admin::ensure_topic(brokers, TbTopic::RULE_ENGINE_DLQ, 10).await {
         tracing::warn!("ensure rule engine DLQ topic failed: {e}");
     }
-    let producer = KafkaQueueProducer::new(brokers, "tb-rule-engine")
-        .expect("kafka producer init failed");
+    let producer =
+        KafkaQueueProducer::new(brokers, "tb-rule-engine").expect("kafka producer init failed");
     let engine = RuleEngineService::with_cache_ttl(pool, producer, chain_cache_ttl);
     let brokers = brokers.to_string();
     let group_id = group_id.to_string();
@@ -64,8 +68,8 @@ pub async fn start_rule_engine_for_group(
                         continue;
                     };
                     // checkpoint 恢复：rule_chain_id + rule_node_id 非空时从指定节点继续。
-                    let resume = parse_uuid(&tb_msg.rule_chain_id)
-                        .zip(parse_uuid(&tb_msg.rule_node_id));
+                    let resume =
+                        parse_uuid(&tb_msg.rule_chain_id).zip(parse_uuid(&tb_msg.rule_node_id));
                     match tb_proto::convert::tb_msg_from_proto(&tb_msg) {
                         Ok(m) => {
                             let msg_type = m.msg_type.clone();

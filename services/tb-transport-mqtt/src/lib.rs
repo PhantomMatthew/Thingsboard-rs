@@ -24,6 +24,17 @@ use crate::codec::MqttPacket;
 /// 订阅标志位 sentinel：未订阅。
 pub const UNSUBSCRIBED: u8 = 0xFF;
 
+/// 上行 publish 结果记录：限流静默丢弃（debug，MQTT 无错误回执语义），其余 warn。
+pub fn log_publish_result(result: tb_common::TbResult<()>, context: &str) {
+    match result {
+        Ok(()) => {}
+        Err(tb_common::TbError::RateLimitExceeded(_)) => {
+            tracing::debug!("{context}: dropped by tenant rate limit");
+        }
+        Err(e) => tracing::warn!("{context}: {e}"),
+    }
+}
+
 /// 在线会话句柄：下行包经 tx 交给会话 task；qos 原子位记录已授予的订阅等级。
 /// gateway_device 非空表示这是网关子设备的逻辑会话（下行 RPC 包装成 v1/gateway/rpc）。
 pub struct SessionHandle {

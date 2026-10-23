@@ -11,7 +11,12 @@ use crate::registry;
 
 pub const ROOT_CHAIN_NAME: &str = "Root Rule Chain";
 
-fn new_node(chain_id: Uuid, node_type: &str, name: &str, configuration: serde_json::Value) -> RuleNode {
+fn new_node(
+    chain_id: Uuid,
+    node_type: &str,
+    name: &str,
+    configuration: serde_json::Value,
+) -> RuleNode {
     RuleNode {
         id: Uuid::now_v7(),
         created_time: 0,

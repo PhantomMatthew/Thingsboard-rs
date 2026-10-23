@@ -1,9 +1,11 @@
 //! tb-dao：PostgreSQL 数据访问层（sqlx 动态查询）。
 
 pub mod alarm;
+pub mod api_usage;
 pub mod asset;
 pub mod asset_profile;
 pub mod attributes;
+pub mod audit_log;
 pub mod customer;
 pub mod dashboard;
 pub mod device;
@@ -22,9 +24,11 @@ pub mod timeseries;
 pub mod user;
 
 pub use alarm::AlarmDao;
+pub use api_usage::{ApiUsageState, ApiUsageStateDao, UsageDelta};
 pub use asset::AssetDao;
 pub use asset_profile::AssetProfileDao;
 pub use attributes::AttributesDao;
+pub use audit_log::{AuditLog, AuditLogDao, AuditLogFilter};
 pub use customer::CustomerDao;
 pub use dashboard::DashboardDao;
 pub use device::DeviceDao;

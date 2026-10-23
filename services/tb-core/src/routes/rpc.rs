@@ -92,7 +92,11 @@ async fn send_rpc(
     state
         .queue_producer()
         .await?
-        .send(&topic, &session.session_id, Bytes::from(msg.encode_to_vec()))
+        .send(
+            &topic,
+            &session.session_id,
+            Bytes::from(msg.encode_to_vec()),
+        )
         .await
         .map_err(TbError::internal)
 }
@@ -106,17 +110,19 @@ async fn rpc_twoway(
     require_authority(&user, &[Authority::TenantAdmin, Authority::CustomerUser])?;
     check_device_access(&state, &user, device_id).await?;
     let timeout = timeout_of(&body);
-    let session = state.device_sessions.rpc_session(device_id).ok_or_else(|| {
-        TbError::NotFound("device is offline or not subscribed to RPC".into())
-    })?;
+    let session = state
+        .device_sessions
+        .rpc_session(device_id)
+        .ok_or_else(|| TbError::NotFound("device is offline or not subscribed to RPC".into()))?;
     let request_id = state.device_sessions.next_rpc_request_id();
-    let rx = state.device_sessions.register_pending_rpc(device_id, request_id);
+    let rx = state
+        .device_sessions
+        .register_pending_rpc(device_id, request_id);
     send_rpc(&state, device_id, &session, request_id, &body, timeout).await?;
     // 等设备响应；超时作废 pending 槽位。
     match tokio::time::timeout(timeout + Duration::from_millis(500), rx).await {
         Ok(Ok(Ok(payload))) => {
-            let value: Value =
-                serde_json::from_str(&payload).unwrap_or(Value::String(payload));
+            let value: Value = serde_json::from_str(&payload).unwrap_or(Value::String(payload));
             Ok(Json(value).into_response())
         }
         Ok(Ok(Err(e))) => Ok((
@@ -130,7 +136,9 @@ async fn rpc_twoway(
         )
             .into_response()),
         Err(_) => {
-            state.device_sessions.drop_pending_rpc(device_id, request_id);
+            state
+                .device_sessions
+                .drop_pending_rpc(device_id, request_id);
             Ok((
                 StatusCode::GATEWAY_TIMEOUT,
                 Json(json!({"message": "rpc request timeout"})),
@@ -149,9 +157,10 @@ async fn rpc_oneway(
     require_authority(&user, &[Authority::TenantAdmin, Authority::CustomerUser])?;
     check_device_access(&state, &user, device_id).await?;
     let timeout = timeout_of(&body);
-    let session = state.device_sessions.rpc_session(device_id).ok_or_else(|| {
-        TbError::NotFound("device is offline or not subscribed to RPC".into())
-    })?;
+    let session = state
+        .device_sessions
+        .rpc_session(device_id)
+        .ok_or_else(|| TbError::NotFound("device is offline or not subscribed to RPC".into()))?;
     let request_id = state.device_sessions.next_rpc_request_id();
     send_rpc(&state, device_id, &session, request_id, &body, timeout).await?;
     Ok(StatusCode::OK)

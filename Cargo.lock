@@ -3003,6 +3003,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tb-housekeeper"
+version = "0.1.0"
+dependencies = [
+ "sqlx",
+ "tb-dao",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "tb-proto"
 version = "0.1.0"
 dependencies = [
@@ -3096,6 +3107,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "chrono",
+ "dashmap",
  "moka",
  "prost",
  "serde_json",

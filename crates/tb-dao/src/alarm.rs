@@ -215,4 +215,17 @@ impl AlarmDao {
             page_link.page_size,
         ))
     }
+
+    /// housekeeper 用：删除 CLEARED_* 且 clear_ts 早于 cutoff 的告警，返回删除行数。
+    pub async fn delete_cleared_older_than(&self, clear_ts: i64) -> TbResult<u64> {
+        let res = sqlx::query(
+            "DELETE FROM alarm WHERE status IN ('CLEARED_UNACK','CLEARED_ACK') \
+             AND clear_ts IS NOT NULL AND clear_ts < $1",
+        )
+        .bind(clear_ts)
+        .execute(&self.pool)
+        .await
+        .map_err(TbError::db)?;
+        Ok(res.rows_affected())
+    }
 }

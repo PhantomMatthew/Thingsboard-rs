@@ -168,7 +168,10 @@ async fn handle(state: &AppState, producer: &KafkaQueueProducer, msg: pb::ToCore
             let Some(device_id) = session_device_id(Some(&session)) else {
                 return;
             };
-            if !state.device_sessions.activity_throttled(device_id, m.last_activity_ts) {
+            if !state
+                .device_sessions
+                .activity_throttled(device_id, m.last_activity_ts)
+            {
                 write_server_attributes(
                     state,
                     device_id,

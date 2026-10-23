@@ -7,12 +7,13 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::Value;
 use tb_auth::{ApiError, AuthUser};
-use tb_common::TbError;
+use tb_common::{EntityType, TbError};
 use tb_dao::models::{Authority, Tenant};
 use tb_dao::{PageData, PageLink};
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::audit::audit;
 use crate::auth_middleware::require_authority;
 use crate::routes::PageQuery;
 
@@ -83,6 +84,14 @@ async fn save_tenant(
     if is_new {
         crate::routes::rule_chain::seed_default_root_chain(&state, saved.id).await?;
     }
+    audit(
+        &state,
+        &user,
+        Some((saved.id, EntityType::Tenant, saved.title.clone())),
+        if is_new { "CREATED" } else { "UPDATED" },
+        None,
+        "SUCCESS",
+    );
     Ok(Json(saved))
 }
 
@@ -106,9 +115,18 @@ async fn delete_tenant(
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
     require_authority(&user, &[Authority::SysAdmin])?;
+    let existing = state.tenant_dao.find_by_id(id).await?;
     if !state.tenant_dao.delete_by_id(id).await? {
         return Err(TbError::NotFound(format!("tenant {id}")).into());
     }
+    audit(
+        &state,
+        &user,
+        existing.map(|t| (t.id, EntityType::Tenant, t.title)),
+        "DELETED",
+        None,
+        "SUCCESS",
+    );
     Ok(StatusCode::OK)
 }
 

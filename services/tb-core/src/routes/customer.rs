@@ -7,12 +7,13 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::Value;
 use tb_auth::{ApiError, AuthUser};
-use tb_common::TbError;
+use tb_common::{EntityType, TbError};
 use tb_dao::models::{Authority, Customer};
 use tb_dao::{PageData, PageLink};
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::audit::audit;
 use crate::auth_middleware::{check_tenant_scope, require_authority};
 use crate::routes::PageQuery;
 
@@ -48,6 +49,7 @@ async fn save_customer(
     Json(req): Json<SaveCustomerRequest>,
 ) -> Result<Json<Customer>, ApiError> {
     require_authority(&user, &[Authority::TenantAdmin])?;
+    let is_new = req.id.is_none();
     let (id, created_time) = match req.id {
         Some(id) => {
             let existing = state
@@ -75,7 +77,16 @@ async fn save_customer(
         email: req.email,
         additional_info: req.additional_info,
     };
-    Ok(Json(state.customer_dao.save(&customer).await?))
+    let saved = state.customer_dao.save(&customer).await?;
+    audit(
+        &state,
+        &user,
+        Some((saved.id, EntityType::Customer, saved.title.clone())),
+        if is_new { "CREATED" } else { "UPDATED" },
+        None,
+        "SUCCESS",
+    );
+    Ok(Json(saved))
 }
 
 async fn get_customer(
@@ -98,6 +109,14 @@ async fn delete_customer(
     let customer = load_customer(&state, id).await?;
     check_tenant_scope(&user, customer.tenant_id)?;
     state.customer_dao.delete_by_id(id).await?;
+    audit(
+        &state,
+        &user,
+        Some((customer.id, EntityType::Customer, customer.title)),
+        "DELETED",
+        None,
+        "SUCCESS",
+    );
     Ok(StatusCode::OK)
 }
 

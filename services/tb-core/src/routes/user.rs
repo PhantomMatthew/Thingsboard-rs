@@ -7,12 +7,13 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::Value;
 use tb_auth::{ApiError, AuthUser};
-use tb_common::TbError;
+use tb_common::{EntityType, TbError};
 use tb_dao::models::{Authority, User, UserCredentials};
 use tb_dao::{PageData, PageLink};
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::audit::audit;
 use crate::auth_middleware::{check_tenant_scope, require_authority};
 use crate::routes::PageQuery;
 use crate::routes::customer::load_customer;
@@ -69,6 +70,7 @@ async fn save_user(
         }
     }
 
+    let is_new = req.id.is_none();
     let (id, created_time) = match req.id {
         Some(id) => {
             let existing = state
@@ -128,6 +130,14 @@ async fn save_user(
         }
         (None, false) => {}
     }
+    audit(
+        &state,
+        &user,
+        Some((saved.id, EntityType::User, saved.email.clone())),
+        if is_new { "CREATED" } else { "UPDATED" },
+        None,
+        "SUCCESS",
+    );
     Ok(Json(saved))
 }
 
@@ -157,6 +167,14 @@ async fn delete_user(
     let target = load_user(&state, id).await?;
     check_tenant_scope(&user, target.tenant_id)?;
     state.user_dao.delete_by_id(id).await?;
+    audit(
+        &state,
+        &user,
+        Some((target.id, EntityType::User, target.email)),
+        "DELETED",
+        None,
+        "SUCCESS",
+    );
     Ok(StatusCode::OK)
 }
 

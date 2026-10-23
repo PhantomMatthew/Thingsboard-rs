@@ -117,11 +117,9 @@ async fn rule_chain_api_end_to_end() {
     let edges = meta["edges"].as_array().unwrap();
     assert_eq!(edges.len(), 2);
     let filter_id = filter_node["id"].as_str().unwrap();
-    assert!(
-        edges
-            .iter()
-            .any(|e| e["from"] == first && e["to"] == filter_id && e["type"] == "POST_TELEMETRY_REQUEST")
-    );
+    assert!(edges.iter().any(|e| e["from"] == first
+        && e["to"] == filter_id
+        && e["type"] == "POST_TELEMETRY_REQUEST"));
     assert!(
         edges
             .iter()

@@ -9,9 +9,9 @@ use tb_proto::transport as pb;
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
+use crate::TransportState;
 use crate::codec::{MqttCodec, MqttPacket, PublishPacket};
 use crate::session::{self, Session};
-use crate::TransportState;
 
 pub const TOPIC_FW_SUBSCRIBE: &str = "v2/fw/response/+";
 pub const TOPIC_FW_REQUEST_PREFIX: &str = "v2/fw/request/";
@@ -78,12 +78,14 @@ async fn resolve_firmware(
         .map_err(|e| tracing::warn!("ota get_attributes failed: {e}"))
         .ok()?;
     let str_attr = |key: &str| {
-        attrs.shared_attributes.iter().find(|kv| kv.key == key).and_then(|kv| {
-            match &kv.value {
+        attrs
+            .shared_attributes
+            .iter()
+            .find(|kv| kv.key == key)
+            .and_then(|kv| match &kv.value {
                 Some(tb_proto::common::key_value_proto::Value::StrV(s)) => Some(s.clone()),
                 _ => None,
-            }
-        })
+            })
     };
     let title = str_attr("current_fw_title").unwrap_or_default();
     let version = str_attr("current_fw_version").unwrap_or_default();

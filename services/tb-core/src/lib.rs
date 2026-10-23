@@ -1,5 +1,6 @@
 //! tb-core：REST API 服务（租户/客户/用户/设备/资产等实体管理）。
 
+pub mod audit;
 pub mod auth_middleware;
 pub mod core_consumer;
 pub mod device_session;
@@ -9,6 +10,7 @@ pub mod state;
 pub mod telemetry_cache;
 pub mod telemetry_ingest;
 pub mod transport_api;
+pub mod usage;
 
 use axum::Router;
 use tb_auth::AuthState;
@@ -19,10 +21,15 @@ pub use state::AppState;
 
 /// 组装完整 HTTP 路由（含 /api/auth 子服务与通用 layer）。
 pub fn build_router(state: AppState) -> Router {
-    let auth_state = AuthState::new(state.auth_service.clone(), state.jwt_factory.clone());
+    let auth_state = AuthState::new(state.auth_service.clone(), state.jwt_factory.clone())
+        .with_audit_tx(state.audit_tx.clone());
     Router::new()
         .merge(routes::api_router())
         .nest_service("/api/auth", tb_auth::router(auth_state))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            usage::count_rest_request,
+        ))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state)

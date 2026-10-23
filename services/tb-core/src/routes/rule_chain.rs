@@ -13,16 +13,23 @@ use tb_dao::{PageData, PageLink};
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::audit::audit;
 use crate::auth_middleware::{check_tenant_scope, require_authority};
 use crate::routes::PageQuery;
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/ruleChain", post(save_rule_chain))
-        .route("/api/ruleChain/{id}", get(get_rule_chain).delete(delete_rule_chain))
+        .route(
+            "/api/ruleChain/{id}",
+            get(get_rule_chain).delete(delete_rule_chain),
+        )
         .route("/api/ruleChain/{id}/nodes", get(get_nodes).put(put_nodes))
         .route("/api/ruleChains", get(list_rule_chains))
-        .route("/api/ruleNode/{ruleNodeId}/events", get(get_node_debug_events))
+        .route(
+            "/api/ruleNode/{ruleNodeId}/events",
+            get(get_node_debug_events),
+        )
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,6 +80,7 @@ async fn save_rule_chain(
 ) -> Result<Json<RuleChain>, ApiError> {
     require_authority(&user, &[Authority::TenantAdmin])?;
     let tenant_id = user.0.tenant_id;
+    let is_new = req.id.is_none();
     let (id, created_time, first_rule_node_id, existing_root) = match req.id {
         Some(id) => {
             let existing = state
@@ -101,7 +109,16 @@ async fn save_rule_chain(
         configuration: None,
         additional_info: None,
     };
-    Ok(Json(state.rule_chain_dao.save_rooted(&chain).await?))
+    let saved = state.rule_chain_dao.save_rooted(&chain).await?;
+    audit(
+        &state,
+        &user,
+        Some((saved.id, EntityType::RuleChain, saved.name.clone())),
+        if is_new { "CREATED" } else { "UPDATED" },
+        None,
+        "SUCCESS",
+    );
+    Ok(Json(saved))
 }
 
 async fn get_rule_chain(
@@ -120,8 +137,16 @@ async fn delete_rule_chain(
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
     require_authority(&user, &[Authority::TenantAdmin])?;
-    load_chain(&state, &user, id).await?;
+    let chain = load_chain(&state, &user, id).await?;
     state.rule_chain_dao.delete_cascade(id).await?;
+    audit(
+        &state,
+        &user,
+        Some((chain.id, EntityType::RuleChain, chain.name)),
+        "DELETED",
+        None,
+        "SUCCESS",
+    );
     Ok(StatusCode::OK)
 }
 
@@ -227,11 +252,9 @@ async fn put_nodes(
 
     for node in &req.nodes {
         if !tb_rule_engine::known_node_types().contains(&node.r#type.as_str()) {
-            return Err(TbError::InvalidInput(format!(
-                "unknown rule node type: {}",
-                node.r#type
-            ))
-            .into());
+            return Err(
+                TbError::InvalidInput(format!("unknown rule node type: {}", node.r#type)).into(),
+            );
         }
     }
     for edge in &req.edges {
@@ -245,10 +268,9 @@ async fn put_nodes(
     }
     if let Some(first) = req.first_node_index {
         if first >= req.nodes.len() {
-            return Err(TbError::InvalidInput(format!(
-                "firstNodeIndex out of range: {first}"
-            ))
-            .into());
+            return Err(
+                TbError::InvalidInput(format!("firstNodeIndex out of range: {first}")).into(),
+            );
         }
     } else if !req.nodes.is_empty() {
         return Err(TbError::InvalidInput(

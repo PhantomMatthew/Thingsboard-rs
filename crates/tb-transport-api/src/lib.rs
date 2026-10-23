@@ -4,6 +4,10 @@
 //!   响应走 `tb_transport.api.responses.<node_id>`，后台 task 按 request_id 路由到 oneshot。
 //! - 异步上行：publish_* 把遥测/属性/RPC 封装为 ToRuleEngineMsg 发到 `tb_rule_engine.Main`
 //!   （key=device_id，保证同设备分区有序）。
+//! - 租户级限流：`TB_TRANSPORT_RATE_LIMIT_PER_TENANT`（msg/s，默认 0=不限），
+//!   超限返回 TbError::RateLimitExceeded。
+
+pub mod rate_limit;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -21,6 +25,8 @@ use tb_queue::{
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+use crate::rate_limit::RateLimiter;
+
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const CACHE_TTL: Duration = Duration::from_secs(60);
 
@@ -31,6 +37,7 @@ struct Inner {
     producer: KafkaQueueProducer,
     pending: PendingMap,
     cache: moka::future::Cache<String, Arc<(pb::DeviceInfoProto, pb::DeviceProfileProto)>>,
+    rate_limiter: Mutex<Option<RateLimiter>>,
     router_task: tokio::task::JoinHandle<()>,
 }
 
@@ -50,18 +57,17 @@ impl TransportApiClient {
             let responses_topic = responses_topic.clone();
             let group_id = format!("transport-api-{node_id}");
             tokio::spawn(async move {
-                if let Err(e) = tb_queue::admin::ensure_topic(&brokers, &responses_topic, 1).await
-                {
+                if let Err(e) = tb_queue::admin::ensure_topic(&brokers, &responses_topic, 1).await {
                     tracing::warn!("ensure responses topic failed: {e}");
                 }
                 let mut consumer =
                     match StreamQueueConsumer::new(&brokers, &group_id, &[&responses_topic]) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!("transport-api response consumer failed to start: {e}");
-                        return;
-                    }
-                };
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::error!("transport-api response consumer failed to start: {e}");
+                            return;
+                        }
+                    };
                 loop {
                     match consumer.recv().await {
                         Ok(msg) => {
@@ -87,15 +93,36 @@ impl TransportApiClient {
         let cache = moka::future::Cache::builder()
             .time_to_live(CACHE_TTL)
             .build();
+        let rate_limiter = std::env::var("TB_TRANSPORT_RATE_LIMIT_PER_TENANT")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&n| n > 0)
+            .map(RateLimiter::new);
         Ok(Self {
             inner: Arc::new(Inner {
                 node_id: node_id.to_string(),
                 producer,
                 pending,
                 cache,
+                rate_limiter: Mutex::new(rate_limiter),
                 router_task,
             }),
         })
+    }
+
+    /// 测试/定制用：覆盖环境变量配置的限流阈值（0 = 不限）。
+    pub fn set_rate_limit(&self, max_msgs_per_sec_per_tenant: u32) {
+        let limiter = (max_msgs_per_sec_per_tenant > 0)
+            .then(|| RateLimiter::new(max_msgs_per_sec_per_tenant));
+        *self.inner.rate_limiter.lock().unwrap() = limiter;
+    }
+
+    /// 租户令牌桶取一枚；未配置限流时恒 true。
+    fn rate_limit_check(&self, tenant_id: &str) -> bool {
+        match &*self.inner.rate_limiter.lock().unwrap() {
+            Some(limiter) => limiter.check(tenant_id),
+            None => true,
+        }
     }
 
     pub fn node_id(&self) -> &str {
@@ -156,12 +183,14 @@ impl TransportApiClient {
             .await?;
         let out = match resp.response {
             Some(pb::transport_api_response_msg::Response::ValidateCredentials(v)) => Ok(v),
-            Some(pb::transport_api_response_msg::Response::Error(e)) => {
-                Err(TbError::Internal(format!("transport-api error {}: {}", e.code, e.message)))
-            }
+            Some(pb::transport_api_response_msg::Response::Error(e)) => Err(TbError::Internal(
+                format!("transport-api error {}: {}", e.code, e.message),
+            )),
             other => {
                 tracing::warn!(?other, "unexpected transport-api response");
-                Err(TbError::Internal("unexpected transport-api response".into()))
+                Err(TbError::Internal(
+                    "unexpected transport-api response".into(),
+                ))
             }
         }?;
         if out.valid
@@ -182,15 +211,13 @@ impl TransportApiClient {
         password: &str,
     ) -> TbResult<pb::ValidateCredentialsResponse> {
         let resp = self
-            .request(
-                pb::transport_api_request_msg::Request::ValidateMqttBasic(
-                    pb::ValidateMqttBasicRequest {
-                        client_id: client_id.to_string(),
-                        username: username.to_string(),
-                        password: password.to_string(),
-                    },
-                ),
-            )
+            .request(pb::transport_api_request_msg::Request::ValidateMqttBasic(
+                pb::ValidateMqttBasicRequest {
+                    client_id: client_id.to_string(),
+                    username: username.to_string(),
+                    password: password.to_string(),
+                },
+            ))
             .await?;
         match resp.response {
             Some(pb::transport_api_response_msg::Response::ValidateCredentials(v)) => Ok(v),
@@ -199,7 +226,9 @@ impl TransportApiClient {
             )),
             other => {
                 tracing::warn!(?other, "unexpected transport-api response");
-                Err(TbError::Internal("unexpected transport-api response".into()))
+                Err(TbError::Internal(
+                    "unexpected transport-api response".into(),
+                ))
             }
         }
     }
@@ -227,7 +256,9 @@ impl TransportApiClient {
             )),
             other => {
                 tracing::warn!(?other, "unexpected transport-api response");
-                Err(TbError::Internal("unexpected transport-api response".into()))
+                Err(TbError::Internal(
+                    "unexpected transport-api response".into(),
+                ))
             }
         }
     }
@@ -238,6 +269,12 @@ impl TransportApiClient {
         device: &pb::DeviceInfoProto,
         entries: Vec<TsKvEntry>,
     ) -> TbResult<()> {
+        if !self.rate_limit_check(&device.tenant_id) {
+            return Err(TbError::RateLimitExceeded(format!(
+                "tenant {} telemetry rate limit exceeded",
+                device.tenant_id
+            )));
+        }
         let mut by_ts: HashMap<i64, serde_json::Map<String, serde_json::Value>> = HashMap::new();
         let mut order: Vec<i64> = Vec::new();
         for e in entries {
@@ -261,6 +298,12 @@ impl TransportApiClient {
         device: &pb::DeviceInfoProto,
         entries: Vec<KvEntry>,
     ) -> TbResult<()> {
+        if !self.rate_limit_check(&device.tenant_id) {
+            return Err(TbError::RateLimitExceeded(format!(
+                "tenant {} attributes rate limit exceeded",
+                device.tenant_id
+            )));
+        }
         let kv: serde_json::Map<String, serde_json::Value> = entries
             .into_iter()
             .map(|e| (e.key, serde_json::to_value(&e.value).unwrap_or_default()))
@@ -313,7 +356,9 @@ impl TransportApiClient {
             )),
             other => {
                 tracing::warn!(?other, "unexpected transport-api response");
-                Err(TbError::Internal("unexpected transport-api response".into()))
+                Err(TbError::Internal(
+                    "unexpected transport-api response".into(),
+                ))
             }
         }
     }
@@ -346,7 +391,9 @@ impl TransportApiClient {
             )),
             other => {
                 tracing::warn!(?other, "unexpected transport-api response");
-                Err(TbError::Internal("unexpected transport-api response".into()))
+                Err(TbError::Internal(
+                    "unexpected transport-api response".into(),
+                ))
             }
         }
     }
@@ -374,7 +421,9 @@ impl TransportApiClient {
             )),
             other => {
                 tracing::warn!(?other, "unexpected transport-api response");
-                Err(TbError::Internal("unexpected transport-api response".into()))
+                Err(TbError::Internal(
+                    "unexpected transport-api response".into(),
+                ))
             }
         }
     }
@@ -404,7 +453,9 @@ impl TransportApiClient {
             )),
             other => {
                 tracing::warn!(?other, "unexpected transport-api response");
-                Err(TbError::Internal("unexpected transport-api response".into()))
+                Err(TbError::Internal(
+                    "unexpected transport-api response".into(),
+                ))
             }
         }
     }

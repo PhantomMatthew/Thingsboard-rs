@@ -8,9 +8,9 @@ use crate::node::Node;
 use crate::nodes::{
     ChangeOriginatorNode, CheckpointNode, ClearAlarmNode, CreateAlarmNode, DeduplicationNode,
     DelayNode, DeleteAttributesNode, DeleteKeysNode, GeoFilterNode, KafkaNode, KeyExistsFilterNode,
-    LogNode, MathNode, MsgTypeFilterNode, MsgTypeSwitchNode, MqttNode, OriginatorAttributesNode,
-    OriginatorFieldsNode, OriginatorTypeFilterNode, RelatedAttributesNode, RenameKeysNode,
-    RelationFilterNode, RestCallNode, RpcOnewayNode, RuleChainNode, SaveAttributesNode,
+    LogNode, MathNode, MqttNode, MsgTypeFilterNode, MsgTypeSwitchNode, OriginatorAttributesNode,
+    OriginatorFieldsNode, OriginatorTypeFilterNode, RelatedAttributesNode, RelationFilterNode,
+    RenameKeysNode, RestCallNode, RpcOnewayNode, RuleChainNode, SaveAttributesNode,
     SaveTimeseriesNode, ScriptFilterNode, ScriptTransformNode, TenantCustomerFieldsNode,
 };
 

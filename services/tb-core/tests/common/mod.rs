@@ -134,8 +134,7 @@ pub async fn start_servers_with_transport() -> (String, String) {
     let (base, _pool) = start_server_with_pool().await;
     let uuid = uuid::Uuid::now_v7().simple().to_string();
     let run_id = &uuid[20..];
-    let brokers =
-        std::env::var("TB_KAFKA_BROKERS").unwrap_or_else(|_| "localhost:29092".into());
+    let brokers = std::env::var("TB_KAFKA_BROKERS").unwrap_or_else(|_| "localhost:29092".into());
     // 注意：transport-api server 依赖 AppState，需重新构建同库 state。
     let pool: PgPool = PgPoolOptions::new()
         .max_connections(5)
@@ -151,8 +150,8 @@ pub async fn start_servers_with_transport() -> (String, String) {
     .await;
 
     let node_id = format!("test-http-{run_id}");
-    let transport_state = tb_transport_http::TransportState::new(&brokers, &node_id)
-        .expect("http transport state");
+    let transport_state =
+        tb_transport_http::TransportState::new(&brokers, &node_id).expect("http transport state");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind random port");

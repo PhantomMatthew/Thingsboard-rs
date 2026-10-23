@@ -156,7 +156,9 @@ async fn find_device_by_name(
     name: &str,
 ) -> Option<String> {
     let resp = client
-        .get(format!("{base}/api/devices?pageSize=50&page=0&textSearch={name}"))
+        .get(format!(
+            "{base}/api/devices?pageSize=50&page=0&textSearch={name}"
+        ))
         .header("Authorization", bearer(token))
         .send()
         .await
@@ -213,7 +215,10 @@ async fn gateway_e2e() {
         let start = std::time::Instant::now();
         while found.is_none() {
             found = find_device_by_name(&client, &core, &admin_token, "gw-sub-1").await;
-            assert!(start.elapsed() < Duration::from_secs(30), "sub-device never created");
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "sub-device never created"
+            );
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
         found.unwrap()
@@ -258,9 +263,9 @@ async fn gateway_e2e() {
             .await
             .unwrap();
         let attrs: Value = resp.json().await.unwrap_or(Value::Null);
-        attrs.as_array().is_some_and(|a| {
-            a.iter().any(|e| e["key"] == "model" && e["value"] == "x1")
-        })
+        attrs
+            .as_array()
+            .is_some_and(|a| a.iter().any(|e| e["key"] == "model" && e["value"] == "x1"))
     })
     .await;
 
@@ -293,9 +298,11 @@ async fn gateway_e2e() {
         )
         .await
         .unwrap();
-    let pkt = wait_for(&mut gw.rx, Duration::from_secs(15), |p| {
-        matches!(p, Packet::Publish(p) if p.topic == "v1/gateway/attributes/response")
-    })
+    let pkt = wait_for(
+        &mut gw.rx,
+        Duration::from_secs(15),
+        |p| matches!(p, Packet::Publish(p) if p.topic == "v1/gateway/attributes/response"),
+    )
     .await;
     match pkt {
         Packet::Publish(p) => {
@@ -331,12 +338,17 @@ async fn gateway_e2e() {
                     .send()
                     .await
                     .unwrap();
-                (resp.status(), resp.json::<Value>().await.unwrap_or(Value::Null))
+                (
+                    resp.status(),
+                    resp.json::<Value>().await.unwrap_or(Value::Null),
+                )
             })
         };
-        let request = wait_opt(&mut gw.rx, Duration::from_secs(4), |p| {
-            matches!(p, Packet::Publish(p) if p.topic == "v1/gateway/rpc")
-        })
+        let request = wait_opt(
+            &mut gw.rx,
+            Duration::from_secs(4),
+            |p| matches!(p, Packet::Publish(p) if p.topic == "v1/gateway/rpc"),
+        )
         .await;
         if let Some(Packet::Publish(p)) = request {
             let payload: Value = serde_json::from_slice(&p.payload).unwrap();

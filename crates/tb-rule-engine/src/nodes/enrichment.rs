@@ -230,7 +230,11 @@ impl RelatedAttributesNode {
     }
 
     /// 第一个匹配的关联实体（relation_type_group=COMMON）。
-    async fn first_related(&self, ctx: &NodeContext, originator: &EntityId) -> TbResult<Option<EntityId>> {
+    async fn first_related(
+        &self,
+        ctx: &NodeContext,
+        originator: &EntityId,
+    ) -> TbResult<Option<EntityId>> {
         let rels = if self.direction == "FROM" {
             ctx.relation_dao
                 .find_by_from(originator.id, originator.entity_type)
@@ -249,11 +253,12 @@ impl RelatedAttributesNode {
                 } else {
                     (r.from_id, r.from_type)
                 };
-                (self.entity_types.is_empty() || self.entity_types.contains(&ty.as_str().to_string()))
-                    .then_some(EntityId {
-                        entity_type: ty,
-                        id,
-                    })
+                (self.entity_types.is_empty()
+                    || self.entity_types.contains(&ty.as_str().to_string()))
+                .then_some(EntityId {
+                    entity_type: ty,
+                    id,
+                })
             })
             .next())
     }
@@ -319,7 +324,10 @@ fn contact_fields(
             _ => None,
         }
     };
-    fields.iter().filter_map(|f| lookup(f).map(|v| (f.clone(), v))).collect()
+    fields
+        .iter()
+        .filter_map(|f| lookup(f).map(|v| (f.clone(), v)))
+        .collect()
 }
 
 impl TenantCustomerFieldsNode {
@@ -344,9 +352,12 @@ impl Node for TenantCustomerFieldsNode {
     async fn on_msg(&self, ctx: &NodeContext, mut msg: TbMsg) -> Vec<(String, TbMsg)> {
         match ctx.tenant_dao.find_by_id(msg.tenant_id).await {
             Ok(Some(t)) => {
-                for (f, v) in
-                    contact_fields(&self.tenant_fields, &t.title, t.email.as_deref(), t.phone.as_deref())
-                {
+                for (f, v) in contact_fields(
+                    &self.tenant_fields,
+                    &t.title,
+                    t.email.as_deref(),
+                    t.phone.as_deref(),
+                ) {
                     msg.metadata.insert(format!("tenant_{f}"), v);
                 }
             }

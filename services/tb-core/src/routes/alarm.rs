@@ -21,7 +21,10 @@ pub fn router() -> Router<AppState> {
         .route("/api/alarm/{alarmId}", get(get_alarm))
         .route("/api/alarm/{alarmId}/ack", post(ack_alarm))
         .route("/api/alarm/{alarmId}/clear", post(clear_alarm))
-        .route("/api/alarms/{entityType}/{entityId}", get(get_entity_alarms))
+        .route(
+            "/api/alarms/{entityType}/{entityId}",
+            get(get_entity_alarms),
+        )
         .route("/api/alarms", get(get_tenant_alarms))
 }
 

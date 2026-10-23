@@ -6,14 +6,16 @@ use std::sync::Arc;
 use sqlx::PgPool;
 use tb_auth::{AuthService, JwtTokenFactory};
 use tb_dao::{
-    AlarmDao, AssetDao, AssetProfileDao, AttributesDao, CustomerDao, DashboardDao,
-    DeviceCredentialsDao, DeviceDao, DeviceProfileDao, KeyDictionaryDao, OtaPackageDao,
-    RelationDao, RuleChainDao, RuleNodeDao, RuleNodeDebugEventDao, TenantDao, TenantProfileDao,
-    TimeseriesDao, UserCredentialsDao, UserDao,
+    AlarmDao, ApiUsageStateDao, AssetDao, AssetProfileDao, AttributesDao, AuditLogDao, CustomerDao,
+    DashboardDao, DeviceCredentialsDao, DeviceDao, DeviceProfileDao, KeyDictionaryDao,
+    OtaPackageDao, RelationDao, RuleChainDao, RuleNodeDao, RuleNodeDebugEventDao, TenantDao,
+    TenantProfileDao, TimeseriesDao, UserCredentialsDao, UserDao,
 };
 use tb_queue::KafkaQueueProducer;
+use tokio::sync::mpsc;
 
 use crate::device_session::SharedDeviceSessionRegistry;
+use crate::usage::UsageTracker;
 
 const DEFAULT_REDIS_URL: &str = "redis://localhost:16379";
 const DEFAULT_KAFKA_BROKERS: &str = "localhost:29092";
@@ -40,6 +42,11 @@ pub struct AppStateInner {
     pub attributes_dao: AttributesDao,
     pub alarm_dao: AlarmDao,
     pub ota_package_dao: OtaPackageDao,
+    pub audit_log_dao: AuditLogDao,
+    pub api_usage_state_dao: ApiUsageStateDao,
+    pub usage: UsageTracker,
+    /// login 审计事件通道（tb-auth 侧 try_send，receiver 已在 new() 启动）。
+    pub audit_tx: mpsc::Sender<tb_dao::AuditLog>,
     pub device_sessions: SharedDeviceSessionRegistry,
     pub redis: redis::Client,
     redis_conn: tokio::sync::OnceCell<redis::aio::ConnectionManager>,
@@ -70,7 +77,18 @@ impl AppState {
             .unwrap_or_else(|_| redis::Client::open(DEFAULT_REDIS_URL).unwrap());
         let kafka_brokers =
             std::env::var("TB_KAFKA_BROKERS").unwrap_or_else(|_| DEFAULT_KAFKA_BROKERS.into());
-        Self {
+        let audit_log_dao = AuditLogDao::new(pool.clone());
+        let (audit_tx, mut audit_rx) = mpsc::channel::<tb_dao::AuditLog>(1024);
+        let sink_dao = audit_log_dao.clone();
+        tokio::spawn(async move {
+            while let Some(entry) = audit_rx.recv().await {
+                if let Err(e) = sink_dao.save(&entry).await {
+                    tracing::warn!("audit sink save failed: {e}");
+                }
+            }
+        });
+        let usage = UsageTracker::default();
+        let state = Self {
             inner: Arc::new(AppStateInner {
                 tenant_dao: TenantDao::new(pool.clone()),
                 tenant_profile_dao: TenantProfileDao::new(pool.clone()),
@@ -91,6 +109,10 @@ impl AppState {
                 attributes_dao: AttributesDao::new(pool.clone(), key_dictionary_dao.clone()),
                 alarm_dao: AlarmDao::new(pool.clone()),
                 ota_package_dao: OtaPackageDao::new(pool.clone()),
+                audit_log_dao,
+                api_usage_state_dao: ApiUsageStateDao::new(pool.clone()),
+                usage: usage.clone(),
+                audit_tx,
                 device_sessions: crate::device_session::DeviceSessionRegistry::new_shared(),
                 key_dictionary_dao,
                 redis,
@@ -101,7 +123,9 @@ impl AppState {
                 jwt_factory,
                 pool,
             }),
-        }
+        };
+        usage.start_flush(state.clone());
+        state
     }
 
     /// 惰性建立并复用 Redis 连接（自动重连）；首次失败不影响后续重试。

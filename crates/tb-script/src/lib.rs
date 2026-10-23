@@ -132,9 +132,10 @@ impl ScriptEngine {
             None => metadata.clone(),
         };
         let new_type = match map.get("msgType") {
-            Some(d) => d.clone().into_string().map_err(|_| {
-                ScriptError::InvalidReturn("msgType must be a string".into())
-            })?,
+            Some(d) => d
+                .clone()
+                .into_string()
+                .map_err(|_| ScriptError::InvalidReturn("msgType must be a string".into()))?,
             None => msg_type.to_string(),
         };
         Ok(TransformOutput {
@@ -197,7 +198,11 @@ fn json_to_dynamic(v: &Value) -> Dynamic {
             }
         }
         Value::String(s) => s.clone().into(),
-        Value::Array(a) => a.iter().map(json_to_dynamic).collect::<rhai::Array>().into(),
+        Value::Array(a) => a
+            .iter()
+            .map(json_to_dynamic)
+            .collect::<rhai::Array>()
+            .into(),
         Value::Object(o) => {
             let mut map = rhai::Map::new();
             for (k, v) in o {
@@ -258,12 +263,22 @@ mod tests {
         let e = engine();
         let msg = json!({"temperature": 80});
         assert!(
-            e.eval_filter("msg.temperature > 50", &msg, &HashMap::new(), "POST_TELEMETRY_REQUEST")
-                .unwrap()
+            e.eval_filter(
+                "msg.temperature > 50",
+                &msg,
+                &HashMap::new(),
+                "POST_TELEMETRY_REQUEST"
+            )
+            .unwrap()
         );
         assert!(
-            !e.eval_filter("msg.temperature > 100", &msg, &HashMap::new(), "POST_TELEMETRY_REQUEST")
-                .unwrap()
+            !e.eval_filter(
+                "msg.temperature > 100",
+                &msg,
+                &HashMap::new(),
+                "POST_TELEMETRY_REQUEST"
+            )
+            .unwrap()
         );
     }
 
@@ -277,7 +292,10 @@ mod tests {
             e.eval_filter(script, &msg, &metadata, "POST_TELEMETRY_REQUEST")
                 .unwrap()
         );
-        assert!(!e.eval_filter(script, &msg, &metadata, "CONNECT_EVENT").unwrap());
+        assert!(
+            !e.eval_filter(script, &msg, &metadata, "CONNECT_EVENT")
+                .unwrap()
+        );
     }
 
     #[test]
@@ -325,7 +343,12 @@ mod tests {
     fn filter_non_bool_return_rejected() {
         let e = engine();
         let err = e
-            .eval_filter("msg.temperature + 1", &json!({"temperature": 1}), &HashMap::new(), "T")
+            .eval_filter(
+                "msg.temperature + 1",
+                &json!({"temperature": 1}),
+                &HashMap::new(),
+                "T",
+            )
             .unwrap_err();
         assert!(matches!(err, ScriptError::InvalidReturn(_)));
     }
@@ -344,7 +367,12 @@ mod tests {
         let e = engine();
         let msg = json!({"temperature": 80});
         let v = e
-            .eval_map("#{value: msg.temperature, note: \"hot\"}", &msg, &HashMap::new(), "T")
+            .eval_map(
+                "#{value: msg.temperature, note: \"hot\"}",
+                &msg,
+                &HashMap::new(),
+                "T",
+            )
             .unwrap();
         assert_eq!(v, json!({"value": 80, "note": "hot"}));
     }

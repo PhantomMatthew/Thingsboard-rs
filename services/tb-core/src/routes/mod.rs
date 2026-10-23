@@ -3,6 +3,7 @@
 pub mod alarm;
 pub mod asset;
 pub mod asset_profile;
+pub mod audit;
 pub mod customer;
 pub mod device;
 pub mod device_profile;
@@ -11,6 +12,7 @@ pub mod rpc;
 pub mod rule_chain;
 pub mod telemetry;
 pub mod tenant;
+pub mod usage;
 pub mod user;
 
 use axum::Router;
@@ -33,6 +35,8 @@ pub fn api_router() -> Router<AppState> {
         .merge(alarm::router())
         .merge(rpc::router())
         .merge(ota::router())
+        .merge(audit::router())
+        .merge(usage::router())
 }
 
 #[derive(Debug, Deserialize)]

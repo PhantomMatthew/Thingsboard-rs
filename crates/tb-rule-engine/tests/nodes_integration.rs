@@ -9,7 +9,9 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use tb_common::msg::{TbMsg, msg_type};
 use tb_common::{AttributeScope, EntityId, EntityType, KvEntry, KvValue};
-use tb_dao::models::{AlarmStatus, Customer, Device, DeviceProfile, EntityRelation, RuleChain, RuleNode, Tenant};
+use tb_dao::models::{
+    AlarmStatus, Customer, Device, DeviceProfile, EntityRelation, RuleChain, RuleNode, Tenant,
+};
 use tb_dao::{
     AlarmDao, AttributesDao, CustomerDao, DeviceDao, DeviceProfileDao, KeyDictionaryDao,
     RelationDao, RuleChainDao, RuleNodeDebugEventDao, TenantDao, TimeseriesDao, migrate,
@@ -21,7 +23,7 @@ use tb_rule_engine::nodes::{
     ChangeOriginatorNode, ClearAlarmNode, CreateAlarmNode, DeduplicationNode, DelayNode,
     DeleteAttributesNode, DeleteKeysNode, GeoFilterNode, KafkaNode, KeyExistsFilterNode, MathNode,
     MsgTypeFilterNode, OriginatorAttributesNode, OriginatorFieldsNode, OriginatorTypeFilterNode,
-    RelatedAttributesNode, RenameKeysNode, RelationFilterNode, RestCallNode, RpcOnewayNode,
+    RelatedAttributesNode, RelationFilterNode, RenameKeysNode, RestCallNode, RpcOnewayNode,
     RuleChainNode, TenantCustomerFieldsNode,
 };
 use tb_rule_engine::{ChainLoader, Node, NodeContext, chain};
@@ -137,7 +139,13 @@ fn make_chain_node(chain_id: Uuid, node_type: &str, config: Value, debug: bool) 
     }
 }
 
-async fn save_chain(pool: &PgPool, tenant_id: Uuid, nodes: &[RuleNode], edges: &[(Uuid, Uuid, String)], first: Uuid) -> RuleChain {
+async fn save_chain(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    nodes: &[RuleNode],
+    edges: &[(Uuid, Uuid, String)],
+    first: Uuid,
+) -> RuleChain {
     let dao = RuleChainDao::new(pool.clone());
     let chain = RuleChain {
         id: Uuid::now_v7(),
@@ -151,7 +159,9 @@ async fn save_chain(pool: &PgPool, tenant_id: Uuid, nodes: &[RuleNode], edges: &
         additional_info: None,
     };
     let chain = dao.save(&chain).await.unwrap();
-    dao.save_nodes(chain.id, nodes, edges, Some(first)).await.unwrap();
+    dao.save_nodes(chain.id, nodes, edges, Some(first))
+        .await
+        .unwrap();
     chain
 }
 
@@ -171,8 +181,14 @@ async fn originator_attributes_to_metadata_and_msg() {
         device,
         AttributeScope::ServerScope,
         &[
-            KvEntry { key: "model".into(), value: KvValue::Str("X1".into()) },
-            KvEntry { key: "threshold".into(), value: KvValue::Long(42) },
+            KvEntry {
+                key: "model".into(),
+                value: KvValue::Str("X1".into()),
+            },
+            KvEntry {
+                key: "threshold".into(),
+                value: KvValue::Long(42),
+            },
         ],
     )
     .await
@@ -180,7 +196,10 @@ async fn originator_attributes_to_metadata_and_msg() {
     dao.save(
         device,
         AttributeScope::ClientScope,
-        &[KvEntry { key: "clientKey".into(), value: KvValue::Bool(true) }],
+        &[KvEntry {
+            key: "clientKey".into(),
+            value: KvValue::Bool(true),
+        }],
     )
     .await
     .unwrap();
@@ -256,7 +275,10 @@ async fn related_attributes_from_relation_peer() {
     dao.save(
         asset.id,
         AttributeScope::ServerScope,
-        &[KvEntry { key: "location".into(), value: KvValue::Str("warehouse-A".into()) }],
+        &[KvEntry {
+            key: "location".into(),
+            value: KvValue::Str("warehouse-A".into()),
+        }],
     )
     .await
     .unwrap();
@@ -302,7 +324,10 @@ async fn tenant_customer_fields_to_metadata() {
         email: Some("c@test.io".into()),
         additional_info: None,
     };
-    CustomerDao::new(pool.clone()).save(&customer).await.unwrap();
+    CustomerDao::new(pool.clone())
+        .save(&customer)
+        .await
+        .unwrap();
 
     let node = TenantCustomerFieldsNode::new(&json!({
         "tenant_fields": ["title", "email"],
@@ -337,12 +362,24 @@ async fn msg_type_and_originator_type_filters() {
 
     let node = MsgTypeFilterNode::new(&json!({"types": ["POST_TELEMETRY_REQUEST"]})).unwrap();
     assert_eq!(node.on_msg(&ctx, msg(json!({}))).await[0].0, "True");
-    let m = TbMsg::new(msg_type::CONNECT_EVENT, EntityId::new(EntityType::Device), Uuid::now_v7(), json!({}), HashMap::new());
+    let m = TbMsg::new(
+        msg_type::CONNECT_EVENT,
+        EntityId::new(EntityType::Device),
+        Uuid::now_v7(),
+        json!({}),
+        HashMap::new(),
+    );
     assert_eq!(node.on_msg(&ctx, m).await[0].0, "False");
 
     let node = OriginatorTypeFilterNode::new(&json!({"types": ["DEVICE", "ASSET"]})).unwrap();
     assert_eq!(node.on_msg(&ctx, msg(json!({}))).await[0].0, "True");
-    let m = TbMsg::new("T", EntityId::new(EntityType::Customer), Uuid::now_v7(), json!({}), HashMap::new());
+    let m = TbMsg::new(
+        "T",
+        EntityId::new(EntityType::Customer),
+        Uuid::now_v7(),
+        json!({}),
+        HashMap::new(),
+    );
     assert_eq!(node.on_msg(&ctx, m).await[0].0, "False");
 }
 
@@ -400,8 +437,20 @@ async fn geo_filter_circle_and_polygon() {
         "circle": {"lat": 48.0, "lng": 11.0, "radius_m": 1000.0},
     }))
     .unwrap();
-    assert_eq!(circle.on_msg(&ctx, msg(json!({"lat": 48.0, "lng": 11.001}))).await[0].0, "True");
-    assert_eq!(circle.on_msg(&ctx, msg(json!({"lat": 49.0, "lng": 12.0}))).await[0].0, "False");
+    assert_eq!(
+        circle
+            .on_msg(&ctx, msg(json!({"lat": 48.0, "lng": 11.001})))
+            .await[0]
+            .0,
+        "True"
+    );
+    assert_eq!(
+        circle
+            .on_msg(&ctx, msg(json!({"lat": 49.0, "lng": 12.0})))
+            .await[0]
+            .0,
+        "False"
+    );
     // 缺坐标 → False
     assert_eq!(circle.on_msg(&ctx, msg(json!({}))).await[0].0, "False");
 
@@ -410,10 +459,28 @@ async fn geo_filter_circle_and_polygon() {
         "polygon": [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
     }))
     .unwrap();
-    assert_eq!(polygon.on_msg(&ctx, msg(json!({"lat": 0.5, "lng": 0.5}))).await[0].0, "True");
-    assert_eq!(polygon.on_msg(&ctx, msg(json!({"lat": 2.0, "lng": 2.0}))).await[0].0, "False");
+    assert_eq!(
+        polygon
+            .on_msg(&ctx, msg(json!({"lat": 0.5, "lng": 0.5})))
+            .await[0]
+            .0,
+        "True"
+    );
+    assert_eq!(
+        polygon
+            .on_msg(&ctx, msg(json!({"lat": 2.0, "lng": 2.0})))
+            .await[0]
+            .0,
+        "False"
+    );
     // 字符串坐标也接受
-    assert_eq!(polygon.on_msg(&ctx, msg(json!({"lat": "0.5", "lng": "0.5"}))).await[0].0, "True");
+    assert_eq!(
+        polygon
+            .on_msg(&ctx, msg(json!({"lat": "0.5", "lng": "0.5"})))
+            .await[0]
+            .0,
+        "True"
+    );
 }
 
 // ---------- transform ----------
@@ -423,8 +490,11 @@ async fn rename_and_delete_keys() {
     let pool = setup().await;
     let ctx = ctx(&pool);
 
-    let rename = RenameKeysNode::new(&json!({"map": {"temp": "temperature"}, "target": "msg"})).unwrap();
-    let outs = rename.on_msg(&ctx, msg(json!({"temp": 25, "keep": 1}))).await;
+    let rename =
+        RenameKeysNode::new(&json!({"map": {"temp": "temperature"}, "target": "msg"})).unwrap();
+    let outs = rename
+        .on_msg(&ctx, msg(json!({"temp": 25, "keep": 1})))
+        .await;
     assert_eq!(outs[0].0, "Success");
     assert_eq!(outs[0].1.data, json!({"temperature": 25, "keep": 1}));
 
@@ -533,8 +603,14 @@ async fn delete_attributes_node() {
         device,
         AttributeScope::ServerScope,
         &[
-            KvEntry { key: "a".into(), value: KvValue::Long(1) },
-            KvEntry { key: "b".into(), value: KvValue::Long(2) },
+            KvEntry {
+                key: "a".into(),
+                value: KvValue::Long(1),
+            },
+            KvEntry {
+                key: "b".into(),
+                value: KvValue::Long(2),
+            },
         ],
     )
     .await
@@ -545,7 +621,10 @@ async fn delete_attributes_node() {
     m.originator.id = device;
     let outs = node.on_msg(&ctx, m).await;
     assert_eq!(outs[0].0, "Success");
-    let left = dao.find(device, AttributeScope::ServerScope, None).await.unwrap();
+    let left = dao
+        .find(device, AttributeScope::ServerScope, None)
+        .await
+        .unwrap();
     assert_eq!(left.len(), 1);
     assert_eq!(left[0].key, "b");
 }
@@ -643,7 +722,10 @@ async fn poll_kafka(
             // 新 topic 首消费常见 UnknownTopicOrPartition，等 broker 自动创建后重试。
             _ => {}
         }
-        assert!(start.elapsed() < timeout, "poll_kafka timed out after {timeout:?}");
+        assert!(
+            start.elapsed() < timeout,
+            "poll_kafka timed out after {timeout:?}"
+        );
     }
 }
 
@@ -658,7 +740,8 @@ async fn rpc_oneway_sends_to_core_topic() {
     .unwrap();
 
     let group = uniq("rpc-oneway-test");
-    let mut consumer = StreamQueueConsumer::new("localhost:29092", &group, &[TbTopic::CORE]).unwrap();
+    let mut consumer =
+        StreamQueueConsumer::new("localhost:29092", &group, &[TbTopic::CORE]).unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let m = msg(json!({"temperature": 1}));
@@ -670,8 +753,12 @@ async fn rpc_oneway_sends_to_core_topic() {
             node.on_msg(&ctx, m.clone()).await;
         },
         |payload| {
-            let Ok(to_core) = core_pb::ToCoreMsg::decode(payload) else { return false };
-            let Some(core_pb::to_core_msg::Msg::RpcRequest(rpc)) = to_core.msg else { return false };
+            let Ok(to_core) = core_pb::ToCoreMsg::decode(payload) else {
+                return false;
+            };
+            let Some(core_pb::to_core_msg::Msg::RpcRequest(rpc)) = to_core.msg else {
+                return false;
+            };
             rpc.device_id == device_id.to_string()
                 && rpc.method == "setGpio"
                 && rpc.params_json == json!({"pin": 4, "value": 1}).to_string().as_str()
@@ -705,7 +792,10 @@ async fn rest_call_against_local_server() {
                 }
             }),
         )
-        .route("/bad", post(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }));
+        .route(
+            "/bad",
+            post(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+        );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -722,7 +812,10 @@ async fn rest_call_against_local_server() {
     let outs = node.on_msg(&ctx, m).await;
     assert_eq!(outs[0].0, "Success");
     assert_eq!(outs[0].1.metadata["rest_call_status"], "200");
-    let got = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(got, format!("dev-42|{}", json!({"t": 25})));
 
     // 500 → Failure，状态码仍进 metadata
@@ -766,7 +859,9 @@ async fn external_kafka_publishes_msg_json() {
             node.on_msg(&ctx, m.clone()).await;
         },
         |payload| {
-            let Ok(v) = serde_json::from_slice::<Value>(payload) else { return false };
+            let Ok(v) = serde_json::from_slice::<Value>(payload) else {
+                return false;
+            };
             v["id"] == json!(msg_id.to_string()) && v["data"] == json!({"temperature": 7})
         },
     )
@@ -809,7 +904,11 @@ async fn rule_chain_node_executes_target_chain() {
     );
     let chain_a = save_chain(&pool, tenant.id, std::slice::from_ref(&flow), &[], flow.id).await;
 
-    let state = ChainLoader::new(pool.clone()).load(chain_a.id).await.unwrap().unwrap();
+    let state = ChainLoader::new(pool.clone())
+        .load(chain_a.id)
+        .await
+        .unwrap()
+        .unwrap();
     let m = msg(json!({"ts": 1, "values": {"temperature": 33}}));
     let originator = m.originator.id;
     chain::execute(&ctx, &state, flow.id, m).await;
@@ -853,7 +952,11 @@ async fn checkpoint_requeues_instead_of_local_forward() {
     let mut consumer = StreamQueueConsumer::new("localhost:29092", &group, &[&topic]).unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let state = ChainLoader::new(pool.clone()).load(chain_row.id).await.unwrap().unwrap();
+    let state = ChainLoader::new(pool.clone())
+        .load(chain_row.id)
+        .await
+        .unwrap()
+        .unwrap();
     let mut m = msg(json!({"ts": 2, "values": {"temperature": 44}}));
     m.queue_name = queue.clone();
     let originator = m.originator.id;
@@ -866,7 +969,9 @@ async fn checkpoint_requeues_instead_of_local_forward() {
             chain::execute(&ctx, &state, checkpoint.id, m.clone()).await;
         },
         |payload| {
-            let Ok(to_re) = ToRuleEngineMsg::decode(payload) else { return false };
+            let Ok(to_re) = ToRuleEngineMsg::decode(payload) else {
+                return false;
+            };
             let Some(p) = to_re.tb_msg else { return false };
             p.rule_chain_id == chain_row.id.to_string() && p.rule_node_id == save.id.to_string()
         },
@@ -874,7 +979,13 @@ async fn checkpoint_requeues_instead_of_local_forward() {
     .await;
 
     // 未本地转发：ts_kv_latest 应为空
-    assert!(ts_dao.find_latest(originator, None).await.unwrap().is_empty());
+    assert!(
+        ts_dao
+            .find_latest(originator, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 // ---------- DLQ / debug ----------
@@ -886,15 +997,31 @@ async fn failure_without_edge_goes_to_dlq() {
     let tenant = make_tenant(&pool).await;
 
     // 编译错误脚本 → 运行时 Failure；无 Failure 边 → DLQ
-    let filter = make_chain_node(Uuid::nil(), "filter.script", json!({"script": "msg. >"}), false);
-    let chain_row = save_chain(&pool, tenant.id, std::slice::from_ref(&filter), &[], filter.id).await;
+    let filter = make_chain_node(
+        Uuid::nil(),
+        "filter.script",
+        json!({"script": "msg. >"}),
+        false,
+    );
+    let chain_row = save_chain(
+        &pool,
+        tenant.id,
+        std::slice::from_ref(&filter),
+        &[],
+        filter.id,
+    )
+    .await;
 
     let group = uniq("dlq-verify");
     let mut consumer =
         StreamQueueConsumer::new("localhost:29092", &group, &[TbTopic::RULE_ENGINE_DLQ]).unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let state = ChainLoader::new(pool.clone()).load(chain_row.id).await.unwrap().unwrap();
+    let state = ChainLoader::new(pool.clone())
+        .load(chain_row.id)
+        .await
+        .unwrap()
+        .unwrap();
     let m = msg(json!({}));
     let msg_id = m.id;
 
@@ -905,7 +1032,9 @@ async fn failure_without_edge_goes_to_dlq() {
             chain::execute(&ctx, &state, filter.id, m.clone()).await;
         },
         |payload| {
-            let Ok(to_re) = ToRuleEngineMsg::decode(payload) else { return false };
+            let Ok(to_re) = ToRuleEngineMsg::decode(payload) else {
+                return false;
+            };
             let Some(p) = to_re.tb_msg else { return false };
             if p.id != msg_id.to_string() {
                 return false;
@@ -928,7 +1057,11 @@ async fn debug_mode_writes_in_out_events() {
     let log = make_chain_node(Uuid::nil(), "action.log", json!({"prefix": "dbg"}), true);
     let chain_row = save_chain(&pool, tenant.id, std::slice::from_ref(&log), &[], log.id).await;
 
-    let state = ChainLoader::new(pool.clone()).load(chain_row.id).await.unwrap().unwrap();
+    let state = ChainLoader::new(pool.clone())
+        .load(chain_row.id)
+        .await
+        .unwrap()
+        .unwrap();
     let m = msg(json!({"temperature": 5}));
     let msg_id = m.id;
     chain::execute(&ctx, &state, log.id, m).await;

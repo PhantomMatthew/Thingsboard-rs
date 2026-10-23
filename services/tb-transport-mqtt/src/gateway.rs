@@ -185,13 +185,11 @@ async fn on_telemetry(state: &TransportState, session: &Session, payload: &[u8])
         };
         match session::parse_telemetry(&serde_json::to_vec(&value).unwrap_or_default()) {
             Ok(entries) => {
-                if let Err(e) = state
+                let res = state
                     .transport_api
                     .publish_telemetry(&sub.device, entries)
-                    .await
-                {
-                    tracing::warn!(device = name, "gateway telemetry publish failed: {e}");
-                }
+                    .await;
+                crate::log_publish_result(res, "gateway telemetry publish failed");
             }
             Err(e) => tracing::warn!(device = name, "bad gateway telemetry values: {e}"),
         }
@@ -214,13 +212,11 @@ async fn on_attributes(state: &TransportState, session: &Session, payload: &[u8]
             .into_iter()
             .map(|(key, value)| KvEntry { key, value })
             .collect();
-        if let Err(e) = state
+        let res = state
             .transport_api
             .publish_attributes(&sub.device, entries)
-            .await
-        {
-            tracing::warn!(device = name, "gateway attributes publish failed: {e}");
-        }
+            .await;
+        crate::log_publish_result(res, "gateway attributes publish failed");
     }
 }
 
@@ -256,7 +252,10 @@ async fn on_attributes_request(
         return;
     };
     let Some(sub) = session.sub_devices.get(&req.device) else {
-        tracing::warn!(device = req.device, "attributes request for unknown sub-device");
+        tracing::warn!(
+            device = req.device,
+            "attributes request for unknown sub-device"
+        );
         return;
     };
     let (client_keys, shared_keys) = if req.client {
@@ -343,7 +342,9 @@ async fn on_rpc(state: &TransportState, session: &Session, payload: &[u8]) {
 
 /// 网关订阅 v1/gateway/rpc：存量子设备逐个发 subscribe_rpc，后续 connect 的子设备自动带上。
 pub async fn subscribe_rpc(state: &TransportState, session: &Session, granted_qos: u8) {
-    session.gateway_rpc_qos.store(granted_qos, Ordering::Relaxed);
+    session
+        .gateway_rpc_qos
+        .store(granted_qos, Ordering::Relaxed);
     for sub in session.sub_devices.values() {
         if let Some(handle) = state.sessions.get(&sub.info.session_id) {
             handle.rpc_qos.store(granted_qos, Ordering::Relaxed);
