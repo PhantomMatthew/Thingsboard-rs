@@ -1,0 +1,19 @@
+[package]
+name = "tb-bench"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tb-bench"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true, features = ["full"] }
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
+reqwest = { version = "0.12", features = ["json"] }
+rumqttc = "0.24"

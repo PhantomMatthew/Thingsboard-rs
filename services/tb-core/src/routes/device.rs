@@ -343,5 +343,13 @@ pub async fn ensure_default_device_profile(
         firmware_id: None,
         software_id: None,
     };
-    state.device_profile_dao.save(&profile).await
+    // 并发首建可能撞上 (tenant_id, name) 唯一约束，重读一次兜底。
+    match state.device_profile_dao.save(&profile).await {
+        Ok(p) => Ok(p),
+        Err(_) => state
+            .device_profile_dao
+            .find_default(tenant_id)
+            .await?
+            .ok_or_else(|| TbError::Internal("default device profile lost".into())),
+    }
 }

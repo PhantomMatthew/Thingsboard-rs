@@ -17,6 +17,7 @@ members = [
     "services/tb-transport-coap",
     "services/tb-transport-http",
     "services/tb-transport-mqtt",
+    "tools/bench",
 ]
 
 [workspace.package]

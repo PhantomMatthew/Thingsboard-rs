@@ -254,5 +254,13 @@ pub async fn ensure_default_asset_profile(
         is_default: true,
         profile_data: serde_json::json!({}),
     };
-    state.asset_profile_dao.save(&profile).await
+    // 并发首建可能撞上 (tenant_id, name) 唯一约束，重读一次兜底。
+    match state.asset_profile_dao.save(&profile).await {
+        Ok(p) => Ok(p),
+        Err(_) => state
+            .asset_profile_dao
+            .find_default(tenant_id)
+            .await?
+            .ok_or_else(|| TbError::Internal("default asset profile lost".into())),
+    }
 }

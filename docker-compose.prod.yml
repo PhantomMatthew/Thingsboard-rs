@@ -1,0 +1,184 @@
+# Thingsboard-rs 生产部署模板。
+# 用法：cp .env.prod.example .env.prod 并填入真实值，然后
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+# 应用镜像：docker build -f docker/Dockerfile -t thingsboard-rs:latest .
+
+name: thingsboard-rs-prod
+
+services:
+  # ---------- 基础设施 ----------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-thingsboard}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}
+      POSTGRES_DB: ${POSTGRES_DB:-thingsboard}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-thingsboard}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    # 不暴露端口：仅供容器网络内访问。
+
+  kafka:
+    image: apache/kafka:3.9.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    volumes:
+      - kafkadata:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ---------- 应用服务（单一镜像，entrypoint 区分角色） ----------
+  tb-core:
+    image: ${APP_IMAGE:-thingsboard-rs:latest}
+    entrypoint: ["tb-core"]
+    environment:
+      TB_DATABASE_URL: postgres://${POSTGRES_USER:-thingsboard}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-thingsboard}
+      TB_KAFKA_BROKERS: kafka:9092
+      TB_REDIS_URL: redis://redis:6379
+      TB_EDQS_URL: http://tb-edqs:8090
+      TB_HTTP_PORT: 8080
+      TB_JWT_SECRET: ${JWT_SECRET:?JWT_SECRET required}
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      tb-edqs: { condition: service_started }
+    restart: unless-stopped
+
+  tb-auth:
+    image: ${APP_IMAGE:-thingsboard-rs:latest}
+    entrypoint: ["tb-auth"]
+    environment:
+      TB_DATABASE_URL: postgres://${POSTGRES_USER:-thingsboard}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-thingsboard}
+      TB_HTTP_PORT: 8081
+      TB_JWT_SECRET: ${JWT_SECRET:?JWT_SECRET required}
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+
+  tb-rule-engine:
+    image: ${APP_IMAGE:-thingsboard-rs:latest}
+    entrypoint: ["tb-rule-engine"]
+    environment:
+      TB_DATABASE_URL: postgres://${POSTGRES_USER:-thingsboard}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-thingsboard}
+      TB_KAFKA_BROKERS: kafka:9092
+      TB_RE_QUEUE: Main
+      RUST_LOG: ${RUST_LOG:-info}
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+    restart: unless-stopped
+
+  tb-transport-mqtt:
+    image: ${APP_IMAGE:-thingsboard-rs:latest}
+    entrypoint: ["tb-transport-mqtt"]
+    environment:
+      TB_KAFKA_BROKERS: kafka:9092
+      TB_MQTT_BIND: 0.0.0.0:1883
+      TB_NODE_ID: mqtt-1
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "1883:1883"
+    depends_on:
+      kafka: { condition: service_healthy }
+      tb-core: { condition: service_started }
+    restart: unless-stopped
+
+  tb-transport-http:
+    image: ${APP_IMAGE:-thingsboard-rs:latest}
+    entrypoint: ["tb-transport-http"]
+    environment:
+      TB_KAFKA_BROKERS: kafka:9092
+      TB_TRANSPORT_HTTP_PORT: 8088
+      TB_NODE_ID: http-1
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "8088:8088"
+    depends_on:
+      kafka: { condition: service_healthy }
+      tb-core: { condition: service_started }
+    restart: unless-stopped
+
+  tb-transport-coap:
+    image: ${APP_IMAGE:-thingsboard-rs:latest}
+    entrypoint: ["tb-transport-coap"]
+    environment:
+      TB_KAFKA_BROKERS: kafka:9092
+      TB_COAP_BIND: 0.0.0.0:5683
+      TB_NODE_ID: coap-1
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "5683:5683/udp"
+    depends_on:
+      kafka: { condition: service_healthy }
+      tb-core: { condition: service_started }
+    restart: unless-stopped
+
+  tb-edqs:
+    image: ${APP_IMAGE:-thingsboard-rs:latest}
+    entrypoint: ["tb-edqs"]
+    environment:
+      TB_DATABASE_URL: postgres://${POSTGRES_USER:-thingsboard}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-thingsboard}
+      TB_KAFKA_BROKERS: kafka:9092
+      TB_EDQS_PORT: 8090
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "8090:8090"
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+    restart: unless-stopped
+
+  tb-housekeeper:
+    image: ${APP_IMAGE:-thingsboard-rs:latest}
+    entrypoint: ["tb-housekeeper"]
+    environment:
+      TB_DATABASE_URL: postgres://${POSTGRES_USER:-thingsboard}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-thingsboard}
+      TB_HOUSEKEEPER_INTERVAL_SEC: ${HOUSEKEEPER_INTERVAL_SEC:-3600}
+      TB_TS_TTL_DAYS: ${TS_TTL_DAYS:-0}
+      TB_DEBUG_EVENT_TTL_DAYS: ${DEBUG_EVENT_TTL_DAYS:-7}
+      TB_ALARM_TTL_DAYS: ${ALARM_TTL_DAYS:-0}
+      RUST_LOG: ${RUST_LOG:-info}
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  kafkadata:
+  redisdata:
