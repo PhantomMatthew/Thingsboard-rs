@@ -88,6 +88,17 @@ async fn save_asset(
         None,
         "SUCCESS",
     );
+    crate::edqs::publish_entity_upsert(
+        &state,
+        saved.tenant_id,
+        saved.id,
+        EntityType::Asset,
+        saved.customer_id,
+        &saved.name,
+        "",
+        saved.label.as_deref(),
+        saved.created_time,
+    );
     Ok(Json(saved))
 }
 
@@ -125,6 +136,7 @@ async fn delete_asset(
         None,
         "SUCCESS",
     );
+    crate::edqs::publish_entity_delete(&state, asset.tenant_id, id, EntityType::Asset);
     Ok(StatusCode::OK)
 }
 
@@ -179,7 +191,19 @@ async fn assign_asset(
     let customer = load_customer(&state, customer_id).await?;
     check_tenant_scope(&user, customer.tenant_id)?;
     asset.customer_id = Some(customer_id);
-    Ok(Json(state.asset_dao.save(&asset).await?))
+    let saved = state.asset_dao.save(&asset).await?;
+    crate::edqs::publish_entity_upsert(
+        &state,
+        saved.tenant_id,
+        saved.id,
+        EntityType::Asset,
+        saved.customer_id,
+        &saved.name,
+        "",
+        saved.label.as_deref(),
+        saved.created_time,
+    );
+    Ok(Json(saved))
 }
 
 async fn unassign_asset(
@@ -191,7 +215,19 @@ async fn unassign_asset(
     let mut asset = load_asset(&state, asset_id).await?;
     check_tenant_scope(&user, asset.tenant_id)?;
     asset.customer_id = None;
-    Ok(Json(state.asset_dao.save(&asset).await?))
+    let saved = state.asset_dao.save(&asset).await?;
+    crate::edqs::publish_entity_upsert(
+        &state,
+        saved.tenant_id,
+        saved.id,
+        EntityType::Asset,
+        saved.customer_id,
+        &saved.name,
+        "",
+        saved.label.as_deref(),
+        saved.created_time,
+    );
+    Ok(Json(saved))
 }
 
 pub async fn load_asset(state: &AppState, id: Uuid) -> TbResult<Asset> {

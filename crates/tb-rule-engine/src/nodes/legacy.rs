@@ -7,6 +7,8 @@ use tb_common::{
     AttributeScope, EntityId, EntityType, KvEntry, KvValue, TbError, TbResult, TsKvEntry,
 };
 use tb_dao::models::{Alarm, AlarmSeverity, AlarmStatus};
+use tb_proto::common as common_pb;
+use tb_proto::edqs as edqs_pb;
 use uuid::Uuid;
 
 use crate::context::NodeContext;
@@ -133,6 +135,22 @@ impl Node for ScriptTransformNode {
     }
 }
 
+/// EDQS 读模型事件：fire-and-forget，失败仅 warn。
+fn publish_edqs(ctx: &NodeContext, tenant_id: Uuid, event: edqs_pb::EdqsEventMsg) {
+    let Some(producer) = ctx.edqs_producer.clone() else {
+        return;
+    };
+    tokio::spawn(async move {
+        if let Err(e) = tb_queue::edqs::publish_event(&producer, tenant_id, &event).await {
+            tracing::warn!("edqs event publish failed: {e}");
+        }
+    });
+}
+
+fn kv_proto(key: &str, value: &KvValue) -> common_pb::KeyValueProto {
+    tb_proto::convert::kv_to_proto_named(0, key, value)
+}
+
 /// action.save_timeseries：msg.data 为 {ts, values:{k:v}} 或扁平 {k:v}（ts 取 msg.ts）。
 /// 写 ts_kv + ts_kv_latest。default_ttl 仅为配置兼容保留（本库 ts_kv 无 TTL 列）。
 #[derive(Default)]
@@ -191,7 +209,22 @@ async fn save_timeseries(ctx: &NodeContext, msg: &TbMsg) -> TbResult<()> {
         })
         .collect();
     // TODO(Phase 8b/9)：发布 usage 统计消息到 tb_usage_stats topic，由 core 汇总进 api_usage_state。
-    ctx.timeseries_dao.save(msg.originator.id, &entries).await
+    ctx.timeseries_dao.save(msg.originator.id, &entries).await?;
+    publish_edqs(
+        ctx,
+        msg.tenant_id,
+        edqs_pb::EdqsEventMsg {
+            tenant_id: msg.tenant_id.to_string(),
+            event: Some(edqs_pb::edqs_event_msg::Event::LatestTelemetry(
+                edqs_pb::LatestTelemetryMsg {
+                    entity_id: msg.originator.id.to_string(),
+                    values: entries.iter().map(|e| kv_proto(&e.key, &e.value)).collect(),
+                    ts: entries.iter().map(|e| e.ts).collect(),
+                },
+            )),
+        },
+    );
+    Ok(())
 }
 
 /// action.save_attributes：config {scope: 默认 CLIENT_SCOPE}；
@@ -262,7 +295,23 @@ impl SaveAttributesNode {
             .collect();
         ctx.attributes_dao
             .save(msg.originator.id, scope, &entries)
-            .await
+            .await?;
+        publish_edqs(
+            ctx,
+            msg.tenant_id,
+            edqs_pb::EdqsEventMsg {
+                tenant_id: msg.tenant_id.to_string(),
+                event: Some(edqs_pb::edqs_event_msg::Event::AttributeUpdate(
+                    edqs_pb::AttributeUpdateMsg {
+                        entity_id: msg.originator.id.to_string(),
+                        scope: common_pb::AttributeScope::from(scope) as i32,
+                        updated: entries.iter().map(|e| kv_proto(&e.key, &e.value)).collect(),
+                        deleted_keys: vec![],
+                    },
+                )),
+            },
+        );
+        Ok(())
     }
 }
 

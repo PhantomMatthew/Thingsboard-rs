@@ -6,6 +6,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         proto_dir.join("transport_api.proto"),
         proto_dir.join("core.proto"),
         proto_dir.join("rule_engine.proto"),
+        proto_dir.join("edqs.proto"),
     ];
 
     for f in &files {

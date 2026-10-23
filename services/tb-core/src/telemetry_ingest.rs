@@ -86,6 +86,7 @@ async fn handle_msg(state: &AppState, msg: &TbMsgProto) -> tb_common::TbResult<(
                 })
                 .collect();
             telemetry_cache::save_with_latest(state, tenant_id, entity_id, &entries).await?;
+            crate::edqs::publish_latest(state, tenant_id, entity_id, &entries);
         }
         msg_type::POST_ATTRIBUTES_REQUEST => {
             let entity_id = Uuid::parse_str(&msg.originator_id).map_err(|_| {
@@ -117,6 +118,14 @@ async fn handle_msg(state: &AppState, msg: &TbMsgProto) -> tb_common::TbResult<(
                 .attributes_dao
                 .save(entity_id, scope, &entries)
                 .await?;
+            crate::edqs::publish_attribute_update(
+                state,
+                tenant_id,
+                entity_id,
+                scope,
+                &entries,
+                vec![],
+            );
         }
         other => {
             tracing::debug!(msg_type = other, "ingest skipped");

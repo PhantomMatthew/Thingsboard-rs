@@ -11,6 +11,7 @@ members = [
     "services/tb-auth",
     "services/tb-core",
     "services/tb-housekeeper",
+    "services/tb-edqs",
     "services/tb-rule-engine",
     "services/tb-transport-http",
     "services/tb-transport-mqtt",

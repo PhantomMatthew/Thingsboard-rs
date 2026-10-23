@@ -52,6 +52,9 @@ pub struct AppStateInner {
     redis_conn: tokio::sync::OnceCell<redis::aio::ConnectionManager>,
     kafka_producer: tokio::sync::OnceCell<KafkaQueueProducer>,
     kafka_brokers: String,
+    /// tb-edqs 内网地址（代理端点转发目标）。
+    pub edqs_url: String,
+    pub http_client: reqwest::Client,
     pub auth_service: Arc<AuthService>,
     pub jwt_factory: Arc<JwtTokenFactory>,
 }
@@ -77,6 +80,8 @@ impl AppState {
             .unwrap_or_else(|_| redis::Client::open(DEFAULT_REDIS_URL).unwrap());
         let kafka_brokers =
             std::env::var("TB_KAFKA_BROKERS").unwrap_or_else(|_| DEFAULT_KAFKA_BROKERS.into());
+        let edqs_url =
+            std::env::var("TB_EDQS_URL").unwrap_or_else(|_| "http://localhost:8090".into());
         let audit_log_dao = AuditLogDao::new(pool.clone());
         let (audit_tx, mut audit_rx) = mpsc::channel::<tb_dao::AuditLog>(1024);
         let sink_dao = audit_log_dao.clone();
@@ -119,6 +124,11 @@ impl AppState {
                 redis_conn: tokio::sync::OnceCell::new(),
                 kafka_producer: tokio::sync::OnceCell::new(),
                 kafka_brokers,
+                edqs_url,
+                http_client: reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .unwrap_or_default(),
                 auth_service: AuthService::new(pool.clone(), jwt_factory.clone()),
                 jwt_factory,
                 pool,

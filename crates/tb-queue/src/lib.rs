@@ -9,6 +9,7 @@
 
 pub mod admin;
 pub mod consumer;
+pub mod edqs;
 pub mod partition;
 pub mod producer;
 pub mod topics;

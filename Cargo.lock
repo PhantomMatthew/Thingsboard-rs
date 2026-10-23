@@ -2972,6 +2972,7 @@ dependencies = [
  "tb-auth",
  "tb-common",
  "tb-dao",
+ "tb-edqs",
  "tb-proto",
  "tb-queue",
  "tb-rule-engine",
@@ -2999,6 +3000,28 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "tb-edqs"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "dashmap",
+ "prost",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tb-common",
+ "tb-dao",
+ "tb-proto",
+ "tb-queue",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -3031,11 +3054,14 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
+ "prost",
  "rdkafka",
  "tb-common",
+ "tb-proto",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

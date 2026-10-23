@@ -121,6 +121,17 @@ async fn save_device(
         None,
         "SUCCESS",
     );
+    crate::edqs::publish_entity_upsert(
+        &state,
+        saved.tenant_id,
+        saved.id,
+        EntityType::Device,
+        saved.customer_id,
+        &saved.name,
+        saved.r#type.as_deref().unwrap_or_default(),
+        saved.label.as_deref(),
+        saved.created_time,
+    );
     Ok(Json(saved))
 }
 
@@ -151,6 +162,7 @@ async fn delete_device(
         None,
         "SUCCESS",
     );
+    crate::edqs::publish_entity_delete(&state, device.tenant_id, id, EntityType::Device);
     Ok(StatusCode::OK)
 }
 
@@ -205,7 +217,19 @@ async fn assign_device(
     let customer = load_customer(&state, customer_id).await?;
     check_tenant_scope(&user, customer.tenant_id)?;
     device.customer_id = Some(customer_id);
-    Ok(Json(state.device_dao.save(&device).await?))
+    let saved = state.device_dao.save(&device).await?;
+    crate::edqs::publish_entity_upsert(
+        &state,
+        saved.tenant_id,
+        saved.id,
+        EntityType::Device,
+        saved.customer_id,
+        &saved.name,
+        saved.r#type.as_deref().unwrap_or_default(),
+        saved.label.as_deref(),
+        saved.created_time,
+    );
+    Ok(Json(saved))
 }
 
 async fn unassign_device(
@@ -217,7 +241,19 @@ async fn unassign_device(
     let mut device = load_device(&state, device_id).await?;
     check_tenant_scope(&user, device.tenant_id)?;
     device.customer_id = None;
-    Ok(Json(state.device_dao.save(&device).await?))
+    let saved = state.device_dao.save(&device).await?;
+    crate::edqs::publish_entity_upsert(
+        &state,
+        saved.tenant_id,
+        saved.id,
+        EntityType::Device,
+        saved.customer_id,
+        &saved.name,
+        saved.r#type.as_deref().unwrap_or_default(),
+        saved.label.as_deref(),
+        saved.created_time,
+    );
+    Ok(Json(saved))
 }
 
 async fn get_device_credentials(

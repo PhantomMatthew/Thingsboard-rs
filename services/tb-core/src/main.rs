@@ -34,6 +34,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState::new(pool, Arc::new(JwtTokenFactory::from_env()));
     tb_core::seed::seed(&state).await?;
 
+    let brokers = std::env::var("TB_KAFKA_BROKERS").unwrap_or_else(|_| "localhost:29092".into());
+    if let Err(e) =
+        tb_queue::admin::ensure_topic(&brokers, tb_queue::TbTopic::EDQS_EVENTS, 10).await
+    {
+        tracing::warn!("ensure edqs topic failed: {e}");
+    }
+
     let transport_api = tb_core::transport_api::start_transport_api(state.clone()).await;
     let core_consumer = tb_core::core_consumer::start_core_consumer(state.clone()).await;
     // Phase 4 起遥测落库由 tb-rule-engine 接管；TB_INGEST_ENABLED=true 时才开旧直通 ingest。

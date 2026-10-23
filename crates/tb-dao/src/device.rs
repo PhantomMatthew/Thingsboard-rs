@@ -105,6 +105,16 @@ impl DeviceDao {
         Ok(res.rows_affected() > 0)
     }
 
+    /// 全表分页扫描（EDQS 快照加载用），按 id 排序保证翻页稳定。
+    pub async fn scan_all(&self, offset: i64, limit: i64) -> TbResult<Vec<Device>> {
+        sqlx::query_as::<_, Device>("SELECT * FROM device ORDER BY id LIMIT $1 OFFSET $2")
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(TbError::db)
+    }
+
     pub async fn find_by_tenant_id(
         &self,
         tenant_id: Uuid,

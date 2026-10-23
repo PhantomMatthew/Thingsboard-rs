@@ -26,12 +26,30 @@ pub struct StreamQueueConsumer {
 
 impl StreamQueueConsumer {
     pub fn new(brokers: &str, group_id: &str, topics: &[&str]) -> Result<Self, QueueError> {
+        Self::with_offset_reset(brokers, group_id, topics, "latest")
+    }
+
+    /// 从头消费：新 group 启动时重放历史消息（EDQS 快照加载期间的事件靠它兜底）。
+    pub fn new_from_beginning(
+        brokers: &str,
+        group_id: &str,
+        topics: &[&str],
+    ) -> Result<Self, QueueError> {
+        Self::with_offset_reset(brokers, group_id, topics, "earliest")
+    }
+
+    fn with_offset_reset(
+        brokers: &str,
+        group_id: &str,
+        topics: &[&str],
+        offset_reset: &str,
+    ) -> Result<Self, QueueError> {
         let inner: StreamConsumer = ClientConfig::new()
             .set("bootstrap.servers", brokers)
             .set("group.id", group_id)
             .set("enable.auto.commit", "true")
             .set("auto.commit.interval.ms", "1000")
-            .set("auto.offset.reset", "latest")
+            .set("auto.offset.reset", offset_reset)
             .set("session.timeout.ms", "30000")
             .create()?;
         inner.subscribe(topics)?;

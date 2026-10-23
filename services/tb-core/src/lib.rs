@@ -4,6 +4,7 @@ pub mod audit;
 pub mod auth_middleware;
 pub mod core_consumer;
 pub mod device_session;
+pub mod edqs;
 pub mod routes;
 pub mod seed;
 pub mod state;

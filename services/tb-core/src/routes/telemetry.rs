@@ -239,6 +239,7 @@ async fn save_timeseries(
     check_entity_access(&state, &user, entity_type, entity_id).await?;
     let entries = payload.into_entries(now_ms());
     telemetry_cache::save_with_latest(&state, user.0.tenant_id, entity_id, &entries).await?;
+    crate::edqs::publish_latest(&state, user.0.tenant_id, entity_id, &entries);
     Ok(StatusCode::OK)
 }
 
@@ -398,6 +399,14 @@ async fn save_attributes(
         .attributes_dao
         .save(entity_id, scope, &entries)
         .await?;
+    crate::edqs::publish_attribute_update(
+        &state,
+        user.0.tenant_id,
+        entity_id,
+        scope,
+        &entries,
+        vec![],
+    );
     if scope == AttributeScope::SharedScope {
         let mut kvs = Vec::with_capacity(entries.len());
         for e in &entries {
@@ -468,6 +477,16 @@ async fn delete_attributes(
         .filter(|k| !k.is_empty())
         .ok_or_else(|| TbError::InvalidInput("keys are required".into()))?;
     let deleted = state.attributes_dao.delete(entity_id, scope, &keys).await?;
+    if deleted > 0 {
+        crate::edqs::publish_attribute_update(
+            &state,
+            user.0.tenant_id,
+            entity_id,
+            scope,
+            &[],
+            keys.clone(),
+        );
+    }
     if deleted > 0 && scope == AttributeScope::SharedScope {
         let mut kvs = Vec::with_capacity(keys.len());
         for key in &keys {

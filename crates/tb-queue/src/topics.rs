@@ -22,4 +22,7 @@ impl TbTopic {
 
     pub const RULE_ENGINE_NOTIFICATIONS: &'static str = "tb_rule_engine.notifications";
     pub const RULE_ENGINE_DLQ: &'static str = "tb_rule_engine.dlq";
+
+    /// EDQS 读模型事件流，message key = tenant_id（按租户分区保序）。
+    pub const EDQS_EVENTS: &'static str = "tb_edqs.events";
 }

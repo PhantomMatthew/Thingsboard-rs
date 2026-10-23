@@ -23,6 +23,8 @@ pub struct NodeContext {
     pub debug_event_dao: RuleNodeDebugEventDao,
     pub script_engine: Arc<ScriptEngine>,
     pub kafka_producer: KafkaQueueProducer,
+    /// EDQS 读模型事件发布（复用 kafka_producer）；失败仅 warn，不阻塞规则链。
+    pub edqs_producer: Option<KafkaQueueProducer>,
 }
 
 impl NodeContext {
@@ -39,6 +41,7 @@ impl NodeContext {
             tenant_dao: TenantDao::new(pool.clone()),
             debug_event_dao: RuleNodeDebugEventDao::new(pool.clone()),
             script_engine: Arc::new(ScriptEngine::new()),
+            edqs_producer: Some(kafka_producer.clone()),
             kafka_producer,
             pool,
         }

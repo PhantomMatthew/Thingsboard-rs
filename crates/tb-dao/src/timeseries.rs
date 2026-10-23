@@ -265,6 +265,29 @@ impl TimeseriesDao {
         tx.commit().await.map_err(TbError::db)?;
         Ok(res.rows_affected() as usize)
     }
+    /// ts_kv_latest 全表分页扫描（EDQS 快照加载用）：返回 (entity_id, entry)。
+    pub async fn scan_latest(&self, offset: i64, limit: i64) -> TbResult<Vec<(Uuid, TsKvEntry)>> {
+        let rows = sqlx::query(
+            "SELECT l.entity_id, l.ts, d.key AS key_name, \
+             l.bool_v, l.str_v, l.long_v, l.dbl_v, l.json_v \
+             FROM ts_kv_latest l JOIN key_dictionary d ON d.key_id = l.key \
+             ORDER BY l.entity_id, l.key LIMIT $1 OFFSET $2",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(TbError::db)?;
+        rows.iter()
+            .map(|r| {
+                Ok((
+                    r.try_get("entity_id").map_err(TbError::db)?,
+                    row_to_entry(r)?,
+                ))
+            })
+            .collect()
+    }
+
     /// housekeeper 用：删除 ts 早于 cutoff 的全部历史点（不动 ts_kv_latest），返回删除行数。
     pub async fn delete_older_than(&self, ts: i64) -> TbResult<u64> {
         let res = sqlx::query("DELETE FROM ts_kv WHERE ts < $1")

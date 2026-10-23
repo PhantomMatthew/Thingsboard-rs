@@ -16,4 +16,8 @@ pub mod ruleengine {
     include!(concat!(env!("OUT_DIR"), "/tb.ruleengine.rs"));
 }
 
+pub mod edqs {
+    include!(concat!(env!("OUT_DIR"), "/tb.edqs.rs"));
+}
+
 pub mod convert;

@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package tb.edqs;
+
+import "common.proto";
+
+// EDQS 读模型同步事件：实体/属性/latest 遥测变更，经 Kafka topic tb_edqs.events 投递，
+// message key = tenant_id（按租户分区保序）。
+message EdqsEventMsg {
+  string tenant_id = 1;
+  oneof event {
+    EntityUpsertMsg entity_upsert = 2;
+    EntityDeleteMsg entity_delete = 3;
+    AttributeUpdateMsg attribute_update = 4;
+    LatestTelemetryMsg latest_telemetry = 5;
+  }
+}
+
+// 实体创建/更新（本期支持 device/asset）。type_or_profile：device.type，asset 暂为空串。
+message EntityUpsertMsg {
+  string entity_id = 1;
+  tb.common.EntityType entity_type = 2;
+  string customer_id = 3; // 空串 = 无客户
+  string name = 4;
+  string type_or_profile = 5;
+  string label = 6;
+  int64 created_time = 7;
+}
+
+message EntityDeleteMsg {
+  string entity_id = 1;
+  tb.common.EntityType entity_type = 2;
+}
+
+// 属性保存或删除：deleted_keys 非空表示删除。
+message AttributeUpdateMsg {
+  string entity_id = 1;
+  tb.common.AttributeScope scope = 2;
+  repeated tb.common.KeyValueProto updated = 3;
+  repeated string deleted_keys = 4;
+}
+
+// latest 遥测更新：ts 与 values 下标对齐。
+message LatestTelemetryMsg {
+  string entity_id = 1;
+  repeated tb.common.KeyValueProto values = 2;
+  repeated int64 ts = 3;
+}

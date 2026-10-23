@@ -7,6 +7,7 @@ pub mod audit;
 pub mod customer;
 pub mod device;
 pub mod device_profile;
+pub mod edqs;
 pub mod ota;
 pub mod rpc;
 pub mod rule_chain;
@@ -37,6 +38,7 @@ pub fn api_router() -> Router<AppState> {
         .merge(ota::router())
         .merge(audit::router())
         .merge(usage::router())
+        .merge(edqs::router())
 }
 
 #[derive(Debug, Deserialize)]

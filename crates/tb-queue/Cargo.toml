@@ -11,5 +11,8 @@ async-trait.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 bytes.workspace = true
+prost.workspace = true
+uuid.workspace = true
 rdkafka.workspace = true
 tb-common = { path = "../tb-common" }
+tb-proto = { path = "../tb-proto" }
