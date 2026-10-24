@@ -94,6 +94,12 @@ message UplinkNotificationMsg {
   int32 uplink_msg_id = 2;
 }
 
+message UsageStatsMsg {
+  string tenant_id = 1;
+  int64 transport_msgs = 2;
+  int64 re_msgs = 3;
+}
+
 // ---- Core → Transport 通知（tb_transport.notifications.<node_id>）----
 
 message ToTransportMsg {

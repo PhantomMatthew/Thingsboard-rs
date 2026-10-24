@@ -1,6 +1,7 @@
 //! 首期 8 个节点（msg_type_switch/script/save/alarm/log/checkpoint）。
 
 use async_trait::async_trait;
+use prost::Message as _;
 use serde::Deserialize;
 use tb_common::msg::{TbMsg, msg_type};
 use tb_common::{
@@ -223,8 +224,25 @@ async fn save_timeseries(ctx: &NodeContext, msg: &TbMsg) -> TbResult<()> {
             value: json_to_kv(v),
         })
         .collect();
-    // TODO(Phase 8b/9)：发布 usage 统计消息到 tb_usage_stats topic，由 core 汇总进 api_usage_state。
     ctx.timeseries_dao.save(msg.originator.id, &entries).await?;
+    if !entries.is_empty() {
+        let usage = tb_proto::core::UsageStatsMsg {
+            tenant_id: msg.tenant_id.to_string(),
+            transport_msgs: entries.len() as i64,
+            re_msgs: 0,
+        };
+        if let Err(e) = ctx
+            .kafka_producer
+            .send(
+                tb_queue::TbTopic::USAGE_STATS,
+                &msg.tenant_id.to_string(),
+                bytes::Bytes::from(usage.encode_to_vec()),
+            )
+            .await
+        {
+            tracing::warn!(tenant_id = %msg.tenant_id, "usage stats publish failed: {e}");
+        }
+    }
     crate::telemetry_cache::update_latest(ctx, msg.originator.id, &entries).await;
     spawn_calculated(
         ctx,

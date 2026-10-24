@@ -1,6 +1,6 @@
 //! API 用量统计：内存计数器（DashMap）+ 每 60s 累加落库 api_usage_state。
-//! 维度：telemetry 写入条数（REST 与 ingest 共用 save_with_latest 计入 transport_msgs）、
-//! 规则引擎消息数（core ingest 可见的计入 re_msgs；rule-engine 服务侧统计留 Phase 8b/9）、
+//! 维度：telemetry 写入条数（REST 直接计数，规则引擎经 tb_usage_stats 计入 transport_msgs）、
+//! 规则引擎消息数（经 tb_usage_stats 计入 re_msgs，旧直通 ingest 保留原有计数）、
 //! REST 请求数（middleware 按 JWT tenant 计入，仅内存不落库）。
 
 use std::sync::Arc;

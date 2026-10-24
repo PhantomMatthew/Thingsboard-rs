@@ -7,6 +7,7 @@ impl TbTopic {
     pub const CORE: &'static str = "tb_core";
     pub const CORE_NOTIFICATIONS: &'static str = "tb_core.notifications";
     pub const HOUSEKEEPER: &'static str = "tb_housekeeper";
+    pub const USAGE_STATS: &'static str = "tb_usage_stats";
 
     pub fn transport_api_responses(node_id: &str) -> String {
         format!("tb_transport.api.responses.{node_id}")

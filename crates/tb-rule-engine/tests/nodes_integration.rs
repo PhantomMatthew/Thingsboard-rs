@@ -28,7 +28,7 @@ use tb_rule_engine::nodes::{
     DeleteAttributesNode, DeleteKeysNode, GeoFilterNode, KafkaNode, KeyExistsFilterNode, MathNode,
     MsgTypeFilterNode, OriginatorAttributesNode, OriginatorFieldsNode, OriginatorTypeFilterNode,
     RelatedAttributesNode, RelationFilterNode, RenameKeysNode, RestCallNode, RpcOnewayNode,
-    RuleChainNode, TenantCustomerFieldsNode,
+    RuleChainNode, SaveTimeseriesNode, TenantCustomerFieldsNode,
 };
 use tb_rule_engine::{ChainLoader, Node, NodeContext, chain};
 use uuid::Uuid;
@@ -60,6 +60,25 @@ impl RecordingProducer {
 impl QueueProducer for RecordingProducer {
     async fn send(&self, topic: &str, _key: &str, payload: Bytes) -> Result<(), QueueError> {
         self.sent.lock().unwrap().push((topic.to_string(), payload));
+        Ok(())
+    }
+}
+
+struct UsageRecordingProducer {
+    sent: Mutex<Vec<(String, String, Bytes)>>,
+    fail: bool,
+}
+
+#[async_trait::async_trait]
+impl QueueProducer for UsageRecordingProducer {
+    async fn send(&self, topic: &str, key: &str, payload: Bytes) -> Result<(), QueueError> {
+        if self.fail {
+            return Err(QueueError::Serialization("injected send failure".into()));
+        }
+        self.sent
+            .lock()
+            .unwrap()
+            .push((topic.to_string(), key.to_string(), payload));
         Ok(())
     }
 }
@@ -600,6 +619,46 @@ async fn change_originator_variants() {
 }
 
 // ---------- action ----------
+
+#[tokio::test]
+async fn save_timeseries_publishes_one_usage_stats_message() {
+    let pool = setup().await;
+    let producer = Arc::new(UsageRecordingProducer {
+        sent: Mutex::new(Vec::new()),
+        fail: false,
+    });
+    let queue: Arc<dyn QueueProducer> = producer.clone();
+    let ctx = NodeContext::with_queue_producer(pool, queue);
+    let m = msg(json!({"temperature": 25, "humidity": 60}));
+    let tenant_id = m.tenant_id;
+
+    let outs = SaveTimeseriesNode::default().on_msg(&ctx, m).await;
+    assert_eq!(outs[0].0, "Success");
+    let sent = producer.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].0, TbTopic::USAGE_STATS);
+    assert_eq!(sent[0].1, tenant_id.to_string());
+    let usage = core_pb::UsageStatsMsg::decode(sent[0].2.clone()).unwrap();
+    assert_eq!(usage.tenant_id, tenant_id.to_string());
+    assert_eq!(usage.transport_msgs, 2);
+    assert_eq!(usage.re_msgs, 0);
+}
+
+#[tokio::test]
+async fn save_timeseries_usage_publish_failure_still_succeeds() {
+    let pool = setup().await;
+    let producer = Arc::new(UsageRecordingProducer {
+        sent: Mutex::new(Vec::new()),
+        fail: true,
+    });
+    let queue: Arc<dyn QueueProducer> = producer;
+    let ctx = NodeContext::with_queue_producer(pool, queue);
+
+    let outs = SaveTimeseriesNode::default()
+        .on_msg(&ctx, msg(json!({"temperature": 25, "humidity": 60})))
+        .await;
+    assert_eq!(outs[0].0, "Success");
+}
 
 #[tokio::test]
 async fn clear_alarm_lifecycle() {

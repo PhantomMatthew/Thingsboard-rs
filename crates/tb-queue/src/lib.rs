@@ -5,7 +5,7 @@
 //! - `tb_core` / `tb_core.notifications`
 //! - `tb_rule_engine.<queue_name>`（默认 Main）/ `tb_rule_engine.notifications`
 //! - `tb_transport.notifications.<node_id>`
-//! - `tb_housekeeper`
+//! - `tb_housekeeper` / `tb_usage_stats`
 //!
 //! 消费提交过渡设计：`StreamQueueConsumer::new` 与 `new_from_beginning`
 //! 暂时保留自动提交，避免既有消费循环在改为显式提交前重放消息。

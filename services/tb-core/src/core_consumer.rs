@@ -1,5 +1,6 @@
 //! tb_core 消费者：维护 Redis 设备会话、设备活性、规则引擎生命周期事件与 RPC 回流。
 //! topic `tb_core`（key=device_id 保证同设备有序），group `tb-core-main`。
+//! 独立消费 `tb_usage_stats`，由 core 的 UsageTracker 聚合租户遥测与规则引擎消息用量。
 
 use prost::Message as _;
 use tb_common::msg::msg_type;
@@ -30,19 +31,70 @@ pub async fn start_core_consumer_for_group(
     if let Err(e) = tb_queue::admin::ensure_topic(&brokers, &responses_topic, 1).await {
         tracing::warn!("ensure core rpc responses topic failed: {e}");
     }
+    if let Err(e) =
+        tb_queue::admin::ensure_topic(&brokers, TbTopic::USAGE_STATS, CORE_PARTITIONS).await
+    {
+        tracing::warn!("ensure usage stats topic failed: {e}");
+    }
     let group_id = group_id.to_string();
+    let usage_group = format!("{group_id}-usage-stats");
     tokio::spawn(async move {
         let main_state = state.clone();
         let main_brokers = brokers.clone();
         let main_group = group_id.clone();
         let response_state = state.clone();
         let response_brokers = brokers.clone();
+        let usage_state = state.clone();
+        let usage_brokers = brokers.clone();
         tokio::select! {
             _ = run_main(main_state, main_brokers, main_group) => {},
             _ = run_rpc_responses(response_state, response_brokers) => {},
+            _ = run_usage_stats(usage_state, usage_brokers, usage_group) => {},
             _ = run_session_sweeper(state) => {},
         }
     })
+}
+
+async fn run_usage_stats(state: AppState, brokers: String, group_id: String) {
+    let mut consumer = match StreamQueueConsumer::new_manual_commit(
+        &brokers,
+        &group_id,
+        &[TbTopic::USAGE_STATS],
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("usage stats consumer init failed: {e}");
+            return;
+        }
+    };
+    tracing::info!("usage stats consumer started");
+    loop {
+        match consumer.recv().await {
+            Ok(msg) => {
+                match pb::UsageStatsMsg::decode(msg.payload.clone()) {
+                    Ok(usage) => match Uuid::parse_str(&usage.tenant_id) {
+                        Ok(tenant_id) => {
+                            state
+                                .usage
+                                .inc_transport_msgs(tenant_id, usage.transport_msgs);
+                            state.usage.inc_re_msgs(tenant_id, usage.re_msgs);
+                        }
+                        Err(e) => {
+                            tracing::warn!(tenant_id = %usage.tenant_id, "usage stats has bad tenant_id: {e}");
+                        }
+                    },
+                    Err(e) => tracing::warn!("undecodable UsageStatsMsg: {e}"),
+                }
+                if let Err(e) = consumer.commit(&msg).await {
+                    tracing::error!("usage stats commit failed: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::error!("usage stats consumer error: {e}");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    }
 }
 
 async fn run_main(state: AppState, brokers: String, group_id: String) {

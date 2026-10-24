@@ -20,6 +20,11 @@ pub async fn start_server() -> String {
 
 /// 同 start_server，但额外返回测试库连接池（测试需直接走 DAO 造数时）。
 pub async fn start_server_with_pool() -> (String, PgPool) {
+    let (base, pool, _) = start_server_with_state().await;
+    (base, pool)
+}
+
+pub async fn start_server_with_state() -> (String, PgPool, AppState) {
     let admin = PgPoolOptions::new()
         .max_connections(1)
         .connect(ADMIN_URL)
@@ -52,10 +57,13 @@ pub async fn start_server_with_pool() -> (String, PgPool) {
         .await
         .expect("bind random port");
     let addr = listener.local_addr().unwrap();
+    let router_state = state.clone();
     tokio::spawn(async move {
-        axum::serve(listener, build_router(state)).await.unwrap();
+        axum::serve(listener, build_router(router_state))
+            .await
+            .unwrap();
     });
-    (format!("http://{addr}"), pool)
+    (format!("http://{addr}"), pool, state)
 }
 
 pub async fn login(client: &Client, base: &str, username: &str, password: &str) -> Value {
@@ -130,30 +138,21 @@ pub async fn create_device(client: &Client, base: &str, token: &str, name: &str)
 /// transport-api 校验请求（各自测试库数据不同），导致随机 valid=false 串扰。
 pub static INTEGRATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// 同 start_servers_with_transport，但额外起 telemetry ingest 与 rule engine（Main 队列，
-/// 独立 group、1s 链缓存 TTL），使 transport 上行遥测完整走 Kafka → 规则链 → 落库。
+/// 同 start_servers_with_transport，但额外起 core consumer 与 rule engine（Main 队列，
+/// 独立 group、1s 链缓存 TTL），不启动旧 ingest，避免与规则引擎重复落库和计数。
 pub async fn start_servers_with_rule_engine() -> (String, String) {
-    let (base, _pool) = start_server_with_pool().await;
+    let (base, pool, state) = start_server_with_state().await;
     let uuid = uuid::Uuid::now_v7().simple().to_string();
     let run_id = &uuid[20..];
     let brokers = std::env::var("TB_KAFKA_BROKERS").unwrap_or_else(|_| "localhost:29092".into());
-    let pool: PgPool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(TEST_URL)
-        .await
-        .expect("connect test db");
-    let factory = Arc::new(JwtTokenFactory::new("test-secret", 900, 604800));
-    let state = AppState::new(pool.clone(), factory)
-        .await
-        .expect("app state");
     let _transport_api = tb_core::transport_api::start_transport_api_for_group(
         state.clone(),
         &format!("tb-core-transport-api-{run_id}"),
     )
     .await;
-    let _ingest = tb_core::telemetry_ingest::start_telemetry_ingest_for_group(
-        state.clone(),
-        &format!("tb-core-ingest-{run_id}"),
+    let _core = tb_core::core_consumer::start_core_consumer_for_group(
+        state,
+        &format!("tb-core-main-{run_id}"),
     )
     .await;
     let _rule_engine = tb_rule_engine_server::start_rule_engine_for_group(
