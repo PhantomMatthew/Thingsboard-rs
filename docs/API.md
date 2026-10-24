@@ -45,6 +45,7 @@
 | POST | /api/device/credentials | TA | 更新设备凭证 |
 | GET | /api/customer/{customerId}/devices | TA/CU | 客户设备分页 |
 | POST/DELETE | /api/device/{deviceId}/assign/{customerId} | TA | 分配/回收设备 |
+| POST | /api/customer/device/{deviceName}/claim | CU | 客户使用 secretKey 认领设备 |
 | POST | /api/asset | TA | 创建/更新资产 |
 | GET/DELETE | /api/asset/{id} | TA | 查/删资产 |
 | GET | /api/assets | TA | 资产分页 |

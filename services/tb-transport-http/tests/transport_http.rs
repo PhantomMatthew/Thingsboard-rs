@@ -133,14 +133,14 @@ async fn http_transport_telemetry_and_attributes() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
-    // claim 未实现 → 501
+    // claim 请求被 core 接收 → 200
     let resp = client
         .post(format!("{transport}/api/v1/TEST_TOKEN/claim"))
         .json(&json!({"secretKey": "x", "durationMs": 1000}))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]
