@@ -15,6 +15,7 @@ use tb_common::{KvEntry, KvValue, TbResult, TsKvEntry};
 use tb_proto::core as core_pb;
 use tb_proto::transport as pb;
 use tb_queue::{QueueProducer as _, TbTopic};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
@@ -38,12 +39,25 @@ pub const TOPIC_RPC_REQUEST_PREFIX: &str = "v1/devices/me/rpc/request/";
 pub const TOPIC_RPC_RESPONSE_PREFIX: &str = "v1/devices/me/rpc/response/";
 pub const TOPIC_RPC_SUBSCRIBE: &str = "v1/devices/me/rpc/request/+";
 
+pub trait MqttIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T> MqttIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+pub type MqttStream = Box<dyn MqttIo>;
+
 pub async fn run(socket: TcpStream, peer: SocketAddr, state: TransportState) {
     if let Err(e) = socket.set_nodelay(true) {
         tracing::debug!(%peer, "set_nodelay failed: {e}");
     }
+    run_with_x509(Box::new(socket), peer, state, None).await;
+}
+
+pub async fn run_with_x509(
+    socket: MqttStream,
+    peer: SocketAddr,
+    state: TransportState,
+    x509_der: Option<Vec<u8>>,
+) {
     let mut framed = Framed::new(socket, MqttCodec::default());
-    let Some(mut session) = connect(&mut framed, peer, &state).await else {
+    let Some(mut session) = connect(&mut framed, peer, &state, x509_der.as_deref()).await else {
         return;
     };
     let session_id = session.info.session_id.clone();
@@ -66,9 +80,10 @@ pub async fn run(socket: TcpStream, peer: SocketAddr, state: TransportState) {
 
 /// 等 CONNECT 并完成认证；失败已回 CONNACK（或协议错误直接断开），返回 None。
 async fn connect(
-    framed: &mut Framed<TcpStream, MqttCodec>,
+    framed: &mut Framed<MqttStream, MqttCodec>,
     peer: SocketAddr,
     state: &TransportState,
+    x509_der: Option<&[u8]>,
 ) -> Option<Session> {
     let first = tokio::time::timeout(CONNECT_TIMEOUT, framed.next()).await;
     let connect = match first {
@@ -123,7 +138,7 @@ async fn connect(
         crate::provision::serve(framed, state).await;
         return None;
     }
-    let device = match authenticate(state, &connect).await {
+    let device = match authenticate(state, &connect, x509_der).await {
         Ok(Some((device, _profile))) => device,
         Ok(None) => {
             send(
@@ -205,15 +220,18 @@ async fn connect(
     Some(session)
 }
 
-/// Java 语义：username+password+client_id 齐备先走 MQTT_BASIC（内部回退 token）；
-/// 仅 username 非空按 access token。Err 表示基础设施失败，Ok(None) 表示凭证无效。
+/// 客户端证书优先走 X509；否则保持 Java 的 MQTT_BASIC/access token 顺序。
 async fn authenticate(
     state: &TransportState,
     connect: &ConnectPacket,
+    x509_der: Option<&[u8]>,
 ) -> TbResult<Option<(pb::DeviceInfoProto, pb::DeviceProfileProto)>> {
     let username = connect.username.as_deref().unwrap_or("");
     let password = connect.password.as_deref().map(String::from_utf8_lossy);
-    let resp = if !username.is_empty() && password.is_some() && !connect.client_id.is_empty() {
+    let resp = if let Some(der) = x509_der {
+        let hash = tb_common::x509::x509_cert_hash_from_der(der)?;
+        state.transport_api.validate_x509(&hash).await
+    } else if !username.is_empty() && password.is_some() && !connect.client_id.is_empty() {
         state
             .transport_api
             .validate_mqtt_basic(
@@ -290,7 +308,7 @@ impl Session {
     }
 }
 
-pub(crate) async fn send(framed: &mut Framed<TcpStream, MqttCodec>, packet: MqttPacket) {
+pub(crate) async fn send(framed: &mut Framed<MqttStream, MqttCodec>, packet: MqttPacket) {
     if let Err(e) = framed.send(packet).await {
         tracing::debug!("send failed: {e}");
     }
@@ -321,7 +339,7 @@ pub(crate) async fn send_core(
 
 /// 主循环；返回关闭原因。
 async fn serve(
-    framed: &mut Framed<TcpStream, MqttCodec>,
+    framed: &mut Framed<MqttStream, MqttCodec>,
     state: &TransportState,
     session: &mut Session,
 ) -> String {
@@ -405,7 +423,7 @@ async fn serve(
 }
 
 async fn handle(
-    framed: &mut Framed<TcpStream, MqttCodec>,
+    framed: &mut Framed<MqttStream, MqttCodec>,
     state: &TransportState,
     session: &mut Session,
     packet: MqttPacket,
@@ -522,7 +540,7 @@ async fn handle(
 }
 
 async fn handle_publish(
-    framed: &mut Framed<TcpStream, MqttCodec>,
+    framed: &mut Framed<MqttStream, MqttCodec>,
     state: &TransportState,
     session: &mut Session,
     p: PublishPacket,
@@ -657,7 +675,7 @@ fn attributes_to_json(kvs: &[tb_proto::common::KeyValueProto]) -> serde_json::Va
 
 /// 响应格式为 {"client":{...},"shared":{...}}，两种 scope 保留分组。
 async fn handle_attributes_request(
-    framed: &mut Framed<TcpStream, MqttCodec>,
+    framed: &mut Framed<MqttStream, MqttCodec>,
     state: &TransportState,
     session: &Session,
     request_id: &str,

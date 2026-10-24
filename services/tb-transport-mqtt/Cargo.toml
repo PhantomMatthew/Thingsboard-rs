@@ -19,6 +19,10 @@ tracing-subscriber.workspace = true
 thiserror.workspace = true
 dashmap.workspace = true
 moka.workspace = true
+tokio-rustls = "0.25"
+rustls = "0.22"
+rustls-pemfile = "2"
+x509-parser = "0.16"
 tb-common = { path = "../../crates/tb-common" }
 tb-proto = { path = "../../crates/tb-proto" }
 tb-queue = { path = "../../crates/tb-queue" }
@@ -33,3 +37,4 @@ tb-core = { path = "../tb-core" }
 tb-auth = { path = "../tb-auth" }
 tb-dao = { path = "../../crates/tb-dao" }
 sqlx.workspace = true
+rcgen = "0.13"

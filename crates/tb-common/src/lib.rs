@@ -4,6 +4,7 @@ pub mod entity;
 pub mod error;
 pub mod kv;
 pub mod msg;
+pub mod x509;
 
 pub use entity::{EntityId, EntityType};
 pub use error::{TbError, TbResult};

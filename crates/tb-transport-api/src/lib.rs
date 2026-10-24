@@ -253,6 +253,31 @@ impl TransportApiClient {
         }
     }
 
+    pub async fn validate_x509(
+        &self,
+        cert_hash: &str,
+    ) -> TbResult<pb::ValidateCredentialsResponse> {
+        let resp = self
+            .request(pb::transport_api_request_msg::Request::ValidateX509(
+                pb::ValidateX509Request {
+                    cert_hash: cert_hash.to_string(),
+                },
+            ))
+            .await?;
+        match resp.response {
+            Some(pb::transport_api_response_msg::Response::ValidateCredentials(v)) => Ok(v),
+            Some(pb::transport_api_response_msg::Response::Error(e)) => Err(TbError::Internal(
+                format!("transport-api error {}: {}", e.code, e.message),
+            )),
+            other => {
+                tracing::warn!(?other, "unexpected transport-api response");
+                Err(TbError::Internal(
+                    "unexpected transport-api response".into(),
+                ))
+            }
+        }
+    }
+
     /// 设备属性同步查询（HTTP GET attributes 用）。
     pub async fn get_attributes(
         &self,

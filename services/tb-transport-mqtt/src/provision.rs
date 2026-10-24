@@ -7,11 +7,11 @@ use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
 use crate::TransportState;
 use crate::codec::{MqttCodec, MqttPacket, PublishPacket};
+use crate::session::MqttStream;
 
 pub const PROVISION_USERNAME: &str = "provision";
 pub const TOPIC_REQUEST: &str = "provision/request";
@@ -54,7 +54,7 @@ struct ProvisionRequest {
     provision_device_secret: String,
 }
 
-pub async fn serve(framed: &mut Framed<TcpStream, MqttCodec>, state: &TransportState) {
+pub async fn serve(framed: &mut Framed<MqttStream, MqttCodec>, state: &TransportState) {
     let mut limits = ProvisionLimits::default();
     loop {
         match tokio::time::timeout(IDLE_TIMEOUT, framed.next()).await {
@@ -99,7 +99,7 @@ pub async fn serve(framed: &mut Framed<TcpStream, MqttCodec>, state: &TransportS
 }
 
 async fn handle_request(
-    framed: &mut Framed<TcpStream, MqttCodec>,
+    framed: &mut Framed<MqttStream, MqttCodec>,
     state: &TransportState,
     payload: &[u8],
 ) -> bool {

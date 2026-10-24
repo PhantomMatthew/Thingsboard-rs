@@ -123,15 +123,9 @@ async fn handle_request(
                 validate_mqtt_basic(state, &r).await,
             )
         }
-        Some(Request::ValidateX509(_)) => {
-            tracing::warn!("X509 credential validation is not supported");
+        Some(Request::ValidateX509(r)) => {
             pb::transport_api_response_msg::Response::ValidateCredentials(
-                pb::ValidateCredentialsResponse {
-                    valid: false,
-                    device: None,
-                    profile: None,
-                    credentials_body: String::new(),
-                },
+                validate_x509(state, &r.cert_hash).await,
             )
         }
         Some(Request::GetAttributes(r)) => {
@@ -311,6 +305,16 @@ async fn validate_token(state: &AppState, token: &str) -> pb::ValidateCredential
         return invalid_credentials();
     };
     if credentials.credentials_type != CredentialsType::AccessToken {
+        return invalid_credentials();
+    }
+    build_valid_response(state, &credentials).await
+}
+
+async fn validate_x509(state: &AppState, cert_hash: &str) -> pb::ValidateCredentialsResponse {
+    let Some(credentials) = find_credentials(state, cert_hash).await else {
+        return invalid_credentials();
+    };
+    if credentials.credentials_type != CredentialsType::X509Certificate {
         return invalid_credentials();
     }
     build_valid_response(state, &credentials).await

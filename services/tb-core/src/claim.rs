@@ -13,7 +13,7 @@ const DEFAULT_CLAIM_DURATION_MS: i64 = 86_400_000;
 
 #[derive(Debug)]
 pub enum ClaimResult {
-    Success(Device),
+    Success(Box<Device>),
     Failure,
     Claimed,
 }
@@ -117,7 +117,7 @@ pub async fn claim(
     {
         Some(device) => {
             clear_registration(state, &device, true).await?;
-            Ok(ClaimResult::Success(device))
+            Ok(ClaimResult::Success(Box::new(device)))
         }
         None => {
             clear_registration(state, device, true).await?;

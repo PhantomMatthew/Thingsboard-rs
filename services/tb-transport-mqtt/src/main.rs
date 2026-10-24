@@ -20,6 +20,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let state = TransportState::new(&brokers, &node_id)?;
+    if let Ok(bind) = std::env::var("TB_MQTTS_BIND")
+        && !bind.trim().is_empty()
+    {
+        let cert = std::env::var("TB_MQTT_TLS_CERT")?;
+        let key = std::env::var("TB_MQTT_TLS_KEY")?;
+        let acceptor = tb_transport_mqtt::tls::acceptor_from_files(&cert, &key)?;
+        let listener = tokio::net::TcpListener::bind(&bind).await?;
+        tracing::info!(bind, node_id, "tb-transport-mqtt TLS listening");
+        let tls_state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tb_transport_mqtt::tls::serve_tls(listener, tls_state, acceptor).await {
+                tracing::error!("MQTTS listener failed: {e}");
+            }
+        });
+    }
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(bind, node_id, "tb-transport-mqtt listening");
     serve(listener, state).await?;

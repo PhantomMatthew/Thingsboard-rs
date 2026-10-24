@@ -6,12 +6,11 @@
 use bytes::Bytes;
 use tb_proto::common::OtaPackageType;
 use tb_proto::transport as pb;
-use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
 use crate::TransportState;
 use crate::codec::{MqttCodec, MqttPacket, PublishPacket};
-use crate::session::{self, Session};
+use crate::session::{self, MqttStream, Session};
 
 pub const TOPIC_FW_SUBSCRIBE: &str = "v2/fw/response/+";
 pub const TOPIC_FW_REQUEST_PREFIX: &str = "v2/fw/request/";
@@ -46,7 +45,7 @@ pub fn fw_attributes_body(pkg: &pb::OtaPackageProto) -> serde_json::Value {
 /// 读取设备当前固件版本（shared 属性 current_fw_title/current_fw_version），
 /// 有可更新包时缓存元数据并向设备推 fw_* 属性。
 pub async fn check_firmware(
-    framed: &mut Framed<TcpStream, MqttCodec>,
+    framed: &mut Framed<MqttStream, MqttCodec>,
     state: &TransportState,
     session: &Session,
 ) {
@@ -116,7 +115,7 @@ async fn resolve_firmware(
 
 /// v2/fw/request/{requestId}/chunk/{chunkIndex}：payload 为可选 chunkSize（ASCII 数字）。
 pub async fn handle_chunk_request(
-    framed: &mut Framed<TcpStream, MqttCodec>,
+    framed: &mut Framed<MqttStream, MqttCodec>,
     state: &TransportState,
     session: &Session,
     rest: &str,

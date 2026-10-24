@@ -422,6 +422,13 @@ async fn save_device_credentials(
     require_authority(&user, &[Authority::TenantAdmin])?;
     let device = load_device(&state, credentials.device_id).await?;
     check_tenant_scope(&user, device.tenant_id)?;
+    if credentials.credentials_type == CredentialsType::X509Certificate {
+        let certificate = tb_common::x509::parse_x509_credential(
+            credentials.credentials_value.as_deref().unwrap_or(""),
+        )?;
+        credentials.credentials_id = Some(certificate.credentials_id);
+        credentials.credentials_value = Some(certificate.certificate_base64);
+    }
     if credentials.id.is_nil() {
         credentials.id = Uuid::now_v7();
     }

@@ -9,6 +9,7 @@ pub mod gateway;
 pub mod ota;
 pub mod provision;
 pub mod session;
+pub mod tls;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU8;

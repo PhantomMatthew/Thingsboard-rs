@@ -62,12 +62,17 @@ ThingsBoard IoT 平台的 Rust 重写版（微服务架构，非兼容重设计�
 | `TB_INGEST_ENABLED` | tb-core | false | 开启旧直通遥测落库（Phase 4 起由 rule-engine 接管，默认关） |
 | `TB_RE_QUEUE` | tb-rule-engine | `Main` | 消费的规则引擎队列名 |
 | `TB_MQTT_BIND` | tb-transport-mqtt | `0.0.0.0:1883` | MQTT 监听地址 |
+| `TB_MQTTS_BIND` | tb-transport-mqtt | 空（关闭） | MQTTS 监听地址，如 `0.0.0.0:8883` |
+| `TB_MQTT_TLS_CERT` / `TB_MQTT_TLS_KEY` | tb-transport-mqtt | 无 | MQTTS 服务端 PEM 证书/私钥；启用 TLS 时必填 |
+| `TB_CLAIM_ENABLED` / `TB_CLAIM_DURATION_MS` | tb-core | true / 86400000 | 是否默认允许设备认领及默认登记时长 |
 | `TB_TRANSPORT_HTTP_PORT` | tb-transport-http | 8088 | HTTP transport 端口 |
 | `TB_COAP_BIND` | tb-transport-coap | `0.0.0.0:5683` | CoAP 监听地址 |
 | `TB_NODE_ID` | 三个 transport | 自动生成 | 节点 ID（Kafka 下行 topic 路由键） |
 | `TB_EDQS_PORT` / `TB_EDQS_GROUP` | tb-edqs | 8090 / 默认组 | 查询端口 / 消费组 |
 | `TB_HOUSEKEEPER_INTERVAL_SEC` | tb-housekeeper | 3600 | 清理周期 |
 | `TB_TS_TTL_DAYS` / `TB_DEBUG_EVENT_TTL_DAYS` / `TB_ALARM_TTL_DAYS` / `TB_DEDUP_WINDOW_TTL_DAYS` / `TB_DELAY_TASK_TTL_DAYS` | tb-housekeeper | 0 / 7 / 0 / 7 / 7 | 各类数据保留天数（0=不清理；规则任务仅清终态） |
+
+MQTTS 客户端证书为可选项。提供证书时校验有效期和私钥持有，再按设备绑定的 SHA3-256 证书哈希授权；未提供证书时仍可使用 access token 或 MQTT basic。该模式是 pinned certificate 认证，不包含证书链自动 provisioning。
 
 ## 快速开始（开发）
 

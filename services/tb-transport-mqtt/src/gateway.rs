@@ -11,12 +11,11 @@ use serde::Deserialize;
 use serde_json::Value;
 use tb_common::{KvEntry, KvValue};
 use tb_proto::core as core_pb;
-use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 use uuid::Uuid;
 
 use crate::codec::{MqttCodec, MqttPacket, PublishPacket};
-use crate::session::{self, Session, SubDevice};
+use crate::session::{self, MqttStream, Session, SubDevice};
 use crate::{SessionHandle, TransportState, UNSUBSCRIBED};
 
 pub const TOPIC_CONNECT: &str = "v1/gateway/connect";
@@ -28,7 +27,7 @@ pub const TOPIC_ATTRIBUTES_RESPONSE: &str = "v1/gateway/attributes/response";
 pub const TOPIC_RPC: &str = "v1/gateway/rpc";
 
 pub async fn handle_publish(
-    framed: &mut Framed<TcpStream, MqttCodec>,
+    framed: &mut Framed<MqttStream, MqttCodec>,
     state: &TransportState,
     session: &mut Session,
     p: PublishPacket,
@@ -242,7 +241,7 @@ fn kvs_to_map(kvs: &[tb_proto::common::KeyValueProto]) -> serde_json::Map<String
 
 /// {"id","device","client","keys"} → v1/gateway/attributes/response。
 async fn on_attributes_request(
-    framed: &mut Framed<TcpStream, MqttCodec>,
+    framed: &mut Framed<MqttStream, MqttCodec>,
     state: &TransportState,
     session: &Session,
     payload: &[u8],
