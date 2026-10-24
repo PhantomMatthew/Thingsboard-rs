@@ -31,9 +31,9 @@ tb-dao = { path = "../../crates/tb-dao" }
 tb-calculated = { path = "../../crates/tb-calculated" }
 tb-rule-engine = { path = "../../crates/tb-rule-engine" }
 tb-auth = { path = "../tb-auth" }
+tb-edqs = { path = "../tb-edqs" }
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 tb-transport-http = { path = "../tb-transport-http" }
 tb-rule-engine-server = { path = "../tb-rule-engine" }
-tb-edqs = { path = "../tb-edqs" }

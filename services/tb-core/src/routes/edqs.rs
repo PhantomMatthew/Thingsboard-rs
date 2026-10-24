@@ -1,5 +1,5 @@
 //! /api/edqs/...：EDQS 查询代理。认证后强制 tenantId = JWT tenant（SYS_ADMIN 可指定），
-//! 转发给内网 tb-edqs；edqs 不可达返回 502（本期不做 DB 回退，提示调用方改用直接查询端点）。
+//! 转发给内网 tb-edqs；EDQS 不可用时从 PostgreSQL 装载同租户读模型并复用查询引擎。
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -44,15 +44,21 @@ fn with_api_key(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     }
 }
 
-fn bad_gateway(e: impl std::fmt::Display) -> Response {
-    (
-        StatusCode::BAD_GATEWAY,
-        Json(json!({
-            "status": 502,
-            "message": format!("edqs unavailable: {e}; fallback to direct DB query endpoints is not implemented yet"),
-        })),
+fn is_unavailable(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::BAD_GATEWAY
+            | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            | reqwest::StatusCode::GATEWAY_TIMEOUT
     )
-        .into_response()
+}
+
+async fn postgres_fallback(
+    state: &AppState,
+    query: tb_edqs::EntityDataQuery,
+) -> Result<Response, ApiError> {
+    let repo = crate::edqs::load_tenant_repo(&state.pool, query.tenant_id).await?;
+    Ok(Json(tb_edqs::query::execute_query(&repo, &query)).into_response())
 }
 
 async fn forward(resp: reqwest::Response) -> Response {
@@ -71,18 +77,31 @@ async fn query_entity_data(
     user: AuthUser,
     Json(mut body): Json<Value>,
 ) -> Result<Response, ApiError> {
-    resolve_tenant(&user, &mut body)?;
+    let tenant_id = resolve_tenant(&user, &mut body)?;
     let request = state
         .http_client
         .post(format!("{}/api/query/entityData", state.edqs_url))
         .json(&body);
     match with_api_key(request).send().await {
-        Ok(r) => Ok(forward(r).await),
-        Err(e) => Ok(bad_gateway(e)),
+        Ok(r) if !is_unavailable(r.status()) => Ok(forward(r).await),
+        Ok(r) => {
+            tracing::warn!(status = %r.status(), "edqs unavailable; using PostgreSQL fallback");
+            let mut query: tb_edqs::EntityDataQuery =
+                serde_json::from_value(body).map_err(|e| TbError::InvalidInput(e.to_string()))?;
+            query.tenant_id = tenant_id;
+            postgres_fallback(&state, query).await
+        }
+        Err(e) => {
+            tracing::warn!("edqs request failed: {e}; using PostgreSQL fallback");
+            let mut query: tb_edqs::EntityDataQuery =
+                serde_json::from_value(body).map_err(|e| TbError::InvalidInput(e.to_string()))?;
+            query.tenant_id = tenant_id;
+            postgres_fallback(&state, query).await
+        }
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GetParams {
     tenant_id: Option<String>,
@@ -94,6 +113,27 @@ struct GetParams {
     sort_order: Option<String>,
 }
 
+fn get_query(params: GetParams) -> TbResult<tb_edqs::EntityDataQuery> {
+    let tenant_id = params
+        .tenant_id
+        .as_deref()
+        .ok_or_else(|| TbError::InvalidInput("tenantId is required for SYS_ADMIN".into()))
+        .and_then(|id| {
+            Uuid::parse_str(id).map_err(|_| TbError::InvalidInput("invalid tenantId".into()))
+        })?;
+    Ok(tb_edqs::api::entity_data_query(
+        tb_edqs::api::GetQueryParams {
+            tenant_id,
+            entity_type: params.entity_type,
+            name_contains: params.name_contains,
+            page: params.page,
+            page_size: params.page_size,
+            sort_by: params.sort_by,
+            sort_order: params.sort_order,
+        },
+    ))
+}
+
 async fn query_entity_data_get(
     State(state): State<AppState>,
     user: AuthUser,
@@ -102,6 +142,7 @@ async fn query_entity_data_get(
     if user.0.authority != Authority::SysAdmin {
         params.tenant_id = Some(user.0.tenant_id.to_string());
     }
+    let fallback_params = params.clone();
     let mut qs: Vec<(&str, String)> = vec![];
     let mut push = |k: &'static str, v: Option<String>| {
         if let Some(v) = v {
@@ -120,7 +161,14 @@ async fn query_entity_data_get(
         .get(format!("{}/api/query/entityData", state.edqs_url))
         .query(&qs);
     match with_api_key(request).send().await {
-        Ok(r) => Ok(forward(r).await),
-        Err(e) => Ok(bad_gateway(e)),
+        Ok(r) if !is_unavailable(r.status()) => Ok(forward(r).await),
+        Ok(r) => {
+            tracing::warn!(status = %r.status(), "edqs unavailable; using PostgreSQL fallback");
+            postgres_fallback(&state, get_query(fallback_params)?).await
+        }
+        Err(e) => {
+            tracing::warn!("edqs request failed: {e}; using PostgreSQL fallback");
+            postgres_fallback(&state, get_query(fallback_params)?).await
+        }
     }
 }

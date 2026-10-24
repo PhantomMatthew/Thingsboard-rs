@@ -5,7 +5,10 @@ use std::future::Future;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use tb_common::{AttributeScope, EntityType, KvEntry, KvValue, TsKvEntry};
+use sqlx::PgPool;
+use tb_common::{AttributeScope, EntityType, KvEntry, KvValue, TbResult, TsKvEntry};
+use tb_dao::{AssetDao, AttributesDao, DeviceDao, KeyDictionaryDao, TimeseriesDao};
+use tb_edqs::state::{EntityRecord, TenantRepo};
 use tb_proto::common as common_pb;
 use tb_proto::edqs as pb;
 use tokio::sync::mpsc;
@@ -219,6 +222,55 @@ fn tenant_delete_event(tenant_id: Uuid) -> pb::EdqsEventMsg {
 
 pub fn publish_tenant_delete(state: &AppState, tenant_id: Uuid) {
     publish(state, tenant_id, tenant_delete_event(tenant_id));
+}
+
+pub async fn load_tenant_repo(pool: &PgPool, tenant_id: Uuid) -> TbResult<TenantRepo> {
+    let keys = KeyDictionaryDao::new(pool.clone());
+    let device_dao = DeviceDao::new(pool.clone());
+    let asset_dao = AssetDao::new(pool.clone());
+    let attributes_dao = AttributesDao::new(pool.clone(), keys.clone());
+    let timeseries_dao = TimeseriesDao::new(pool.clone(), keys);
+
+    let (devices, assets) = tokio::try_join!(
+        device_dao.find_all_by_tenant(tenant_id),
+        asset_dao.find_all_by_tenant(tenant_id)
+    )?;
+    let mut repo = TenantRepo::default();
+    for device in devices {
+        repo.upsert_entity(EntityRecord {
+            id: device.id,
+            entity_type: EntityType::Device,
+            customer_id: device.customer_id,
+            name: device.name,
+            type_or_profile: device.r#type.unwrap_or_default(),
+            label: device.label,
+            created_time: device.created_time,
+        });
+    }
+    for asset in assets {
+        repo.upsert_entity(EntityRecord {
+            id: asset.id,
+            entity_type: EntityType::Asset,
+            customer_id: asset.customer_id,
+            name: asset.name,
+            type_or_profile: String::new(),
+            label: asset.label,
+            created_time: asset.created_time,
+        });
+    }
+
+    let entity_ids: Vec<_> = repo.entities.keys().copied().collect();
+    let (attributes, latest) = tokio::try_join!(
+        attributes_dao.find_by_entity_ids(&entity_ids),
+        timeseries_dao.find_latest_by_entity_ids(&entity_ids)
+    )?;
+    for (entity_id, scope, entry) in attributes {
+        repo.apply_attribute_update(entity_id, scope, vec![(entry.key, entry.value)], &[], 0);
+    }
+    for (entity_id, entry) in latest {
+        repo.apply_latest(entity_id, vec![(entry.key, entry.ts, entry.value)]);
+    }
+    Ok(repo)
 }
 
 #[cfg(test)]

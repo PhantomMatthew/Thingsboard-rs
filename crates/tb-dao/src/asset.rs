@@ -81,6 +81,14 @@ impl AssetDao {
         Ok(res.rows_affected() > 0)
     }
 
+    pub async fn find_all_by_tenant(&self, tenant_id: Uuid) -> TbResult<Vec<Asset>> {
+        sqlx::query_as::<_, Asset>("SELECT * FROM asset WHERE tenant_id = $1 ORDER BY id")
+            .bind(tenant_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(TbError::db)
+    }
+
     pub async fn find_by_tenant_id(
         &self,
         tenant_id: Uuid,

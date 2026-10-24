@@ -124,6 +124,14 @@ impl DeviceDao {
             .map_err(TbError::db)
     }
 
+    pub async fn find_all_by_tenant(&self, tenant_id: Uuid) -> TbResult<Vec<Device>> {
+        sqlx::query_as::<_, Device>("SELECT * FROM device WHERE tenant_id = $1 ORDER BY id")
+            .bind(tenant_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(TbError::db)
+    }
+
     pub async fn find_by_tenant_id(
         &self,
         tenant_id: Uuid,

@@ -68,22 +68,17 @@ async fn query_entity_data(
 /// GET 简易变体：仅实体过滤 + 分页排序，无 keyFilters/fields。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GetQueryParams {
-    tenant_id: Uuid,
-    entity_type: Option<String>,
-    name_contains: Option<String>,
-    page: Option<i64>,
-    page_size: Option<i64>,
-    sort_by: Option<String>,
-    sort_order: Option<String>,
+pub struct GetQueryParams {
+    pub tenant_id: Uuid,
+    pub entity_type: Option<String>,
+    pub name_contains: Option<String>,
+    pub page: Option<i64>,
+    pub page_size: Option<i64>,
+    pub sort_by: Option<String>,
+    pub sort_order: Option<String>,
 }
 
-async fn query_entity_data_get(
-    State(state): State<EdqsState>,
-    headers: HeaderMap,
-    Query(p): Query<GetQueryParams>,
-) -> Result<Json<PageDataResult>, StatusCode> {
-    authorize(&state, &headers)?;
+pub fn entity_data_query(p: GetQueryParams) -> EntityDataQuery {
     let entity_filter = match (&p.entity_type, &p.name_contains) {
         (Some(t), None) => EntityFilter::EntityType {
             entity_type: t.clone(),
@@ -94,7 +89,7 @@ async fn query_entity_data_get(
         },
         (None, None) => EntityFilter::All,
     };
-    let query = EntityDataQuery {
+    EntityDataQuery {
         tenant_id: p.tenant_id,
         entity_filter,
         key_filters: vec![],
@@ -111,8 +106,18 @@ async fn query_entity_data_get(
             }),
         },
         fields: vec![],
-    };
-    let Some(repo) = state.tenants.get(&p.tenant_id) else {
+    }
+}
+
+async fn query_entity_data_get(
+    State(state): State<EdqsState>,
+    headers: HeaderMap,
+    Query(p): Query<GetQueryParams>,
+) -> Result<Json<PageDataResult>, StatusCode> {
+    authorize(&state, &headers)?;
+    let tenant_id = p.tenant_id;
+    let query = entity_data_query(p);
+    let Some(repo) = state.tenants.get(&tenant_id) else {
         return Ok(empty_page());
     };
     Ok(Json(crate::query::execute_query(&repo, &query)))

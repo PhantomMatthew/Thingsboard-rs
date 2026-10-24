@@ -147,6 +147,33 @@ impl TimeseriesDao {
         rows.iter().map(row_to_entry).collect()
     }
 
+    pub async fn find_latest_by_entity_ids(
+        &self,
+        entity_ids: &[Uuid],
+    ) -> TbResult<Vec<(Uuid, TsKvEntry)>> {
+        if entity_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let rows = sqlx::query(
+            "SELECT l.entity_id, l.ts, d.key AS key_name, \
+             l.bool_v, l.str_v, l.long_v, l.dbl_v, l.json_v \
+             FROM ts_kv_latest l JOIN key_dictionary d ON d.key_id = l.key \
+             WHERE l.entity_id = ANY($1) ORDER BY l.entity_id, l.key",
+        )
+        .bind(entity_ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(TbError::db)?;
+        rows.iter()
+            .map(|r| {
+                Ok((
+                    r.try_get("entity_id").map_err(TbError::db)?,
+                    row_to_entry(r)?,
+                ))
+            })
+            .collect()
+    }
+
     /// 原始历史点，[start_ts, end_ts] 闭区间。
     pub async fn find_history(
         &self,

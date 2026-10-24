@@ -154,3 +154,254 @@ async fn edqs_proxy_entity_data_query() {
 
     consumer.abort();
 }
+
+async fn edqs_returning(status: StatusCode) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = axum::Router::new()
+        .fallback(move || async move { (status, axum::Json(json!({"source": "edqs"}))) });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+async fn create_fallback_device(pool: &sqlx::PgPool, tenant_id: &str, name: &str) -> String {
+    let tenant_id = uuid::Uuid::parse_str(tenant_id).unwrap();
+    let profile_dao = tb_dao::DeviceProfileDao::new(pool.clone());
+    let profile_id = match profile_dao.find_default(tenant_id).await.unwrap() {
+        Some(profile) => profile.id,
+        None => {
+            profile_dao
+                .save(&tb_dao::DeviceProfile {
+                    id: uuid::Uuid::now_v7(),
+                    created_time: 0,
+                    tenant_id,
+                    name: "default".into(),
+                    description: None,
+                    is_default: true,
+                    transport_type: "DEFAULT".into(),
+                    provision_type: "DISABLED".into(),
+                    profile_data: json!({}),
+                    firmware_id: None,
+                    software_id: None,
+                })
+                .await
+                .unwrap()
+                .id
+        }
+    };
+    tb_dao::DeviceDao::new(pool.clone())
+        .save(&tb_dao::Device {
+            id: uuid::Uuid::now_v7(),
+            created_time: 0,
+            tenant_id,
+            customer_id: None,
+            device_profile_id: profile_id,
+            name: name.into(),
+            r#type: Some("sensor".into()),
+            label: None,
+            external_id: None,
+            firmware_id: None,
+            software_id: None,
+            additional_info: None,
+            device_data: json!({}),
+        })
+        .await
+        .unwrap()
+        .id
+        .to_string()
+}
+
+async fn save_telemetry_and_attribute(pool: &sqlx::PgPool, device_id: &str) {
+    let entity_id = uuid::Uuid::parse_str(device_id).unwrap();
+    let keys = tb_dao::KeyDictionaryDao::new(pool.clone());
+    tb_dao::TimeseriesDao::new(pool.clone(), keys.clone())
+        .save(
+            entity_id,
+            &[tb_common::TsKvEntry {
+                ts: 1,
+                key: "temperature".into(),
+                value: tb_common::KvValue::Long(42),
+            }],
+        )
+        .await
+        .unwrap();
+    tb_dao::AttributesDao::new(pool.clone(), keys)
+        .save(
+            entity_id,
+            tb_common::AttributeScope::ServerScope,
+            &[tb_common::KvEntry {
+                key: "region".into(),
+                value: tb_common::KvValue::Str("eu".into()),
+            }],
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn edqs_proxy_post_send_error_falls_back_to_postgres() {
+    let _guard = INTEGRATION_LOCK.lock().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let edqs_addr = listener.local_addr().unwrap();
+    drop(listener);
+    unsafe {
+        std::env::set_var("TB_EDQS_URL", format!("http://{edqs_addr}"));
+    }
+
+    let (base, pool) = start_server_with_pool().await;
+    let client = reqwest::Client::new();
+    let (token, tenant_id) =
+        setup_tenant_admin(&client, &base, "Fallback POST T", "post@t.io").await;
+    let device_id = create_fallback_device(&pool, &tenant_id, "Fallback Device").await;
+    save_telemetry_and_attribute(&pool, &device_id).await;
+
+    let resp = client
+        .post(format!("{base}/api/edqs/query/entityData"))
+        .header("Authorization", bearer(&token))
+        .json(&json!({
+            "tenantId": uuid::Uuid::now_v7(),
+            "entityFilter": {"type": "ENTITY_IDS", "ids": [device_id]},
+            "keyFilters": [{"key": "temperature", "source": "LATEST", "predicate": {"op": "GT", "value": 40}}],
+            "fields": [
+                {"key": "name", "source": "ENTITY_FIELD"},
+                {"key": "temperature", "source": "LATEST"},
+                {"key": "region", "source": "SERVER"}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["totalElements"], 1);
+    assert_eq!(body["data"][0]["entityId"], device_id);
+    assert_eq!(body["data"][0]["values"]["name"], "Fallback Device");
+    assert_eq!(body["data"][0]["values"]["temperature"], 42);
+    assert_eq!(body["data"][0]["values"]["region"], "eu");
+}
+
+#[tokio::test]
+async fn edqs_proxy_get_unavailable_falls_back_with_filter_and_pagination() {
+    let _guard = INTEGRATION_LOCK.lock().await;
+    unsafe {
+        std::env::set_var(
+            "TB_EDQS_URL",
+            edqs_returning(StatusCode::SERVICE_UNAVAILABLE).await,
+        );
+    }
+
+    let (base, pool) = start_server_with_pool().await;
+    let client = reqwest::Client::new();
+    let (token, tenant_id) = setup_tenant_admin(&client, &base, "Fallback GET T", "get@t.io").await;
+    let alpha_one = create_fallback_device(&pool, &tenant_id, "Alpha One").await;
+    let alpha_two = create_fallback_device(&pool, &tenant_id, "Alpha Two").await;
+    create_fallback_device(&pool, &tenant_id, "Beta Device").await;
+
+    let first = client
+        .get(format!("{base}/api/edqs/query/entityData"))
+        .header("Authorization", bearer(&token))
+        .query(&[
+            ("entityType", "DEVICE"),
+            ("nameContains", "alpha"),
+            ("page", "0"),
+            ("pageSize", "1"),
+            ("sortBy", "name"),
+            ("sortOrder", "DESC"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first: Value = first.json().await.unwrap();
+    assert_eq!(first["totalElements"], 2);
+    assert_eq!(first["totalPages"], 2);
+    assert_eq!(first["hasNext"], true);
+    assert_eq!(first["data"].as_array().unwrap().len(), 1);
+    assert_eq!(first["data"][0]["entityId"], alpha_two);
+
+    let second = client
+        .get(format!("{base}/api/edqs/query/entityData"))
+        .header("Authorization", bearer(&token))
+        .query(&[
+            ("entityType", "DEVICE"),
+            ("nameContains", "alpha"),
+            ("page", "1"),
+            ("pageSize", "1"),
+            ("sortBy", "name"),
+            ("sortOrder", "DESC"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let second: Value = second.json().await.unwrap();
+    assert_eq!(second["hasNext"], false);
+    assert_eq!(second["data"][0]["entityId"], alpha_one);
+}
+
+#[tokio::test]
+async fn edqs_proxy_fallback_does_not_load_cross_tenant_entity_ids() {
+    let _guard = INTEGRATION_LOCK.lock().await;
+    unsafe {
+        std::env::set_var("TB_EDQS_URL", edqs_returning(StatusCode::BAD_GATEWAY).await);
+    }
+
+    let (base, pool) = start_server_with_pool().await;
+    let client = reqwest::Client::new();
+    let (token, tenant_id) =
+        setup_tenant_admin(&client, &base, "Fallback Tenant A", "a@t.io").await;
+    let (_, other_tenant_id) =
+        setup_tenant_admin(&client, &base, "Fallback Tenant B", "b@t.io").await;
+    let own_id = create_fallback_device(&pool, &tenant_id, "Own Device").await;
+    let other_id = create_fallback_device(&pool, &other_tenant_id, "Other Device").await;
+    save_telemetry_and_attribute(&pool, &other_id).await;
+
+    let resp = client
+        .post(format!("{base}/api/edqs/query/entityData"))
+        .header("Authorization", bearer(&token))
+        .json(&json!({
+            "entityFilter": {"type": "ENTITY_IDS", "ids": [own_id, other_id]},
+            "fields": [
+                {"key": "name", "source": "ENTITY_FIELD"},
+                {"key": "temperature", "source": "LATEST"}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["totalElements"], 1);
+    assert_eq!(body["data"].as_array().unwrap().len(), 1);
+    assert_eq!(body["data"][0]["entityId"], own_id);
+    assert_eq!(body["data"][0]["values"]["name"], "Own Device");
+    assert!(body["data"][0]["values"].get("temperature").is_none());
+}
+
+#[tokio::test]
+async fn edqs_proxy_non_unavailable_response_is_not_replaced_by_fallback() {
+    let _guard = INTEGRATION_LOCK.lock().await;
+    unsafe {
+        std::env::set_var("TB_EDQS_URL", edqs_returning(StatusCode::BAD_REQUEST).await);
+    }
+
+    let (base, pool) = start_server_with_pool().await;
+    let client = reqwest::Client::new();
+    let (token, tenant_id) = setup_tenant_admin(&client, &base, "No Fallback T", "none@t.io").await;
+    create_fallback_device(&pool, &tenant_id, "Database Device").await;
+
+    let resp = client
+        .post(format!("{base}/api/edqs/query/entityData"))
+        .header("Authorization", bearer(&token))
+        .json(&json!({"entityFilter": {"type": "ALL"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        json!({"source": "edqs"})
+    );
+}

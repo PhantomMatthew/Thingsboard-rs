@@ -122,6 +122,38 @@ impl AttributesDao {
             .collect()
     }
 
+    pub async fn find_by_entity_ids(
+        &self,
+        entity_ids: &[Uuid],
+    ) -> TbResult<Vec<(Uuid, AttributeScope, KvEntry)>> {
+        if entity_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let rows = sqlx::query(
+            "SELECT a.entity_id, a.attribute_type, d.key AS key_name, \
+             a.bool_v, a.str_v, a.long_v, a.dbl_v, a.json_v \
+             FROM attribute_kv a JOIN key_dictionary d ON d.key_id = a.attribute_key \
+             WHERE a.entity_id = ANY($1) \
+             ORDER BY a.entity_id, a.attribute_type, a.attribute_key",
+        )
+        .bind(entity_ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(TbError::db)?;
+        rows.iter()
+            .map(|r| {
+                let scope: i16 = r.try_get("attribute_type").map_err(TbError::db)?;
+                let scope = AttributeScope::from_i16(scope)
+                    .ok_or_else(|| TbError::Internal(format!("unknown attribute_type {scope}")))?;
+                Ok((
+                    r.try_get("entity_id").map_err(TbError::db)?,
+                    scope,
+                    row_to_kv_entry(r)?,
+                ))
+            })
+            .collect()
+    }
+
     /// 全表分页扫描（EDQS 快照加载用）：返回 (entity_id, scope, entry)。
     pub async fn scan_all(
         &self,
