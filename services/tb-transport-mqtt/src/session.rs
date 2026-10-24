@@ -33,6 +33,7 @@ const NO_KEEPALIVE: Duration = Duration::from_secs(24 * 3600);
 
 pub const TOPIC_TELEMETRY: &str = "v1/devices/me/telemetry";
 pub const TOPIC_ATTRIBUTES: &str = "v1/devices/me/attributes";
+pub const TOPIC_CLAIM: &str = "v1/devices/me/claim";
 pub const TOPIC_ATTRIBUTES_REQUEST_PREFIX: &str = "v1/devices/me/attributes/request/";
 pub const TOPIC_ATTRIBUTES_RESPONSE_PREFIX: &str = "v1/devices/me/attributes/response/";
 pub const TOPIC_RPC_REQUEST_PREFIX: &str = "v1/devices/me/rpc/request/";
@@ -568,7 +569,21 @@ async fn handle_publish(
         }
         return Ok(());
     }
-    if topic == TOPIC_TELEMETRY {
+    if topic == TOPIC_CLAIM {
+        let claim =
+            parse_claim_payload(&p.payload).map_err(|e| format!("bad claim payload: {e}"))?;
+        send_core(
+            state,
+            &session.device,
+            core_pb::to_core_msg::Msg::ClaimDevice(core_pb::ClaimDeviceMsg {
+                session: Some(session.info.clone()),
+                secret_key: claim.secret_key,
+                duration_ms: claim.duration_ms,
+            }),
+        )
+        .await;
+        report_activity(state, session).await;
+    } else if topic == TOPIC_TELEMETRY {
         match parse_telemetry(&p.payload) {
             Ok(entries) => {
                 let res = state
@@ -752,6 +767,24 @@ struct AttributesRequestPayload {
     shared_keys: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaimPayload {
+    #[serde(default)]
+    secret_key: String,
+    #[serde(default)]
+    duration_ms: i64,
+}
+
+fn parse_claim_payload(payload: &[u8]) -> Result<ClaimPayload, serde_json::Error> {
+    if payload.iter().all(u8::is_ascii_whitespace) {
+        Ok(ClaimPayload::default())
+    } else {
+        let map = serde_json::from_slice(payload)?;
+        serde_json::from_value(serde_json::Value::Object(map))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RpcPayload {
     method: String,
@@ -841,6 +874,17 @@ mod tests {
     #[test]
     fn parse_telemetry_invalid() {
         assert!(parse_telemetry(b"not json").is_err());
+    }
+
+    #[test]
+    fn claim_payload_accepts_empty_and_json() {
+        let empty = parse_claim_payload(b" \n").unwrap();
+        assert_eq!(empty.secret_key, "");
+        assert_eq!(empty.duration_ms, 0);
+        let claim = parse_claim_payload(br#"{"secretKey":"s","durationMs":1000}"#).unwrap();
+        assert_eq!(claim.secret_key, "s");
+        assert_eq!(claim.duration_ms, 1000);
+        assert!(parse_claim_payload(br#"[]"#).is_err());
     }
 
     fn empty_session() -> Session {

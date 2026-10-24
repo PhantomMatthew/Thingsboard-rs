@@ -357,3 +357,68 @@ async fn mqtt_transport_rejects_bad_token() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn mqtt_claim_registers_for_customer_claim() {
+    let _guard = INTEGRATION_LOCK.lock().await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let (core, mqtt_addr) = start_servers().await;
+    let (admin, _) = setup_tenant_admin(&client, &core, "MQTT Claim", "mqtt-claim@tb.io").await;
+    create_device_with_token(
+        &client,
+        &core,
+        &admin,
+        "mqtt-claim-device",
+        "MQTT_CLAIM_TOKEN",
+    )
+    .await;
+    let mut device = connect_until_success(mqtt_addr, "mqtt-claim-1", "MQTT_CLAIM_TOKEN").await;
+    device
+        .client
+        .publish(
+            "v1/devices/me/claim",
+            QoS::AtLeastOnce,
+            false,
+            json!({"secretKey": "mqtt-secret", "durationMs": 60000}).to_string(),
+        )
+        .await
+        .unwrap();
+    wait_for(&mut device.rx, Duration::from_secs(10), |p| {
+        matches!(p, Packet::PubAck(_))
+    })
+    .await;
+
+    let customer: Value = client
+        .post(format!("{core}/api/customer"))
+        .header("Authorization", bearer(&admin))
+        .json(&json!({"title": "MQTT Claim Customer"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let customer_id = customer["id"].as_str().unwrap();
+    let resp = client
+        .post(format!("{core}/api/user"))
+        .header("Authorization", bearer(&admin))
+        .json(&json!({"customerId": customer_id, "email": "mqtt-claim-customer@tb.io", "authority": "CUSTOMER_USER", "password": "customer"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let tokens = login(&client, &core, "mqtt-claim-customer@tb.io", "customer").await;
+    poll_until(Duration::from_secs(10), async || {
+        let resp = client
+            .post(format!(
+                "{core}/api/customer/device/mqtt-claim-device/claim"
+            ))
+            .header("Authorization", bearer(tokens["token"].as_str().unwrap()))
+            .json(&json!({"secretKey": "mqtt-secret"}))
+            .send()
+            .await
+            .unwrap();
+        resp.status() == reqwest::StatusCode::OK
+    })
+    .await;
+}

@@ -143,7 +143,7 @@ fn is_notification(p: &Packet) -> bool {
         && matches!(p.header.code, MessageClass::Response(ResponseType::Content))
 }
 
-/// a) 上行：POST telemetry/attributes + REST 读回；GET attributes；错误 token 4.01；claim 5.01。
+/// a) 上行：POST telemetry/attributes + REST 读回；GET attributes；错误 token 4.01；claim 登记与客户认领。
 #[tokio::test]
 async fn coap_uplink_and_get_attributes() {
     let _guard = INTEGRATION_LOCK.lock().await;
@@ -268,19 +268,65 @@ async fn coap_uplink_and_get_attributes() {
         .await;
     assert_eq!(status(&resp), ResponseType::Unauthorized);
 
-    // claim → 5.01
+    // claim 登记 → 2.01，客户随后用相同 secret 完成认领。
     let resp = device
         .request(
             RequestType::Post,
             "/api/v1/COAP_TOKEN/claim",
             &[],
             None,
-            json!({"secretKey": "x", "durationMs": 1000})
+            json!({"secretKey": "x", "durationMs": 60000})
                 .to_string()
                 .into_bytes(),
         )
         .await;
-    assert_eq!(status(&resp), ResponseType::NotImplemented);
+    assert_eq!(status(&resp), ResponseType::Created);
+    assert!(resp.payload.is_empty());
+    let resp = device
+        .request(
+            RequestType::Post,
+            "/api/v1/COAP_TOKEN/claim",
+            &[],
+            None,
+            b"[]".to_vec(),
+        )
+        .await;
+    assert_eq!(status(&resp), ResponseType::BadRequest);
+
+    let customer: Value = client
+        .post(format!("{core}/api/customer"))
+        .header("Authorization", bearer(&admin_token))
+        .json(&json!({"title": "CoAP Claim Customer"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let customer_id = customer["id"].as_str().unwrap();
+    let resp = client
+        .post(format!("{core}/api/user"))
+        .header("Authorization", bearer(&admin_token))
+        .json(&json!({"customerId": customer_id, "email": "coap-claim@tb.io", "authority": "CUSTOMER_USER", "password": "customer"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let customer_tokens = login(&client, &core, "coap-claim@tb.io", "customer").await;
+    poll_until(Duration::from_secs(10), async || {
+        let resp = client
+            .post(format!("{core}/api/customer/device/coap-device/claim"))
+            .header(
+                "Authorization",
+                bearer(customer_tokens["token"].as_str().unwrap()),
+            )
+            .json(&json!({"secretKey": "x"}))
+            .send()
+            .await
+            .unwrap();
+        resp.status() == reqwest::StatusCode::OK
+    })
+    .await;
 
     // 未知路径 → 4.04
     let resp = device

@@ -531,10 +531,53 @@ async fn dispatch(state: &TransportState, request: &CoapRequest<SocketAddr>) -> 
             reply(request, ResponseType::Changed, Vec::new())
         }
         (RequestType::Post, "claim", None) => {
-            reply(request, ResponseType::NotImplemented, Vec::new())
+            let device = match validate(state, token).await {
+                Ok(device) => device,
+                Err(status) => return reply(request, status, Vec::new()),
+            };
+            let payload = if request.message.payload.iter().all(u8::is_ascii_whitespace) {
+                ClaimPayload::default()
+            } else {
+                match serde_json::from_slice::<serde_json::Map<String, Value>>(
+                    &request.message.payload,
+                )
+                .ok()
+                .and_then(|map| serde_json::from_value(Value::Object(map)).ok())
+                {
+                    Some(payload) => payload,
+                    None => return reply(request, ResponseType::BadRequest, Vec::new()),
+                }
+            };
+            let session = session_info(state, &device, &uuid::Uuid::now_v7().to_string());
+            match send_core_result(
+                state,
+                &device,
+                core_pb::to_core_msg::Msg::ClaimDevice(core_pb::ClaimDeviceMsg {
+                    session: Some(session),
+                    secret_key: payload.secret_key,
+                    duration_ms: payload.duration_ms,
+                }),
+            )
+            .await
+            {
+                Ok(()) => reply(request, ResponseType::Created, Vec::new()),
+                Err(e) => {
+                    tracing::warn!("CoAP claim publish failed: {e}");
+                    reply(request, ResponseType::InternalServerError, Vec::new())
+                }
+            }
         }
         _ => reply(request, ResponseType::NotFound, Vec::new()),
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaimPayload {
+    #[serde(default)]
+    secret_key: String,
+    #[serde(default)]
+    duration_ms: i64,
 }
 
 /// GET attributes 同步查询：query 参数 clientKeys/sharedKeys → {client:{},shared:{}}。
@@ -729,17 +772,17 @@ fn session_info(
     }
 }
 
-pub(crate) async fn send_core(
+async fn send_core_result(
     state: &TransportState,
     device: &pb::DeviceInfoProto,
     msg: core_pb::to_core_msg::Msg,
-) {
+) -> Result<(), tb_queue::QueueError> {
     let m = core_pb::ToCoreMsg {
         tenant_id: device.tenant_id.clone(),
         entity_id: device.device_id.clone(),
         msg: Some(msg),
     };
-    if let Err(e) = state
+    state
         .producer
         .send(
             TbTopic::CORE,
@@ -747,7 +790,14 @@ pub(crate) async fn send_core(
             Bytes::from(m.encode_to_vec()),
         )
         .await
-    {
+}
+
+pub(crate) async fn send_core(
+    state: &TransportState,
+    device: &pb::DeviceInfoProto,
+    msg: core_pb::to_core_msg::Msg,
+) {
+    if let Err(e) = send_core_result(state, device, msg).await {
         tracing::warn!("send to tb_core failed: {e}");
     }
 }

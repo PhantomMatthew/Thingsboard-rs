@@ -439,7 +439,9 @@ async fn claim(
     let payload = if body.iter().all(u8::is_ascii_whitespace) {
         ClaimPayload::default()
     } else {
-        serde_json::from_slice(&body)
+        let map: serde_json::Map<String, Value> = serde_json::from_slice(&body)
+            .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid claim payload".into()))?;
+        serde_json::from_value(Value::Object(map))
             .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid claim payload".into()))?
     };
     let session = session_info(&state, &device, &Uuid::now_v7().to_string());
