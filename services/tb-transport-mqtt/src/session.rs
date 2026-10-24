@@ -55,10 +55,10 @@ pub async fn run_with_x509(
     socket: MqttStream,
     peer: SocketAddr,
     state: TransportState,
-    x509_der: Option<Vec<u8>>,
+    x509_chain: Option<Vec<Vec<u8>>>,
 ) {
     let mut framed = Framed::new(socket, MqttCodec::default());
-    let Some(mut session) = connect(&mut framed, peer, &state, x509_der.as_deref()).await else {
+    let Some(mut session) = connect(&mut framed, peer, &state, x509_chain.as_deref()).await else {
         return;
     };
     let session_id = session.info.session_id.clone();
@@ -84,7 +84,7 @@ async fn connect(
     framed: &mut Framed<MqttStream, MqttCodec>,
     peer: SocketAddr,
     state: &TransportState,
-    x509_der: Option<&[u8]>,
+    x509_chain: Option<&[Vec<u8>]>,
 ) -> Option<Session> {
     let first = tokio::time::timeout(CONNECT_TIMEOUT, framed.next()).await;
     let connect = match first {
@@ -139,7 +139,7 @@ async fn connect(
         crate::provision::serve(framed, state).await;
         return None;
     }
-    let device = match authenticate(state, &connect, x509_der).await {
+    let device = match authenticate(state, &connect, x509_chain).await {
         Ok(Some((device, _profile))) => device,
         Ok(None) => {
             send(
@@ -225,13 +225,19 @@ async fn connect(
 async fn authenticate(
     state: &TransportState,
     connect: &ConnectPacket,
-    x509_der: Option<&[u8]>,
+    x509_chain: Option<&[Vec<u8>]>,
 ) -> TbResult<Option<(pb::DeviceInfoProto, pb::DeviceProfileProto)>> {
     let username = connect.username.as_deref().unwrap_or("");
     let password = connect.password.as_deref().map(String::from_utf8_lossy);
-    let resp = if let Some(der) = x509_der {
-        let hash = tb_common::x509::x509_cert_hash_from_der(der)?;
-        state.transport_api.validate_x509(&hash).await
+    let resp = if let Some(chain) = x509_chain {
+        tb_common::x509::validate_x509_chain_limits(chain)?;
+        let hash = tb_common::x509::x509_cert_hash_from_der(&chain[0])?;
+        let pinned = state.transport_api.validate_x509(&hash).await?;
+        if pinned.valid {
+            pinned
+        } else {
+            state.transport_api.validate_or_create_x509(chain).await?
+        }
     } else if !username.is_empty() && password.is_some() && !connect.client_id.is_empty() {
         state
             .transport_api
@@ -240,15 +246,20 @@ async fn authenticate(
                 username,
                 password.as_deref().unwrap_or(""),
             )
-            .await
+            .await?
     } else if !username.is_empty() {
-        state.transport_api.validate_token(username).await
+        state.transport_api.validate_token(username).await?
     } else {
         return Ok(None);
     };
-    let resp = resp?;
     if !resp.valid {
         return Ok(None);
+    }
+    if let Some(chain) = x509_chain {
+        let leaf = tb_common::x509::x509_credential_from_der(&chain[0])?;
+        if resp.credentials_body != leaf.certificate_base64 {
+            return Ok(None);
+        }
     }
     match (resp.device, resp.profile) {
         (Some(device), Some(profile)) => Ok(Some((device, profile))),

@@ -84,6 +84,20 @@ impl DeviceProfileDao {
         .map_err(TbError::db)
     }
 
+    pub async fn find_x509_chain_by_certificate_hash(
+        &self,
+        certificate_hash: &str,
+    ) -> TbResult<Vec<DeviceProfile>> {
+        sqlx::query_as::<_, DeviceProfile>(
+            "SELECT * FROM device_profile WHERE provision_type = 'X509_CERTIFICATE_CHAIN' \
+             AND profile_data->'provisionConfiguration'->>'provisionDeviceKey' = $1",
+        )
+        .bind(certificate_hash)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(TbError::db)
+    }
+
     pub async fn delete_by_id(&self, id: Uuid) -> TbResult<bool> {
         let res = sqlx::query("DELETE FROM device_profile WHERE id = $1")
             .bind(id)

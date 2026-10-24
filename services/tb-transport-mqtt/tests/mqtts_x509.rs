@@ -3,7 +3,10 @@ mod common;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use rcgen::{CertificateParams, KeyPair};
+use rcgen::{
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    KeyPair, KeyUsagePurpose,
+};
 use rumqttc::{
     AsyncClient, ConnectReturnCode, ConnectionError, Event, MqttOptions, Packet, TlsConfiguration,
     Transport,
@@ -39,6 +42,35 @@ fn expired() -> TestCertificate {
         key_pem: key.serialize_pem(),
         der: cert.der().to_vec(),
     }
+}
+
+fn ca_signed_chain(common_name: &str) -> (String, TestCertificate) {
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.distinguished_name = DistinguishedName::new();
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "MQTT chain root");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let ca_key = KeyPair::generate().unwrap();
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+
+    let mut leaf_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    leaf_params.distinguished_name = DistinguishedName::new();
+    leaf_params
+        .distinguished_name
+        .push(DnType::CommonName, common_name);
+    leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    let leaf_key = KeyPair::generate().unwrap();
+    let leaf = leaf_params.signed_by(&leaf_key, &ca, &ca_key).unwrap();
+    (
+        ca.pem(),
+        TestCertificate {
+            pem: format!("{}{}", leaf.pem(), ca.pem()),
+            key_pem: leaf_key.serialize_pem(),
+            der: leaf.der().to_vec(),
+        },
+    )
 }
 
 fn tls_options(
@@ -207,4 +239,75 @@ async fn mqtts_x509_and_token_fallback_end_to_end() {
     let mut token_options = tls_options("token-fallback", mqtts_addr.port(), &server, None);
     token_options.set_credentials("MQTTS_TOKEN_FALLBACK", "");
     connect_until_success(token_options).await;
+}
+
+#[tokio::test]
+async fn mqtts_x509_chain_auto_provisions_with_full_tls_chain() {
+    let _guard = INTEGRATION_LOCK.lock().await;
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let (core, _) = start_servers().await;
+    let (admin, _) = setup_tenant_admin(&http, &core, "MQTTS Chain", "mqtts-chain@tb.io").await;
+    let (ca_pem, client) = ca_signed_chain("mqtt-chain-device");
+    let response = http
+        .post(format!("{core}/api/deviceProfile"))
+        .header("Authorization", bearer(&admin))
+        .json(&json!({
+            "name": "MQTT X509 chain",
+            "provisionType": "X509_CERTIFICATE_CHAIN",
+            "profileData": {
+                "provisionConfiguration": {
+                    "certificate": ca_pem,
+                    "certificateRegExPattern": "^(.*)$",
+                    "allowCreateNewDevicesByX509Certificate": true
+                }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let server = self_signed("127.0.0.1");
+    let mqtts_addr = start_mqtts(&server).await;
+    connect_until_success(tls_options(
+        "chain-provisioned",
+        mqtts_addr.port(),
+        &server,
+        Some(&client),
+    ))
+    .await;
+
+    let devices = http
+        .get(format!("{core}/api/devices?pageSize=100&page=0"))
+        .header("Authorization", bearer(&admin))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let device = devices["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["name"] == "mqtt-chain-device")
+        .unwrap();
+    let credentials = http
+        .get(format!(
+            "{core}/api/device/{}/credentials",
+            device["id"].as_str().unwrap()
+        ))
+        .header("Authorization", bearer(&admin))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(
+        credentials["credentialsValue"],
+        tb_common::x509::x509_credential_from_der(&client.der)
+            .unwrap()
+            .certificate_base64
+    );
 }

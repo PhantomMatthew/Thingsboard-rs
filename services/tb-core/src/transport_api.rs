@@ -3,6 +3,7 @@
 
 use bytes::Bytes;
 use prost::Message as _;
+use rustls_pki_types::{CertificateDer, UnixTime};
 use tb_common::{EntityType, TbError, TbResult};
 use tb_dao::models::{
     CredentialsType, Device, DeviceCredentials, DeviceProfile, EntityRelation, OtaPackage,
@@ -11,6 +12,7 @@ use tb_proto::transport as pb;
 use tb_queue::topics::TbTopic;
 use tb_queue::{KafkaQueueProducer, QueueConsumer, QueueProducer as _, StreamQueueConsumer};
 use uuid::Uuid;
+use webpki::{EndEntityCert, KeyUsage, anchor_from_trusted_cert};
 
 use crate::AppState;
 
@@ -126,6 +128,11 @@ async fn handle_request(
         Some(Request::ValidateX509(r)) => {
             pb::transport_api_response_msg::Response::ValidateCredentials(
                 validate_x509(state, &r.cert_hash).await,
+            )
+        }
+        Some(Request::ValidateOrCreateX509(r)) => {
+            pb::transport_api_response_msg::Response::ValidateCredentials(
+                validate_or_create_x509(state, &r).await,
             )
         }
         Some(Request::GetAttributes(r)) => {
@@ -318,6 +325,211 @@ async fn validate_x509(state: &AppState, cert_hash: &str) -> pb::ValidateCredent
         return invalid_credentials();
     }
     build_valid_response(state, &credentials).await
+}
+
+fn verify_x509_client_chain(
+    chain: &[Vec<u8>],
+    trusted_certificate: &[u8],
+    time: UnixTime,
+) -> Result<(), webpki::Error> {
+    if chain.len() < 2 {
+        return Err(webpki::Error::UnknownIssuer);
+    }
+    let leaf_der = CertificateDer::from(chain[0].as_slice());
+    let leaf = EndEntityCert::try_from(&leaf_der)?;
+    let trusted_der = CertificateDer::from(trusted_certificate);
+    let trust_anchor = anchor_from_trusted_cert(&trusted_der)?;
+    let intermediates = chain[1..chain.len() - 1]
+        .iter()
+        .map(|certificate| CertificateDer::from(certificate.as_slice()))
+        .collect::<Vec<_>>();
+    leaf.verify_for_usage(
+        webpki::ALL_VERIFICATION_ALGS,
+        std::slice::from_ref(&trust_anchor),
+        &intermediates,
+        time,
+        KeyUsage::client_auth(),
+        None,
+        Some(&|path: &webpki::VerifiedPath<'_>| {
+            if path.intermediate_certificates().count() == intermediates.len() {
+                Ok(())
+            } else {
+                Err(webpki::Error::UnknownIssuer)
+            }
+        }),
+    )
+    .map(|_| ())
+}
+
+fn x509_device_name(leaf_der: &[u8], pattern: &regex::Regex) -> TbResult<String> {
+    let (remaining, certificate) = x509_parser::parse_x509_certificate(leaf_der)
+        .map_err(|_| TbError::InvalidInput("invalid X509 leaf certificate".into()))?;
+    if !remaining.is_empty() {
+        return Err(TbError::InvalidInput(
+            "invalid X509 leaf certificate".into(),
+        ));
+    }
+    let common_name = certificate
+        .subject()
+        .iter_common_name()
+        .next()
+        .ok_or_else(|| TbError::InvalidInput("X509 leaf CN is missing".into()))?
+        .as_str()
+        .map_err(|_| TbError::InvalidInput("X509 leaf CN is not valid UTF-8".into()))?;
+    let name = pattern
+        .captures(common_name)
+        .and_then(|captures| captures.get(1))
+        .map(|name| name.as_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            TbError::InvalidInput("X509 leaf CN does not match capture group 1".into())
+        })?;
+    Ok(name.to_string())
+}
+
+async fn x509_existing_device_response(
+    state: &AppState,
+    device: Device,
+    profile: &DeviceProfile,
+    leaf: &tb_common::x509::X509Credential,
+) -> pb::ValidateCredentialsResponse {
+    if device.device_profile_id != profile.id {
+        return invalid_credentials();
+    }
+    let credentials = match state
+        .device_credentials_dao
+        .find_by_device_id(device.id)
+        .await
+    {
+        Ok(Some(credentials)) => credentials,
+        _ => return invalid_credentials(),
+    };
+    if credentials.credentials_type != CredentialsType::X509Certificate {
+        return invalid_credentials();
+    }
+    let rotated = DeviceCredentials {
+        id: Uuid::now_v7(),
+        created_time: 0,
+        device_id: device.id,
+        credentials_type: CredentialsType::X509Certificate,
+        credentials_id: Some(leaf.credentials_id.clone()),
+        credentials_value: Some(leaf.certificate_base64.clone()),
+    };
+    match state.device_credentials_dao.save(&rotated).await {
+        Ok(credentials) => build_valid_response(state, &credentials).await,
+        Err(e) => {
+            tracing::warn!(device_id = %device.id, "X509 credential rotation failed: {e}");
+            invalid_credentials()
+        }
+    }
+}
+
+pub async fn validate_or_create_x509(
+    state: &AppState,
+    request: &pb::ValidateOrCreateX509Request,
+) -> pb::ValidateCredentialsResponse {
+    let chain = &request.certificate_chain;
+    if tb_common::x509::validate_x509_chain_limits(chain).is_err() {
+        return invalid_credentials();
+    }
+    let leaf = match tb_common::x509::x509_credential_from_der(&chain[0]) {
+        Ok(leaf) => leaf,
+        Err(_) => return invalid_credentials(),
+    };
+    if let Some(credentials) = find_credentials(state, &leaf.credentials_id).await {
+        if credentials.credentials_type != CredentialsType::X509Certificate {
+            return invalid_credentials();
+        }
+        return build_valid_response(state, &credentials).await;
+    }
+    let chain_tail_hash = match tb_common::x509::x509_cert_hash_from_der(&chain[chain.len() - 1]) {
+        Ok(hash) => hash,
+        Err(_) => return invalid_credentials(),
+    };
+    let profiles = match state
+        .device_profile_dao
+        .find_x509_chain_by_certificate_hash(&chain_tail_hash)
+        .await
+    {
+        Ok(profiles) => profiles,
+        Err(e) => {
+            tracing::warn!("X509 chain profile lookup failed: {e}");
+            return invalid_credentials();
+        }
+    };
+    let [profile] = profiles.as_slice() else {
+        return invalid_credentials();
+    };
+    let configuration =
+        match tb_common::x509::x509_chain_provision_configuration(&profile.profile_data) {
+            Ok(configuration) if configuration.provision_device_key == chain_tail_hash => {
+                configuration
+            }
+            _ => return invalid_credentials(),
+        };
+    if let Err(e) = verify_x509_client_chain(chain, &configuration.certificate_der, UnixTime::now())
+    {
+        tracing::debug!(profile_id = %profile.id, "X509 client path rejected: {e}");
+        return invalid_credentials();
+    }
+    let device_name = match x509_device_name(&chain[0], &configuration.certificate_regex) {
+        Ok(name) => name,
+        Err(_) => return invalid_credentials(),
+    };
+
+    for _ in 0..2 {
+        match state
+            .device_dao
+            .find_by_name(profile.tenant_id, &device_name)
+            .await
+        {
+            Ok(Some(device)) => {
+                return x509_existing_device_response(state, device, profile, &leaf).await;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("X509 provision device lookup failed: {e}");
+                return invalid_credentials();
+            }
+        }
+        if !configuration.allow_create_new_devices {
+            return invalid_credentials();
+        }
+        let device = Device {
+            id: Uuid::now_v7(),
+            created_time: 0,
+            tenant_id: profile.tenant_id,
+            customer_id: None,
+            device_profile_id: profile.id,
+            name: device_name.clone(),
+            r#type: None,
+            label: None,
+            external_id: None,
+            firmware_id: None,
+            software_id: None,
+            additional_info: None,
+            device_data: serde_json::json!({}),
+        };
+        let credentials = DeviceCredentials {
+            id: Uuid::now_v7(),
+            created_time: 0,
+            device_id: device.id,
+            credentials_type: CredentialsType::X509Certificate,
+            credentials_id: Some(leaf.credentials_id.clone()),
+            credentials_value: Some(leaf.certificate_base64.clone()),
+        };
+        match state
+            .device_credentials_dao
+            .save_device_with_credentials(&device, &credentials)
+            .await
+        {
+            Ok((_, credentials)) => return build_valid_response(state, &credentials).await,
+            Err(e) => {
+                tracing::debug!("X509 provision create conflict or failure, rereading: {e}");
+            }
+        }
+    }
+    invalid_credentials()
 }
 
 fn constant_time_eq(left: &str, right: &str) -> bool {
@@ -639,5 +851,108 @@ mod tests {
         );
         assert_eq!(ota_chunk_location(-1, -1), Some((1, 1)));
         assert_eq!(ota_chunk_location(i32::MAX, MAX_OTA_CHUNK_SIZE), None);
+    }
+
+    struct TestCa {
+        certificate: rcgen::Certificate,
+        key: rcgen::KeyPair,
+    }
+
+    fn test_ca(common_name: &str) -> TestCa {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, common_name);
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = params.self_signed(&key).unwrap();
+        TestCa { certificate, key }
+    }
+
+    fn test_leaf(ca: &TestCa, common_name: &str, expired: bool) -> Vec<u8> {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, common_name);
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        if expired {
+            params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2021, 1, 1);
+        }
+        let key = rcgen::KeyPair::generate().unwrap();
+        params
+            .signed_by(&key, &ca.certificate, &ca.key)
+            .unwrap()
+            .der()
+            .to_vec()
+    }
+
+    #[test]
+    fn webpki_client_auth_path_rejects_wrong_missing_expired_and_tampered_certificates() {
+        let ca = test_ca("root");
+        let other_ca = test_ca("other-root");
+        let leaf = test_leaf(&ca, "device-1", false);
+        let chain = vec![leaf.clone(), ca.certificate.der().to_vec()];
+        assert!(
+            verify_x509_client_chain(&chain, ca.certificate.der().as_ref(), UnixTime::now())
+                .is_ok()
+        );
+        assert!(
+            verify_x509_client_chain(&chain, other_ca.certificate.der().as_ref(), UnixTime::now())
+                .is_err()
+        );
+        let unrelated = vec![
+            leaf.clone(),
+            other_ca.certificate.der().to_vec(),
+            ca.certificate.der().to_vec(),
+        ];
+        assert!(
+            verify_x509_client_chain(&unrelated, ca.certificate.der().as_ref(), UnixTime::now())
+                .is_err()
+        );
+        assert!(
+            verify_x509_client_chain(
+                std::slice::from_ref(&leaf),
+                ca.certificate.der().as_ref(),
+                UnixTime::now()
+            )
+            .is_err()
+        );
+
+        let expired = vec![
+            test_leaf(&ca, "expired", true),
+            ca.certificate.der().to_vec(),
+        ];
+        assert!(
+            verify_x509_client_chain(&expired, ca.certificate.der().as_ref(), UnixTime::now())
+                .is_err()
+        );
+
+        let mut tampered = leaf;
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        let tampered = vec![tampered, ca.certificate.der().to_vec()];
+        assert!(
+            verify_x509_client_chain(&tampered, ca.certificate.der().as_ref(), UnixTime::now())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn common_name_requires_regex_capture_group_one() {
+        let ca = test_ca("root");
+        let leaf = test_leaf(&ca, "prefix-device-42", false);
+        let pattern = regex::Regex::new("^prefix-(.*)$").unwrap();
+        assert_eq!(x509_device_name(&leaf, &pattern).unwrap(), "device-42");
+        let mismatch = regex::Regex::new("^other-(.*)$").unwrap();
+        assert!(x509_device_name(&leaf, &mismatch).is_err());
+        let empty = regex::Regex::new("^prefix-(.*)-42$").unwrap();
+        assert_eq!(x509_device_name(&leaf, &empty).unwrap(), "device");
     }
 }

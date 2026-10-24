@@ -12,6 +12,7 @@ message TransportApiRequestMsg {
     ValidateTokenRequest validate_token = 2;
     ValidateMqttBasicRequest validate_mqtt_basic = 3;
     ValidateX509Request validate_x509 = 4;
+    ValidateOrCreateX509Request validate_or_create_x509 = 11;
     GetDeviceProfileRequest get_device_profile = 5;
     GetOrCreateGatewayDeviceRequest get_or_create_gateway_device = 6;
     GetOtaPackageRequest get_ota_package = 7;
@@ -58,6 +59,10 @@ message ValidateMqttBasicRequest {
 
 message ValidateX509Request {
   string cert_hash = 1; // 客户端证书 SHA3-256 hex
+}
+
+message ValidateOrCreateX509Request {
+  repeated bytes certificate_chain = 1; // leaf 在前的完整 DER 链，包含链尾 CA
 }
 
 message GetDeviceProfileRequest {

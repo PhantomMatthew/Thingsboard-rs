@@ -116,13 +116,13 @@ pub async fn serve_tls(
             match acceptor.accept(socket).await {
                 Ok(stream) => {
                     tracing::debug!(%peer, "MQTTS handshake completed");
-                    let cert = stream
-                        .get_ref()
-                        .1
-                        .peer_certificates()
-                        .and_then(|certs| certs.first())
-                        .map(|cert| cert.as_ref().to_vec());
-                    session::run_with_x509(Box::new(stream), peer, state, cert).await;
+                    let chain = stream.get_ref().1.peer_certificates().map(|certs| {
+                        certs
+                            .iter()
+                            .map(|cert| cert.as_ref().to_vec())
+                            .collect::<Vec<_>>()
+                    });
+                    session::run_with_x509(Box::new(stream), peer, state, chain).await;
                 }
                 Err(e) => tracing::debug!(%peer, error = %e, "MQTTS handshake failed"),
             }

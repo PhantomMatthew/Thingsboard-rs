@@ -136,3 +136,16 @@
 `v1/devices/me/rpc/request/+` / `response/+`、`v1/devices/me/attributes/response/+`、
 `v1/gateway/*`、`v1/devices/me/firmware/*`、`/provision`，用户名 = accessToken。
 设备侧 CoAP（:5683/udp）语义同 HTTP。
+
+## MQTTS X509 证书链 provisioning
+
+设备档案使用 `provisionType=X509_CERTIFICATE_CHAIN`，并在
+`profileData.provisionConfiguration` 配置 `certificate`（PEM/Base64 CA 证书）、
+`certificateRegExPattern`（必须含 group 1，用于从 leaf CN 提取设备名）及
+`allowCreateNewDevicesByX509Certificate`（默认 `false`）。保存时服务端根据配置证书的
+SHA3-256 自动生成 `provisionDeviceKey`，调用方提供的同名字段不会被信任。
+
+MQTTS 客户端须发送 leaf 在前、CA 在尾的完整 DER 链（含中间 CA），最多 8 张、合计
+64 KiB。已有 pinned leaf 凭证优先；否则仅在链尾唯一匹配 chain profile、完整
+`client_auth` 路径验证及 CN 正则均通过时认证。自动创建开启时才允许新设备；同 profile
+可轮换 X509 leaf，跨 profile 或设备已有其他类型凭证会被拒绝。

@@ -38,6 +38,7 @@ pub struct SaveDeviceProfileRequest {
     pub transport_type: Option<String>,
     pub provision_type: Option<String>,
     pub profile_data: Option<Value>,
+    pub certificate: Option<String>,
     pub firmware_id: Option<Uuid>,
     pub software_id: Option<Uuid>,
 }
@@ -65,6 +66,15 @@ async fn save_profile(
             .ok_or_else(|| TbError::NotFound(format!("ota package {ota_id}")))?;
         check_tenant_scope(&user, package.tenant_id)?;
     }
+    let mut profile_data = req.profile_data.unwrap_or_else(|| json!({}));
+    if let Some(certificate) = req.certificate {
+        let data = profile_data.as_object_mut().ok_or_else(|| {
+            TbError::InvalidInput("profileData must be an object when certificate is set".into())
+        })?;
+        data.insert("certificate".into(), Value::String(certificate));
+    }
+    let provision_type = req.provision_type.unwrap_or_else(|| "DISABLED".into());
+    tb_common::x509::normalize_x509_chain_profile(&provision_type, &mut profile_data)?;
     let profile = DeviceProfile {
         id,
         created_time,
@@ -73,8 +83,8 @@ async fn save_profile(
         description: req.description,
         is_default: req.is_default.unwrap_or(false),
         transport_type: req.transport_type.unwrap_or_else(|| "DEFAULT".into()),
-        provision_type: req.provision_type.unwrap_or_else(|| "DISABLED".into()),
-        profile_data: req.profile_data.unwrap_or_else(|| json!({})),
+        provision_type,
+        profile_data,
         firmware_id: req.firmware_id,
         software_id: req.software_id,
     };
