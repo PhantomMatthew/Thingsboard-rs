@@ -60,6 +60,24 @@ impl DeviceDao {
             .map_err(TbError::db)
     }
 
+    pub async fn assign_customer_if_unassigned(
+        &self,
+        device_id: Uuid,
+        tenant_id: Uuid,
+        customer_id: Uuid,
+    ) -> TbResult<Option<Device>> {
+        sqlx::query_as::<_, Device>(
+            "UPDATE device SET customer_id = $3 \
+             WHERE id = $1 AND tenant_id = $2 AND customer_id IS NULL RETURNING *",
+        )
+        .bind(device_id)
+        .bind(tenant_id)
+        .bind(customer_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(TbError::db)
+    }
+
     pub async fn find_by_name(&self, tenant_id: Uuid, name: &str) -> TbResult<Option<Device>> {
         sqlx::query_as::<_, Device>("SELECT * FROM device WHERE tenant_id = $1 AND name = $2")
             .bind(tenant_id)

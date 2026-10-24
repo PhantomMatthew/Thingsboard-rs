@@ -2,6 +2,7 @@
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
@@ -67,6 +68,75 @@ pub fn router() -> Router<AppState> {
             "/api/device/{deviceId}/assign/{customerId}",
             post(assign_device).delete(unassign_device),
         )
+        .route(
+            "/api/customer/device/{deviceName}/claim",
+            post(claim_device),
+        )
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaimDeviceRequest {
+    #[serde(default)]
+    secret_key: String,
+}
+
+async fn claim_device(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(device_name): Path<String>,
+    Json(request): Json<ClaimDeviceRequest>,
+) -> Result<Response, ApiError> {
+    require_authority(&user, &[Authority::CustomerUser])?;
+    let customer_id = user
+        .0
+        .customer_id
+        .ok_or_else(|| TbError::PermissionDenied("customer user has no customer".into()))?;
+    let customer = load_customer(&state, customer_id).await?;
+    check_tenant_scope(&user, customer.tenant_id)?;
+    let device = state
+        .device_dao
+        .find_by_name(user.0.tenant_id, &device_name)
+        .await?
+        .ok_or_else(|| TbError::NotFound(format!("device {device_name}")))?;
+    let result = crate::claim::claim(&state, &device, customer_id, &request.secret_key).await?;
+    let response = match result {
+        crate::claim::ClaimResult::Success(device) => {
+            publish_claimed_device(&state, &user, &device);
+            return Ok(Json(json!({"device": device, "response": "SUCCESS"})).into_response());
+        }
+        crate::claim::ClaimResult::Failure => "FAILURE",
+        crate::claim::ClaimResult::Claimed => {
+            let device = load_device(&state, device.id).await?;
+            publish_claimed_device(&state, &user, &device);
+            "CLAIMED"
+        }
+    };
+    Ok((StatusCode::BAD_REQUEST, response).into_response())
+}
+
+fn publish_claimed_device(state: &AppState, user: &AuthUser, device: &Device) {
+    crate::edqs::publish_entity_upsert(
+        state,
+        device.tenant_id,
+        device.id,
+        EntityType::Device,
+        device.customer_id,
+        &device.name,
+        device.r#type.as_deref().unwrap_or_default(),
+        device.label.as_deref(),
+        device.created_time,
+    );
+    audit(
+        state,
+        user,
+        Some((device.id, EntityType::Device, device.name.clone())),
+        "ASSIGNED_TO_CUSTOMER",
+        device
+            .customer_id
+            .map(|customer_id| json!({"customerId": customer_id})),
+        "SUCCESS",
+    );
 }
 
 #[derive(Debug, Deserialize)]

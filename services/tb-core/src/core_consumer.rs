@@ -403,9 +403,7 @@ async fn handle(
             }
         }
         Msg::RpcResponse(m) => complete_rpc_response(state, m)?,
-        Msg::ClaimDevice(_) => {
-            tracing::debug!("claim_device not implemented");
-        }
+        Msg::ClaimDevice(m) => crate::claim::register(state, &m).await?,
         Msg::RpcRequest(m) => {
             let Ok(device_id) = Uuid::parse_str(&m.device_id) else {
                 tracing::warn!(device_id = %m.device_id, "rpc_request: bad device_id");

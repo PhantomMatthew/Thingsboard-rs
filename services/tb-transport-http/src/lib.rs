@@ -421,8 +421,39 @@ async fn get_attributes(
     })))
 }
 
-async fn claim() -> StatusCode {
-    StatusCode::NOT_IMPLEMENTED
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaimPayload {
+    #[serde(default)]
+    secret_key: String,
+    #[serde(default)]
+    duration_ms: i64,
+}
+
+async fn claim(
+    State(state): State<TransportState>,
+    Path(token): Path<String>,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    let device = validate(&state, &token).await?;
+    let payload = if body.iter().all(u8::is_ascii_whitespace) {
+        ClaimPayload::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid claim payload".into()))?
+    };
+    let session = session_info(&state, &device, &Uuid::now_v7().to_string());
+    send_core(
+        &state,
+        &device,
+        core_pb::to_core_msg::Msg::ClaimDevice(core_pb::ClaimDeviceMsg {
+            session: Some(session),
+            secret_key: payload.secret_key,
+            duration_ms: payload.duration_ms,
+        }),
+    )
+    .await?;
+    Ok(StatusCode::OK)
 }
 
 #[derive(Debug, Deserialize)]
