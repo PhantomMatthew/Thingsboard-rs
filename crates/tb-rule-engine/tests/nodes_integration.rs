@@ -53,6 +53,9 @@ struct RecordingProducer {
 impl RecordingProducer {
     fn drain(&self) -> Vec<(String, Bytes)> {
         std::mem::take(&mut *self.sent.lock().unwrap())
+            .into_iter()
+            .filter(|(topic, _)| topic != TbTopic::USAGE_STATS)
+            .collect()
     }
 }
 
@@ -101,6 +104,15 @@ impl Node for NotifyNode {
     async fn on_msg(&self, _ctx: &NodeContext, msg: TbMsg) -> Vec<(String, TbMsg)> {
         self.0.send(msg.id).unwrap();
         Vec::new()
+    }
+}
+
+struct PassNode;
+
+#[async_trait::async_trait]
+impl Node for PassNode {
+    async fn on_msg(&self, _ctx: &NodeContext, msg: TbMsg) -> Vec<(String, TbMsg)> {
+        vec![("Success".into(), msg)]
     }
 }
 
@@ -658,6 +670,62 @@ async fn save_timeseries_usage_publish_failure_still_succeeds() {
         .on_msg(&ctx, msg(json!({"temperature": 25, "humidity": 60})))
         .await;
     assert_eq!(outs[0].0, "Success");
+}
+
+#[tokio::test]
+async fn rule_execution_usage_counts_each_node_and_default_chain() {
+    let pool = setup().await;
+    let producer = Arc::new(UsageRecordingProducer {
+        sent: Mutex::new(Vec::new()),
+        fail: false,
+    });
+    let queue: Arc<dyn QueueProducer> = producer.clone();
+    let ctx = NodeContext::with_queue_producer(pool.clone(), queue.clone());
+    let chain_id = Uuid::now_v7();
+    let first = make_chain_node(chain_id, "action.log", json!({}), false);
+    let second = make_chain_node(chain_id, "action.log", json!({}), false);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let first_impl: Arc<dyn Node> = Arc::new(PassNode);
+    let second_impl: Arc<dyn Node> = Arc::new(NotifyNode(tx));
+    let state = tb_rule_engine::RuleChainState {
+        chain_id,
+        nodes: [
+            (first.id, (first.clone(), first_impl)),
+            (second.id, (second.clone(), second_impl)),
+        ]
+        .into_iter()
+        .collect(),
+        edges: [(first.id, vec![("Success".into(), second.id)])]
+            .into_iter()
+            .collect(),
+        first_node_id: Some(first.id),
+    };
+    chain::execute(&ctx, &state, first.id, msg(json!({"v": 1})))
+        .await
+        .unwrap();
+    assert!(rx.recv().await.is_some());
+    {
+        let sent = producer.sent.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        for (_, _, payload) in sent.iter() {
+            let usage = core_pb::UsageStatsMsg::decode(payload.clone()).unwrap();
+            assert_eq!(usage.re_msgs, 1);
+            assert_eq!(usage.transport_msgs, 0);
+        }
+    }
+
+    let engine =
+        tb_rule_engine::RuleEngineService::with_queue_producer(pool, queue, Duration::ZERO);
+    engine.handle(msg(json!({"temperature": 1}))).await.unwrap();
+    let mut unsupported = msg(json!({"other": 1}));
+    unsupported.msg_type = "UNSUPPORTED".into();
+    engine.handle(unsupported).await.unwrap();
+    let sent = producer.sent.lock().unwrap();
+    assert_eq!(sent.len(), 4);
+    let default_re = core_pb::UsageStatsMsg::decode(sent[2].2.clone()).unwrap();
+    let default_transport = core_pb::UsageStatsMsg::decode(sent[3].2.clone()).unwrap();
+    assert_eq!(default_re.re_msgs, 1);
+    assert_eq!(default_transport.transport_msgs, 1);
 }
 
 #[tokio::test]

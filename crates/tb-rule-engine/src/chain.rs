@@ -125,6 +125,25 @@ async fn save_debug_event(
     }
 }
 
+pub(crate) async fn report_execution(ctx: &NodeContext, msg: &TbMsg) {
+    let usage = tb_proto::core::UsageStatsMsg {
+        tenant_id: msg.tenant_id.to_string(),
+        transport_msgs: 0,
+        re_msgs: 1,
+    };
+    if let Err(e) = ctx
+        .kafka_producer
+        .send(
+            TbTopic::USAGE_STATS,
+            &msg.tenant_id.to_string(),
+            Bytes::from(usage.encode_to_vec()),
+        )
+        .await
+    {
+        tracing::warn!(tenant_id = %msg.tenant_id, "rule execution usage publish failed: {e}");
+    }
+}
+
 pub(crate) async fn send_dlq(
     producer: &Arc<dyn QueueProducer>,
     chain_id: Uuid,
@@ -326,6 +345,7 @@ pub async fn execute(
         if debug {
             save_debug_event(ctx, state, node_id, &msg, "IN", None).await;
         }
+        report_execution(ctx, &msg).await;
         let result = AssertUnwindSafe(node.on_msg(ctx, msg.clone()))
             .catch_unwind()
             .await;

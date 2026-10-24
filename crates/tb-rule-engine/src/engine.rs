@@ -276,9 +276,11 @@ impl RuleEngineService {
     async fn default_chain(&self, msg: TbMsg) {
         match msg.msg_type.as_str() {
             msg_type::POST_TELEMETRY_REQUEST => {
+                chain::report_execution(&self.ctx, &msg).await;
                 SaveTimeseriesNode::default().on_msg(&self.ctx, msg).await;
             }
             msg_type::POST_ATTRIBUTES_REQUEST => {
+                chain::report_execution(&self.ctx, &msg).await;
                 SaveAttributesNode::default().on_msg(&self.ctx, msg).await;
             }
             other => {

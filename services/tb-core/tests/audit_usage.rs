@@ -319,9 +319,10 @@ async fn rule_engine_usage_counts_once_without_legacy_ingest() {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body: Value = resp.json().await.unwrap();
-        (body["transportMsgs"].as_i64() == Some(2)).then_some(body)
+        (body["transportMsgs"].as_i64() == Some(2) && body["reMsgs"].as_i64() == Some(2))
+            .then_some(body)
     })
     .await;
     assert_eq!(report["transportMsgs"], 2);
-    assert_eq!(report["reMsgs"], 0);
+    assert_eq!(report["reMsgs"], 2);
 }

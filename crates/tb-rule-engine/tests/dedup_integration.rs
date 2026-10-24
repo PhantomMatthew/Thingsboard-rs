@@ -13,7 +13,7 @@ use tb_common::{EntityId, EntityType};
 use tb_dao::models::{RuleChain, RuleNode, Tenant};
 use tb_dao::{RuleChainDao, TenantDao, migrate};
 use tb_proto::ruleengine::ToRuleEngineMsg;
-use tb_queue::{QueueError, QueueProducer};
+use tb_queue::{QueueError, QueueProducer, TbTopic};
 use tb_rule_engine::RuleEngineService;
 use uuid::Uuid;
 
@@ -55,6 +55,9 @@ impl RecordingProducer {
 #[async_trait::async_trait]
 impl QueueProducer for RecordingProducer {
     async fn send(&self, topic: &str, _key: &str, payload: Bytes) -> Result<(), QueueError> {
+        if topic == TbTopic::USAGE_STATS {
+            return Ok(());
+        }
         self.sent.lock().unwrap().push((topic.to_string(), payload));
         if self
             .failures
