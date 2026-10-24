@@ -65,6 +65,7 @@ services:
       TB_KAFKA_BROKERS: kafka:9092
       TB_REDIS_URL: redis://redis:6379
       TB_EDQS_URL: http://tb-edqs:8090
+      TB_EDQS_API_KEY: ${TB_EDQS_API_KEY:?TB_EDQS_API_KEY required}
       TB_HTTP_PORT: 8080
       TB_JWT_SECRET: ${JWT_SECRET:?JWT_SECRET required}
       RUST_LOG: ${RUST_LOG:-info}
@@ -156,9 +157,8 @@ services:
       TB_DATABASE_URL: postgres://${POSTGRES_USER:-thingsboard}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-thingsboard}
       TB_KAFKA_BROKERS: kafka:9092
       TB_EDQS_PORT: 8090
+      TB_EDQS_API_KEY: ${TB_EDQS_API_KEY:?TB_EDQS_API_KEY required}
       RUST_LOG: ${RUST_LOG:-info}
-    ports:
-      - "8090:8090"
     depends_on:
       postgres: { condition: service_healthy }
       kafka: { condition: service_healthy }

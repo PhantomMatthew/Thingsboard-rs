@@ -201,7 +201,9 @@ impl Node for SaveTimeseriesNode {
 
 async fn save_timeseries(ctx: &NodeContext, msg: &TbMsg) -> TbResult<()> {
     let (ts, values) = match &msg.data {
-        serde_json::Value::Object(map) if map.contains_key("values") => {
+        serde_json::Value::Object(map)
+            if map.get("values").is_some_and(serde_json::Value::is_object) =>
+        {
             let ts = msg.data["ts"].as_i64().unwrap_or(msg.ts);
             let values = msg.data["values"].as_object().cloned().unwrap_or_default();
             (ts, values)
@@ -223,6 +225,7 @@ async fn save_timeseries(ctx: &NodeContext, msg: &TbMsg) -> TbResult<()> {
         .collect();
     // TODO(Phase 8b/9)：发布 usage 统计消息到 tb_usage_stats topic，由 core 汇总进 api_usage_state。
     ctx.timeseries_dao.save(msg.originator.id, &entries).await?;
+    crate::telemetry_cache::update_latest(ctx, msg.originator.id, &entries).await;
     spawn_calculated(
         ctx,
         msg.tenant_id,
@@ -333,6 +336,7 @@ impl SaveAttributesNode {
                         scope: common_pb::AttributeScope::from(scope) as i32,
                         updated: entries.iter().map(|e| kv_proto(&e.key, &e.value)).collect(),
                         deleted_keys: vec![],
+                        update_ts: chrono::Utc::now().timestamp_millis(),
                     },
                 )),
             },
@@ -341,8 +345,8 @@ impl SaveAttributesNode {
     }
 }
 
-/// action.create_alarm：originator+type 的最新告警仍 ACTIVE 则更新 end_ts/details（"Updated"），
-/// 否则新建 ACTIVE_UNACK 告警（"Created"）。产出 ALARM 类型新消息，data 为告警 JSON。
+/// action.create_alarm：ACTIVE 告警原子更新，否则创建 ACTIVE_UNACK。
+/// 部分唯一索引上的 ON CONFLICT 避免并发检查后再写入产生两条 ACTIVE。
 pub struct CreateAlarmNode {
     alarm_type: String,
     severity: AlarmSeverity,
@@ -354,10 +358,12 @@ impl CreateAlarmNode {
     pub fn new(config: &serde_json::Value) -> TbResult<Self> {
         #[derive(Deserialize)]
         struct Config {
+            #[serde(alias = "alarmType")]
             alarm_type: String,
             severity: AlarmSeverity,
             #[serde(default)]
             propagate: bool,
+            #[serde(alias = "detailsScript")]
             details_script: Option<String>,
         }
         let c: Config = parse_config(config)?;
@@ -413,49 +419,70 @@ impl CreateAlarmNode {
             None => None,
         };
         let now = chrono::Utc::now().timestamp_millis();
-        let existing = ctx
-            .alarm_dao
-            .find_latest_by_originator_and_type(msg.originator.id, &self.alarm_type)
-            .await?;
-        let active = existing
-            .as_ref()
-            .is_some_and(|a| matches!(a.status, AlarmStatus::ActiveUnack | AlarmStatus::ActiveAck));
-        if active {
-            let mut alarm = existing.expect("checked above");
-            alarm.end_ts = now;
-            alarm.severity = self.severity;
-            alarm.propagate = self.propagate;
-            if let Some(d) = details {
-                alarm.details = Some(d);
-            }
-            let alarm = ctx.alarm_dao.save(&alarm).await?;
-            Ok(("Updated".to_string(), alarm))
+        let new_id = Uuid::now_v7();
+        let alarm = Alarm {
+            id: new_id,
+            created_time: now,
+            tenant_id: msg.tenant_id,
+            originator_id: msg.originator.id,
+            originator_type: msg.originator.entity_type,
+            r#type: self.alarm_type.clone(),
+            severity: self.severity,
+            status: AlarmStatus::ActiveUnack,
+            start_ts: now,
+            end_ts: now,
+            ack_ts: None,
+            clear_ts: None,
+            details,
+            propagate: self.propagate,
+            propagate_to_owner: false,
+            propagate_to_tenant: false,
+            propagate_relation_types: None,
+            customer_id: msg.customer_id,
+            assignee_id: None,
+            assign_ts: None,
+        };
+        let saved = sqlx::query_as::<_, Alarm>(
+            "INSERT INTO alarm (id, created_time, tenant_id, originator_id, originator_type, \
+             type, severity, status, start_ts, end_ts, ack_ts, clear_ts, details, propagate, \
+             propagate_to_owner, propagate_to_tenant, propagate_relation_types, customer_id, \
+             assignee_id, assign_ts) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) \
+             ON CONFLICT (originator_id, type) \
+             WHERE status IN ('ACTIVE_UNACK','ACTIVE_ACK') DO UPDATE SET \
+             end_ts=EXCLUDED.end_ts, severity=EXCLUDED.severity, \
+             details=COALESCE(EXCLUDED.details, alarm.details), propagate=EXCLUDED.propagate \
+             RETURNING alarm.*",
+        )
+        .bind(alarm.id)
+        .bind(alarm.created_time)
+        .bind(alarm.tenant_id)
+        .bind(alarm.originator_id)
+        .bind(alarm.originator_type.as_str())
+        .bind(&alarm.r#type)
+        .bind(alarm.severity)
+        .bind(alarm.status)
+        .bind(alarm.start_ts)
+        .bind(alarm.end_ts)
+        .bind(alarm.ack_ts)
+        .bind(alarm.clear_ts)
+        .bind(&alarm.details)
+        .bind(alarm.propagate)
+        .bind(alarm.propagate_to_owner)
+        .bind(alarm.propagate_to_tenant)
+        .bind(&alarm.propagate_relation_types)
+        .bind(alarm.customer_id)
+        .bind(alarm.assignee_id)
+        .bind(alarm.assign_ts)
+        .fetch_one(&ctx.pool)
+        .await
+        .map_err(TbError::db)?;
+        let relation = if saved.id == new_id {
+            "Created"
         } else {
-            let alarm = Alarm {
-                id: Uuid::now_v7(),
-                created_time: 0,
-                tenant_id: msg.tenant_id,
-                originator_id: msg.originator.id,
-                originator_type: msg.originator.entity_type,
-                r#type: self.alarm_type.clone(),
-                severity: self.severity,
-                status: AlarmStatus::ActiveUnack,
-                start_ts: now,
-                end_ts: now,
-                ack_ts: None,
-                clear_ts: None,
-                details,
-                propagate: self.propagate,
-                propagate_to_owner: false,
-                propagate_to_tenant: false,
-                propagate_relation_types: None,
-                customer_id: msg.customer_id,
-                assignee_id: None,
-                assign_ts: None,
-            };
-            let alarm = ctx.alarm_dao.save(&alarm).await?;
-            Ok(("Created".to_string(), alarm))
-        }
+            "Updated"
+        };
+        Ok((relation.to_string(), saved))
     }
 }
 

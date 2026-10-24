@@ -19,56 +19,36 @@ impl TenantDao {
 
     pub async fn save(&self, tenant: &Tenant) -> TbResult<Tenant> {
         let mut t = tenant.clone();
-        if self.find_by_id(t.id).await?.is_some() {
-            sqlx::query(
-                "UPDATE tenant SET title=$2, region=$3, country=$4, state=$5, city=$6, \
-                 address=$7, address2=$8, zip=$9, phone=$10, email=$11, additional_info=$12, \
-                 tenant_profile_id=$13 WHERE id=$1",
-            )
-            .bind(t.id)
-            .bind(&t.title)
-            .bind(&t.region)
-            .bind(&t.country)
-            .bind(&t.state)
-            .bind(&t.city)
-            .bind(&t.address)
-            .bind(&t.address2)
-            .bind(&t.zip)
-            .bind(&t.phone)
-            .bind(&t.email)
-            .bind(&t.additional_info)
-            .bind(t.tenant_profile_id)
-            .execute(&self.pool)
-            .await
-            .map_err(TbError::db)?;
-        } else {
-            if t.created_time == 0 {
-                t.created_time = now_ms();
-            }
-            sqlx::query(
-                "INSERT INTO tenant (id, created_time, title, region, country, state, city, \
-                 address, address2, zip, phone, email, additional_info, tenant_profile_id) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
-            )
-            .bind(t.id)
-            .bind(t.created_time)
-            .bind(&t.title)
-            .bind(&t.region)
-            .bind(&t.country)
-            .bind(&t.state)
-            .bind(&t.city)
-            .bind(&t.address)
-            .bind(&t.address2)
-            .bind(&t.zip)
-            .bind(&t.phone)
-            .bind(&t.email)
-            .bind(&t.additional_info)
-            .bind(t.tenant_profile_id)
-            .execute(&self.pool)
-            .await
-            .map_err(TbError::db)?;
+        if t.created_time == 0 {
+            t.created_time = now_ms();
         }
-        Ok(t)
+        sqlx::query_as::<_, Tenant>(
+            "INSERT INTO tenant (id, created_time, title, region, country, state, city, \
+             address, address2, zip, phone, email, additional_info, tenant_profile_id) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) \
+             ON CONFLICT (id) DO UPDATE SET title=EXCLUDED.title, region=EXCLUDED.region, \
+             country=EXCLUDED.country, state=EXCLUDED.state, city=EXCLUDED.city, \
+             address=EXCLUDED.address, address2=EXCLUDED.address2, zip=EXCLUDED.zip, \
+             phone=EXCLUDED.phone, email=EXCLUDED.email, additional_info=EXCLUDED.additional_info, \
+             tenant_profile_id=EXCLUDED.tenant_profile_id RETURNING *",
+        )
+        .bind(t.id)
+        .bind(t.created_time)
+        .bind(&t.title)
+        .bind(&t.region)
+        .bind(&t.country)
+        .bind(&t.state)
+        .bind(&t.city)
+        .bind(&t.address)
+        .bind(&t.address2)
+        .bind(&t.zip)
+        .bind(&t.phone)
+        .bind(&t.email)
+        .bind(&t.additional_info)
+        .bind(t.tenant_profile_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(TbError::db)
     }
 
     pub async fn find_by_id(&self, id: Uuid) -> TbResult<Option<Tenant>> {
@@ -129,38 +109,25 @@ impl TenantProfileDao {
 
     pub async fn save(&self, profile: &TenantProfile) -> TbResult<TenantProfile> {
         let mut p = profile.clone();
-        if self.find_by_id(p.id).await?.is_some() {
-            sqlx::query(
-                "UPDATE tenant_profile SET name=$2, description=$3, is_default=$4, \
-                 profile_data=$5 WHERE id=$1",
-            )
-            .bind(p.id)
-            .bind(&p.name)
-            .bind(&p.description)
-            .bind(p.is_default)
-            .bind(&p.profile_data)
-            .execute(&self.pool)
-            .await
-            .map_err(TbError::db)?;
-        } else {
-            if p.created_time == 0 {
-                p.created_time = now_ms();
-            }
-            sqlx::query(
-                "INSERT INTO tenant_profile (id, created_time, name, description, is_default, \
-                 profile_data) VALUES ($1,$2,$3,$4,$5,$6)",
-            )
-            .bind(p.id)
-            .bind(p.created_time)
-            .bind(&p.name)
-            .bind(&p.description)
-            .bind(p.is_default)
-            .bind(&p.profile_data)
-            .execute(&self.pool)
-            .await
-            .map_err(TbError::db)?;
+        if p.created_time == 0 {
+            p.created_time = now_ms();
         }
-        Ok(p)
+        sqlx::query_as::<_, TenantProfile>(
+            "INSERT INTO tenant_profile (id, created_time, name, description, is_default, \
+             profile_data) VALUES ($1,$2,$3,$4,$5,$6) \
+             ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, \
+             description=EXCLUDED.description, is_default=EXCLUDED.is_default, \
+             profile_data=EXCLUDED.profile_data RETURNING *",
+        )
+        .bind(p.id)
+        .bind(p.created_time)
+        .bind(&p.name)
+        .bind(&p.description)
+        .bind(p.is_default)
+        .bind(&p.profile_data)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(TbError::db)
     }
 
     pub async fn find_by_id(&self, id: Uuid) -> TbResult<Option<TenantProfile>> {

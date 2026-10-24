@@ -13,7 +13,12 @@ message EdqsEventMsg {
     EntityDeleteMsg entity_delete = 3;
     AttributeUpdateMsg attribute_update = 4;
     LatestTelemetryMsg latest_telemetry = 5;
+    TenantDeleteMsg tenant_delete = 6;
   }
+}
+
+message TenantDeleteMsg {
+  string tenant_id = 1;
 }
 
 // 实体创建/更新（本期支持 device/asset）。type_or_profile：device.type，asset 暂为空串。
@@ -38,6 +43,7 @@ message AttributeUpdateMsg {
   tb.common.AttributeScope scope = 2;
   repeated tb.common.KeyValueProto updated = 3;
   repeated string deleted_keys = 4;
+  int64 update_ts = 5;
 }
 
 // latest 遥测更新：ts 与 values 下标对齐。

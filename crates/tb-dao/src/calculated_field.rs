@@ -19,38 +19,25 @@ impl CalculatedFieldDao {
 
     pub async fn save(&self, field: &CalculatedField) -> TbResult<CalculatedField> {
         let mut f = field.clone();
-        if self.find_by_id(f.id).await?.is_some() {
-            sqlx::query(
-                "UPDATE calculated_field SET tenant_id=$2, entity_id=$3, name=$4, configuration=$5 \
-                 WHERE id=$1",
-            )
-            .bind(f.id)
-            .bind(f.tenant_id)
-            .bind(f.entity_id)
-            .bind(&f.name)
-            .bind(&f.configuration)
-            .execute(&self.pool)
-            .await
-            .map_err(TbError::db)?;
-        } else {
-            if f.created_time == 0 {
-                f.created_time = now_ms();
-            }
-            sqlx::query(
-                "INSERT INTO calculated_field (id, created_time, tenant_id, entity_id, name, configuration) \
-                 VALUES ($1,$2,$3,$4,$5,$6)",
-            )
-            .bind(f.id)
-            .bind(f.created_time)
-            .bind(f.tenant_id)
-            .bind(f.entity_id)
-            .bind(&f.name)
-            .bind(&f.configuration)
-            .execute(&self.pool)
-            .await
-            .map_err(TbError::db)?;
+        if f.created_time == 0 {
+            f.created_time = now_ms();
         }
-        Ok(f)
+        sqlx::query_as::<_, CalculatedField>(
+            "INSERT INTO calculated_field (id, created_time, tenant_id, entity_id, name, configuration) \
+             VALUES ($1,$2,$3,$4,$5,$6) \
+             ON CONFLICT (id) DO UPDATE SET tenant_id=EXCLUDED.tenant_id, \
+             entity_id=EXCLUDED.entity_id, name=EXCLUDED.name, \
+             configuration=EXCLUDED.configuration RETURNING *",
+        )
+        .bind(f.id)
+        .bind(f.created_time)
+        .bind(f.tenant_id)
+        .bind(f.entity_id)
+        .bind(&f.name)
+        .bind(&f.configuration)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(TbError::db)
     }
 
     pub async fn find_by_id(&self, id: Uuid) -> TbResult<Option<CalculatedField>> {
@@ -115,5 +102,18 @@ impl CalculatedFieldDao {
             .await
             .map_err(TbError::db)?;
         Ok(res.rows_affected() > 0)
+    }
+
+    pub async fn delete_by_entity(
+        &self,
+        tx: &mut sqlx::PgConnection,
+        entity_id: Uuid,
+    ) -> TbResult<()> {
+        sqlx::query("DELETE FROM calculated_field WHERE entity_id = $1")
+            .bind(entity_id)
+            .execute(tx)
+            .await
+            .map_err(TbError::db)?;
+        Ok(())
     }
 }

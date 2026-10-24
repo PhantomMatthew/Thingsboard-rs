@@ -57,6 +57,14 @@ async fn save_profile(
         }
         None => (Uuid::now_v7(), 0),
     };
+    for ota_id in [req.firmware_id, req.software_id].into_iter().flatten() {
+        let package = state
+            .ota_package_dao
+            .find_meta_by_id(ota_id)
+            .await?
+            .ok_or_else(|| TbError::NotFound(format!("ota package {ota_id}")))?;
+        check_tenant_scope(&user, package.tenant_id)?;
+    }
     let profile = DeviceProfile {
         id,
         created_time,

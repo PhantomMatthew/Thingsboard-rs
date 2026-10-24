@@ -5,7 +5,9 @@
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
-pub const MAX_PACKET_SIZE: usize = 64 * 1024 * 1024;
+/// 默认 MQTT remaining length 上限（1 MiB），每个 codec 可由环境变量覆盖。
+pub const MAX_PACKET_SIZE: usize = 1024 * 1024;
+pub const MAX_PACKET_SIZE_ENV: &str = "TB_MQTT_MAX_PACKET_SIZE";
 
 pub const LEVEL_3_1_1: u8 = 4;
 
@@ -86,8 +88,26 @@ pub enum CodecError {
     StringTooLong,
 }
 
-#[derive(Default)]
-pub struct MqttCodec;
+pub struct MqttCodec {
+    max_packet_size: usize,
+}
+
+impl Default for MqttCodec {
+    fn default() -> Self {
+        let max_packet_size = std::env::var(MAX_PACKET_SIZE_ENV)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|size| *size > 0)
+            .unwrap_or(MAX_PACKET_SIZE);
+        Self { max_packet_size }
+    }
+}
+
+impl MqttCodec {
+    pub fn with_max_packet_size(max_packet_size: usize) -> Self {
+        Self { max_packet_size }
+    }
+}
 
 struct Cursor<'a> {
     buf: &'a [u8],
@@ -162,7 +182,10 @@ fn read_varint_buf(cur: &mut Cursor<'_>, what: &'static str) -> Result<usize, Co
 }
 
 /// 从帧头区域读 remaining length：返回 (值, varint 字节数)；数据不足返回 None。
-fn read_remaining_length(src: &[u8]) -> Result<Option<(usize, usize)>, CodecError> {
+fn read_remaining_length(
+    src: &[u8],
+    max_packet_size: usize,
+) -> Result<Option<(usize, usize)>, CodecError> {
     let mut value = 0usize;
     for i in 0..4 {
         let Some(&b) = src.get(i) else {
@@ -170,7 +193,7 @@ fn read_remaining_length(src: &[u8]) -> Result<Option<(usize, usize)>, CodecErro
         };
         value |= ((b & 0x7f) as usize) << (7 * i);
         if b & 0x80 == 0 {
-            if value > MAX_PACKET_SIZE {
+            if value > max_packet_size {
                 return Err(CodecError::PacketTooLarge(value));
             }
             return Ok(Some((value, i + 1)));
@@ -187,7 +210,8 @@ impl Decoder for MqttCodec {
         if src.len() < 2 {
             return Ok(None);
         }
-        let Some((remaining, rl_bytes)) = read_remaining_length(&src[1..])? else {
+        let Some((remaining, rl_bytes)) = read_remaining_length(&src[1..], self.max_packet_size)?
+        else {
             return Ok(None);
         };
         let total = 1 + rl_bytes + remaining;
@@ -523,7 +547,7 @@ mod tests {
     use super::*;
 
     fn roundtrip(packet: MqttPacket) {
-        let mut codec = MqttCodec;
+        let mut codec = MqttCodec::default();
         let mut buf = BytesMut::new();
         codec.encode(packet.clone(), &mut buf).unwrap();
         let decoded = codec.decode(&mut buf).unwrap().expect("complete packet");
@@ -532,7 +556,7 @@ mod tests {
     }
 
     fn roundtrip_fragmented(packet: MqttPacket) {
-        let mut codec = MqttCodec;
+        let mut codec = MqttCodec::default();
         let mut wire = BytesMut::new();
         codec.encode(packet.clone(), &mut wire).unwrap();
         let mut buf = BytesMut::new();
@@ -644,16 +668,26 @@ mod tests {
 
     #[test]
     fn rejects_oversized_remaining_length() {
-        let mut codec = MqttCodec;
-        // remaining length = 64MB + 1 → 超出上限
+        let mut codec = MqttCodec::default();
         let mut buf = BytesMut::from(&[0x30u8, 0x81, 0x80, 0x80, 0x40][..]);
         let err = codec.decode(&mut buf).unwrap_err();
         assert!(matches!(err, CodecError::PacketTooLarge(_)));
     }
 
     #[test]
+    fn packet_size_limit_is_configurable_and_defaults_to_one_mib() {
+        assert_eq!(MAX_PACKET_SIZE, 1024 * 1024);
+        let mut codec = MqttCodec::with_max_packet_size(8);
+        let mut buf = BytesMut::from(&[0x30u8, 0x09][..]);
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(CodecError::PacketTooLarge(9))
+        ));
+    }
+
+    #[test]
     fn rejects_malformed_varint() {
-        let mut codec = MqttCodec;
+        let mut codec = MqttCodec::default();
         let mut buf = BytesMut::from(&[0x30u8, 0x80, 0x80, 0x80, 0x80][..]);
         let err = codec.decode(&mut buf).unwrap_err();
         assert!(matches!(err, CodecError::Malformed(_)));
@@ -661,7 +695,7 @@ mod tests {
 
     #[test]
     fn rejects_publish_with_wildcard_topic() {
-        let mut codec = MqttCodec;
+        let mut codec = MqttCodec::default();
         let mut buf = BytesMut::new();
         put_utf8(&mut buf, "a/+/b").unwrap();
         buf.extend_from_slice(b"x");
@@ -674,7 +708,7 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_type() {
-        let mut codec = MqttCodec;
+        let mut codec = MqttCodec::default();
         // PUBREL (type 6) 不支持
         let mut buf = BytesMut::from(&[0x62u8, 0x02, 0x00, 0x01][..]);
         let err = codec.decode(&mut buf).unwrap_err();
@@ -693,7 +727,7 @@ mod tests {
         let mut buf = BytesMut::new();
         frame(&mut buf, 0x10, body.len());
         buf.extend_from_slice(&body);
-        let mut codec = MqttCodec;
+        let mut codec = MqttCodec::default();
         let packet = codec.decode(&mut buf).unwrap().unwrap();
         match packet {
             MqttPacket::Connect(c) => {

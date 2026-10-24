@@ -16,6 +16,16 @@ use crate::session::{self, Session};
 pub const TOPIC_FW_SUBSCRIBE: &str = "v2/fw/response/+";
 pub const TOPIC_FW_REQUEST_PREFIX: &str = "v2/fw/request/";
 pub const DEFAULT_CHUNK_SIZE: i32 = 16 * 1024;
+pub const MAX_CHUNK_SIZE: i32 = 256 * 1024;
+
+fn requested_chunk_size(payload: &[u8]) -> i32 {
+    std::str::from_utf8(payload)
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(DEFAULT_CHUNK_SIZE)
+        .min(MAX_CHUNK_SIZE)
+}
 
 pub fn fw_attributes_body(pkg: &pb::OtaPackageProto) -> serde_json::Value {
     let tag = if pkg.tag.is_empty() {
@@ -120,11 +130,7 @@ pub async fn handle_chunk_request(
         tracing::warn!(chunk, "bad firmware chunk index");
         return;
     };
-    let chunk_size = std::str::from_utf8(payload)
-        .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok())
-        .filter(|s| *s > 0)
-        .unwrap_or(DEFAULT_CHUNK_SIZE);
+    let chunk_size = requested_chunk_size(payload);
     let pkg = match state.ota_packages.get(&session.info.session_id).await {
         Some(pkg) => Some(pkg),
         None => resolve_firmware(state, &session.device).await,
@@ -157,5 +163,21 @@ pub async fn handle_chunk_request(
             .await;
         }
         Err(e) => tracing::warn!("ota get_ota_chunk failed: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_size_is_positive_and_capped() {
+        assert_eq!(requested_chunk_size(b"100"), 100);
+        assert_eq!(requested_chunk_size(b"0"), DEFAULT_CHUNK_SIZE);
+        assert_eq!(requested_chunk_size(b"invalid"), DEFAULT_CHUNK_SIZE);
+        assert_eq!(
+            requested_chunk_size((MAX_CHUNK_SIZE + 1).to_string().as_bytes()),
+            MAX_CHUNK_SIZE
+        );
     }
 }

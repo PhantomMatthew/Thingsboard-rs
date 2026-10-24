@@ -83,14 +83,27 @@ impl TransportState {
     }
 }
 
-/// accept 循环 + 下行通知 consumer，直到 listener 出错。
+/// accept 循环 + 下行通知 consumer；临时 accept 错误退避后继续监听。
 pub async fn serve(listener: TcpListener, state: TransportState) -> std::io::Result<()> {
     tokio::spawn(downlink::run(state.clone()));
+    let mut consecutive_errors = 0u32;
     loop {
-        let (socket, peer) = listener.accept().await?;
-        let st = state.clone();
-        tokio::spawn(async move {
-            session::run(socket, peer, st).await;
-        });
+        match listener.accept().await {
+            Ok((socket, peer)) => {
+                consecutive_errors = 0;
+                let st = state.clone();
+                tokio::spawn(async move {
+                    session::run(socket, peer, st).await;
+                });
+            }
+            Err(e) => {
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                let backoff = std::time::Duration::from_millis(
+                    10u64.saturating_mul(1u64 << consecutive_errors.min(6)),
+                );
+                tracing::warn!(error = %e, ?backoff, "MQTT accept failed; retrying");
+                tokio::time::sleep(backoff).await;
+            }
+        }
     }
 }

@@ -29,9 +29,12 @@ impl AttributesDao {
             return Ok(());
         }
         let now = now_ms();
+        let mut key_ids = Vec::with_capacity(entries.len());
+        for entry in entries {
+            key_ids.push(self.keys.get_or_create_id(&entry.key).await?);
+        }
         let mut tx = self.pool.begin().await.map_err(TbError::db)?;
-        for e in entries {
-            let key_id = self.keys.get_or_create_id(&e.key).await?;
+        for (e, key_id) in entries.iter().zip(key_ids) {
             let cols = split_value(&e.value);
             sqlx::query(
                 "INSERT INTO attribute_kv \
@@ -58,6 +61,19 @@ impl AttributesDao {
             .map_err(TbError::db)?;
         }
         tx.commit().await.map_err(TbError::db)?;
+        Ok(())
+    }
+
+    pub async fn delete_by_entity(
+        &self,
+        tx: &mut sqlx::PgConnection,
+        entity_id: Uuid,
+    ) -> TbResult<()> {
+        sqlx::query("DELETE FROM attribute_kv WHERE entity_id = $1")
+            .bind(entity_id)
+            .execute(tx)
+            .await
+            .map_err(TbError::db)?;
         Ok(())
     }
 

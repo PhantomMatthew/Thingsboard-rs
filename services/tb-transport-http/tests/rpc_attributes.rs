@@ -174,6 +174,85 @@ async fn http_attributes_and_rpc_long_poll() {
     let (status, body) = twoway.await.unwrap();
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, json!({"status": "ok"}));
+
+    // 同一长轮询窗口到达两个 twoway RPC：第一个返回后，第二个必须留给下一次轮询。
+    let multi_device_id = create_device_with_token(
+        &client,
+        &core,
+        &admin_token,
+        "http-multi-rpc-dev",
+        "HATTR_MULTI",
+    )
+    .await;
+    let first_poll = {
+        let client = client.clone();
+        let http = http.clone();
+        tokio::spawn(async move {
+            client
+                .get(format!("{http}/api/v1/HATTR_MULTI/rpc"))
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        })
+    };
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let mut twoway_tasks = Vec::new();
+    for _ in 0..2 {
+        let client = client.clone();
+        let core = core.clone();
+        let token = admin_token.clone();
+        let device_id = multi_device_id.clone();
+        twoway_tasks.push(tokio::spawn(async move {
+            rest_twoway(&client, &core, &token, &device_id, 10000).await
+        }));
+    }
+    let first = first_poll.await.unwrap();
+    assert!(
+        first.get("id").is_some(),
+        "first RPC was not delivered: {first}"
+    );
+    let second_poll = {
+        let client = client.clone();
+        let http = http.clone();
+        tokio::spawn(async move {
+            client
+                .get(format!("{http}/api/v1/HATTR_MULTI/rpc"))
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        })
+    };
+    let second = tokio::time::timeout(Duration::from_secs(6), second_poll)
+        .await
+        .expect("second RPC was dropped between poll windows")
+        .unwrap();
+    assert!(
+        second.get("id").is_some(),
+        "second poll returned no RPC: {second}"
+    );
+    assert_ne!(first["id"], second["id"]);
+
+    for request in [&first, &second] {
+        let request_id = request["id"].as_i64().unwrap();
+        let response = client
+            .post(format!("{http}/api/v1/HATTR_MULTI/rpc/{request_id}"))
+            .json(&json!({"status": "ok"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    for task in twoway_tasks {
+        let (status, body) = task.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "concurrent twoway failed: {body}");
+        assert_eq!(body, json!({"status": "ok"}));
+    }
 }
 
 async fn rest_twoway(

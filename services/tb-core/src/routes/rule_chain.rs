@@ -251,10 +251,18 @@ async fn put_nodes(
     load_chain(&state, &user, id).await?;
 
     for node in &req.nodes {
-        if !tb_rule_engine::known_node_types().contains(&node.r#type.as_str()) {
-            return Err(
-                TbError::InvalidInput(format!("unknown rule node type: {}", node.r#type)).into(),
-            );
+        let config = node
+            .configuration
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Err(e) = tb_rule_engine::registry::create_node(&node.r#type, &config) {
+            return Err(TbError::InvalidInput(format!(
+                "invalid rule node '{}' ({}): {}",
+                node.name,
+                node.r#type,
+                e.client_message()
+            ))
+            .into());
         }
     }
     for edge in &req.edges {

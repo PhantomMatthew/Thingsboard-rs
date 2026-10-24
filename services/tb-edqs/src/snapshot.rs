@@ -99,7 +99,7 @@ pub async fn load_snapshot(pool: &PgPool, state: &EdqsState) -> TbResult<Snapsho
                 .tenants
                 .entry(*tenant_id)
                 .or_default()
-                .apply_attribute_update(entity_id, scope, vec![(entry.key, entry.value)], &[]);
+                .apply_attribute_update(entity_id, scope, vec![(entry.key, entry.value)], &[], 0);
             stats.attributes += 1;
         }
         offset += PAGE;

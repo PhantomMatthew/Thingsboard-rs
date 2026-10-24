@@ -2,18 +2,17 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use dashmap::DashMap;
 use prost::Message as _;
 use serde::Deserialize;
 use tb_common::msg::{TbMsg, msg_type};
 use tb_common::{EntityId, EntityType, TbError, TbResult};
 use tb_dao::models::{Alarm, AlarmStatus};
 use tb_proto::core as core_pb;
-use tb_queue::{QueueProducer, TbTopic};
+use tb_queue::TbTopic;
 use uuid::Uuid;
 
 use crate::context::NodeContext;
@@ -140,7 +139,7 @@ impl Node for DeleteAttributesNode {
     }
 }
 
-/// action.delay：sleep delay_sec（上限 300）后 "Success"。
+/// action.delay：立即产出 Success，由 chain 将下一跳安排为独立延时重投任务。
 pub struct DelayNode {
     delay: Duration,
 }
@@ -158,26 +157,25 @@ impl DelayNode {
             delay: Duration::from_secs(c.delay_sec.min(MAX_DELAY_SEC)),
         })
     }
+
+    pub(crate) fn delay(&self) -> Duration {
+        self.delay
+    }
 }
 
 #[async_trait]
 impl Node for DelayNode {
     async fn on_msg(&self, _ctx: &NodeContext, msg: TbMsg) -> Vec<(String, TbMsg)> {
-        tokio::time::sleep(self.delay).await;
         vec![("Success".into(), msg)]
     }
 }
 
-/// action.deduplication：per originator+内容 hash 窗口去重；首次 "Success"，重复 "Deduplicated"。
-/// key_fields 为空时对 msg.data 全量 hash（serde_json Map 默认 BTree，序列化结果稳定）。
+/// action.deduplication：chain+node+originator+内容 hash 窗口去重。
+/// 状态存于 NodeContext，链缓存重建不会清空；首次 "Success"，重复 "Deduplicated"。
 pub struct DeduplicationNode {
     window: Duration,
     key_fields: Vec<String>,
-    seen: DashMap<(Uuid, u64), Instant>,
 }
-
-/// 触发惰性清理的容量阈值。
-const DEDUP_SWEEP_THRESHOLD: usize = 10_000;
 
 impl DeduplicationNode {
     pub fn new(config: &serde_json::Value) -> TbResult<Self> {
@@ -191,7 +189,6 @@ impl DeduplicationNode {
         Ok(Self {
             window: Duration::from_secs(c.window_sec.max(1)),
             key_fields: c.key_fields,
-            seen: DashMap::new(),
         })
     }
 
@@ -215,21 +212,19 @@ impl DeduplicationNode {
 
 #[async_trait]
 impl Node for DeduplicationNode {
-    async fn on_msg(&self, _ctx: &NodeContext, msg: TbMsg) -> Vec<(String, TbMsg)> {
-        let key = (msg.originator.id, self.content_hash(&msg));
-        // 惰性过期清理：超阈值时扫一遍删掉过期项。
-        if self.seen.len() > DEDUP_SWEEP_THRESHOLD {
-            let window = self.window;
-            self.seen.retain(|_, t| t.elapsed() < window);
-        }
-        let duplicate = self
-            .seen
-            .get(&key)
-            .is_some_and(|t| t.elapsed() < self.window);
+    async fn on_msg(&self, ctx: &NodeContext, msg: TbMsg) -> Vec<(String, TbMsg)> {
+        let duplicate = ctx
+            .is_duplicate(
+                msg.rule_chain_id.unwrap_or_else(Uuid::nil),
+                msg.rule_node_id.unwrap_or_else(Uuid::nil),
+                msg.originator.id,
+                self.content_hash(&msg),
+                self.window,
+            )
+            .await;
         if duplicate {
             vec![("Deduplicated".into(), msg)]
         } else {
-            self.seen.insert(key, Instant::now());
             vec![("Success".into(), msg)]
         }
     }

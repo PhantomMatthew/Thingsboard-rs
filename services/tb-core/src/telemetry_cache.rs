@@ -103,23 +103,32 @@ pub async fn update_latest(state: &AppState, entity_id: Uuid, entries: &[TsKvEnt
         return;
     };
     let key = redis_key(entity_id);
+    let script = redis::Script::new(
+        r#"
+        local current = redis.call('HGET', KEYS[1], ARGV[1])
+        if current then
+            local ok, decoded = pcall(cjson.decode, current)
+            if ok and type(decoded) == 'table' then
+                local cached_ts = tonumber(decoded['ts'])
+                if cached_ts and cached_ts > tonumber(ARGV[3]) then
+                    return 0
+                end
+            end
+        end
+        redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+        return 1
+        "#,
+    );
     for e in entries {
-        let existing: Option<String> = match conn.hget(&key, &e.key).await {
-            Ok(v) => v,
-            Err(err) => {
-                tracing::warn!("redis HGET failed: {err}");
-                return;
-            }
-        };
-        if let Some(raw) = existing
-            && let Ok(obj) = serde_json::from_str::<serde_json::Value>(&raw)
-            && obj["ts"].as_i64().unwrap_or(i64::MIN) > e.ts
-        {
-            continue;
-        }
-        let res: redis::RedisResult<usize> = conn.hset(&key, &e.key, field_json(e)).await;
+        let res: redis::RedisResult<usize> = script
+            .key(&key)
+            .arg(&e.key)
+            .arg(field_json(e))
+            .arg(e.ts)
+            .invoke_async(&mut conn)
+            .await;
         if let Err(err) = res {
-            tracing::warn!("redis HSET failed: {err}");
+            tracing::warn!("redis atomic latest update failed: {err}");
             return;
         }
     }
@@ -150,6 +159,16 @@ pub async fn save_with_latest(
         .collect();
     crate::calculated::spawn_evaluate(state, tenant_id, entity_id, trigger);
     Ok(())
+}
+
+pub async fn invalidate_latest(state: &AppState, entity_id: Uuid) {
+    let Some(mut conn) = conn(state).await else {
+        return;
+    };
+    let res: redis::RedisResult<usize> = conn.del(redis_key(entity_id)).await;
+    if let Err(e) = res {
+        tracing::warn!("redis DEL failed: {e}");
+    }
 }
 
 /// 全量删除部分 key 后同步剔除缓存 field（保留 __full__ 标记）。

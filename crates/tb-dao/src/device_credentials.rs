@@ -21,11 +21,12 @@ impl DeviceCredentialsDao {
         if c.created_time == 0 {
             c.created_time = now_ms();
         }
-        sqlx::query(
+        sqlx::query_as::<_, DeviceCredentials>(
             "INSERT INTO device_credentials (id, created_time, device_id, credentials_type, \
              credentials_id, credentials_value) VALUES ($1,$2,$3,$4,$5,$6) \
-             ON CONFLICT (device_id) DO UPDATE SET credentials_type=$4, credentials_id=$5, \
-             credentials_value=$6",
+             ON CONFLICT (device_id) DO UPDATE SET credentials_type=EXCLUDED.credentials_type, \
+             credentials_id=EXCLUDED.credentials_id, credentials_value=EXCLUDED.credentials_value \
+             RETURNING *",
         )
         .bind(c.id)
         .bind(c.created_time)
@@ -33,10 +34,9 @@ impl DeviceCredentialsDao {
         .bind(c.credentials_type)
         .bind(&c.credentials_id)
         .bind(&c.credentials_value)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await
-        .map_err(TbError::db)?;
-        Ok(c)
+        .map_err(TbError::db)
     }
 
     pub async fn find_by_id(&self, id: Uuid) -> TbResult<Option<DeviceCredentials>> {
@@ -80,87 +80,66 @@ impl DeviceCredentialsDao {
         Ok(res.rows_affected() > 0)
     }
 
-    /// 在同一事务中保存设备及其凭证：设备走 insert/update，凭证按 device_id upsert。
+    /// 在同一事务中保存设备及其凭证：设备按 id、凭证按 device_id upsert。
     pub async fn save_device_with_credentials(
         &self,
         device: &Device,
         credentials: &DeviceCredentials,
     ) -> TbResult<(Device, DeviceCredentials)> {
         let mut tx = self.pool.begin().await.map_err(TbError::db)?;
-
-        let mut d = device.clone();
-        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM device WHERE id = $1)")
-            .bind(d.id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(TbError::db)?;
-        if exists {
-            sqlx::query(
-                "UPDATE device SET tenant_id=$2, customer_id=$3, device_profile_id=$4, name=$5, \
-                 type=$6, label=$7, external_id=$8, firmware_id=$9, software_id=$10, \
-                 additional_info=$11, device_data=$12 WHERE id=$1",
-            )
-            .bind(d.id)
-            .bind(d.tenant_id)
-            .bind(d.customer_id)
-            .bind(d.device_profile_id)
-            .bind(&d.name)
-            .bind(&d.r#type)
-            .bind(&d.label)
-            .bind(d.external_id)
-            .bind(d.firmware_id)
-            .bind(d.software_id)
-            .bind(&d.additional_info)
-            .bind(&d.device_data)
-            .execute(&mut *tx)
-            .await
-            .map_err(TbError::db)?;
+        let device_created_time = if device.created_time == 0 {
+            now_ms()
         } else {
-            if d.created_time == 0 {
-                d.created_time = now_ms();
-            }
-            sqlx::query(
-                "INSERT INTO device (id, created_time, tenant_id, customer_id, \
-                 device_profile_id, name, type, label, external_id, firmware_id, software_id, \
-                 additional_info, device_data) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
-            )
-            .bind(d.id)
-            .bind(d.created_time)
-            .bind(d.tenant_id)
-            .bind(d.customer_id)
-            .bind(d.device_profile_id)
-            .bind(&d.name)
-            .bind(&d.r#type)
-            .bind(&d.label)
-            .bind(d.external_id)
-            .bind(d.firmware_id)
-            .bind(d.software_id)
-            .bind(&d.additional_info)
-            .bind(&d.device_data)
-            .execute(&mut *tx)
-            .await
-            .map_err(TbError::db)?;
-        }
+            device.created_time
+        };
+        let d = sqlx::query_as::<_, Device>(
+            "INSERT INTO device (id, created_time, tenant_id, customer_id, \
+             device_profile_id, name, type, label, external_id, firmware_id, software_id, \
+             additional_info, device_data) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
+             ON CONFLICT (id) DO UPDATE SET tenant_id=EXCLUDED.tenant_id, \
+             customer_id=EXCLUDED.customer_id, device_profile_id=EXCLUDED.device_profile_id, \
+             name=EXCLUDED.name, type=EXCLUDED.type, label=EXCLUDED.label, \
+             external_id=EXCLUDED.external_id, firmware_id=EXCLUDED.firmware_id, \
+             software_id=EXCLUDED.software_id, additional_info=EXCLUDED.additional_info, \
+             device_data=EXCLUDED.device_data RETURNING *",
+        )
+        .bind(device.id)
+        .bind(device_created_time)
+        .bind(device.tenant_id)
+        .bind(device.customer_id)
+        .bind(device.device_profile_id)
+        .bind(&device.name)
+        .bind(&device.r#type)
+        .bind(&device.label)
+        .bind(device.external_id)
+        .bind(device.firmware_id)
+        .bind(device.software_id)
+        .bind(&device.additional_info)
+        .bind(&device.device_data)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(TbError::db)?;
 
-        let mut c = credentials.clone();
-        c.device_id = d.id;
-        if c.created_time == 0 {
-            c.created_time = now_ms();
-        }
-        sqlx::query(
+        let credentials_created_time = if credentials.created_time == 0 {
+            now_ms()
+        } else {
+            credentials.created_time
+        };
+        let c = sqlx::query_as::<_, DeviceCredentials>(
             "INSERT INTO device_credentials (id, created_time, device_id, credentials_type, \
              credentials_id, credentials_value) VALUES ($1,$2,$3,$4,$5,$6) \
-             ON CONFLICT (device_id) DO UPDATE SET credentials_type=$4, credentials_id=$5, \
-             credentials_value=$6",
+             ON CONFLICT (device_id) DO UPDATE SET credentials_type=EXCLUDED.credentials_type, \
+             credentials_id=EXCLUDED.credentials_id, credentials_value=EXCLUDED.credentials_value \
+             RETURNING *",
         )
-        .bind(c.id)
-        .bind(c.created_time)
-        .bind(c.device_id)
-        .bind(c.credentials_type)
-        .bind(&c.credentials_id)
-        .bind(&c.credentials_value)
-        .execute(&mut *tx)
+        .bind(credentials.id)
+        .bind(credentials_created_time)
+        .bind(device.id)
+        .bind(credentials.credentials_type)
+        .bind(&credentials.credentials_id)
+        .bind(&credentials.credentials_value)
+        .fetch_one(&mut *tx)
         .await
         .map_err(TbError::db)?;
 

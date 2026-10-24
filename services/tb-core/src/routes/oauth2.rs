@@ -35,7 +35,10 @@ fn try_admin(state: &AppState, headers: &HeaderMap) -> Option<SecurityUser> {
         .to_str()
         .ok()?
         .strip_prefix("Bearer ")?;
-    let claims = state.jwt_factory.parse_typed(token, TokenType::Access).ok()?;
+    let claims = state
+        .jwt_factory
+        .parse_typed(token, TokenType::Access)
+        .ok()?;
     let user = claims.to_security_user().ok()?;
     matches!(user.authority, Authority::SysAdmin | Authority::TenantAdmin).then_some(user)
 }
@@ -74,7 +77,7 @@ async fn oauth2_login(
 #[serde(rename_all = "camelCase")]
 pub struct SaveOauth2ClientRequest {
     pub id: Option<Uuid>,
-    /// 仅 SYS_ADMIN 可指定（空 = 平台级）；TENANT_ADMIN 强制覆写为本租户。
+    /// 仅 SYS_ADMIN 可指定（空 = 平台级）。
     pub tenant_id: Option<Uuid>,
     pub title: String,
     pub client_id: String,
@@ -87,16 +90,30 @@ pub struct SaveOauth2ClientRequest {
     pub enabled: Option<bool>,
 }
 
+fn validate_http_uri(name: &str, value: &str) -> Result<(), TbError> {
+    let url = reqwest::Url::parse(value)
+        .map_err(|_| TbError::InvalidInput(format!("{name} must be an absolute HTTP(S) URL")))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(TbError::InvalidInput(format!(
+            "{name} must be an absolute HTTP(S) URL"
+        )));
+    }
+    Ok(())
+}
+
 async fn save_client(
     State(state): State<AppState>,
     user: AuthUser,
     Json(req): Json<SaveOauth2ClientRequest>,
 ) -> Result<Json<Oauth2Client>, ApiError> {
-    require_authority(&user, &[Authority::SysAdmin, Authority::TenantAdmin])?;
-    let tenant_id = match user.0.authority {
-        Authority::SysAdmin => req.tenant_id,
-        _ => Some(user.0.tenant_id),
-    };
+    require_authority(&user, &[Authority::SysAdmin])?;
+    validate_http_uri("authorizationUri", &req.authorization_uri)?;
+    validate_http_uri("tokenUri", &req.token_uri)?;
+    validate_http_uri("userInfoUri", &req.user_info_uri)?;
+    if let Some(uri) = &req.redirect_uri_template {
+        validate_http_uri("redirectUriTemplate", uri)?;
+    }
+    let tenant_id = req.tenant_id;
     let (id, created_time) = match req.id {
         Some(id) => {
             let existing = load_and_check(&state, &user, id).await?;
@@ -135,7 +152,7 @@ async fn delete_client(
     user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    require_authority(&user, &[Authority::SysAdmin, Authority::TenantAdmin])?;
+    require_authority(&user, &[Authority::SysAdmin])?;
     load_and_check(&state, &user, id).await?;
     state.oauth2_client_dao.delete_by_id(id).await?;
     Ok(StatusCode::OK)
@@ -158,4 +175,19 @@ async fn load_and_check(
         ));
     }
     Ok(client)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_http_uri;
+
+    #[test]
+    fn oauth2_client_uris_require_http_or_https() {
+        for uri in ["https://idp.example.com/token", "http://127.0.0.1/token"] {
+            validate_http_uri("tokenUri", uri).unwrap();
+        }
+        for uri in ["file:///etc/passwd", "ftp://example.com/token", "/relative"] {
+            assert!(validate_http_uri("tokenUri", uri).is_err(), "{uri}");
+        }
+    }
 }

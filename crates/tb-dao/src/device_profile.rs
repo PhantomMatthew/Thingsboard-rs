@@ -19,50 +19,33 @@ impl DeviceProfileDao {
 
     pub async fn save(&self, profile: &DeviceProfile) -> TbResult<DeviceProfile> {
         let mut p = profile.clone();
-        if self.find_by_id(p.id).await?.is_some() {
-            sqlx::query(
-                "UPDATE device_profile SET tenant_id=$2, name=$3, description=$4, is_default=$5, \
-                 transport_type=$6, provision_type=$7, profile_data=$8, firmware_id=$9, \
-                 software_id=$10 WHERE id=$1",
-            )
-            .bind(p.id)
-            .bind(p.tenant_id)
-            .bind(&p.name)
-            .bind(&p.description)
-            .bind(p.is_default)
-            .bind(&p.transport_type)
-            .bind(&p.provision_type)
-            .bind(&p.profile_data)
-            .bind(p.firmware_id)
-            .bind(p.software_id)
-            .execute(&self.pool)
-            .await
-            .map_err(TbError::db)?;
-        } else {
-            if p.created_time == 0 {
-                p.created_time = now_ms();
-            }
-            sqlx::query(
-                "INSERT INTO device_profile (id, created_time, tenant_id, name, description, \
-                 is_default, transport_type, provision_type, profile_data, firmware_id, \
-                 software_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
-            )
-            .bind(p.id)
-            .bind(p.created_time)
-            .bind(p.tenant_id)
-            .bind(&p.name)
-            .bind(&p.description)
-            .bind(p.is_default)
-            .bind(&p.transport_type)
-            .bind(&p.provision_type)
-            .bind(&p.profile_data)
-            .bind(p.firmware_id)
-            .bind(p.software_id)
-            .execute(&self.pool)
-            .await
-            .map_err(TbError::db)?;
+        if p.created_time == 0 {
+            p.created_time = now_ms();
         }
-        Ok(p)
+        sqlx::query_as::<_, DeviceProfile>(
+            "INSERT INTO device_profile (id, created_time, tenant_id, name, description, \
+             is_default, transport_type, provision_type, profile_data, firmware_id, \
+             software_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
+             ON CONFLICT (id) DO UPDATE SET tenant_id=EXCLUDED.tenant_id, name=EXCLUDED.name, \
+             description=EXCLUDED.description, is_default=EXCLUDED.is_default, \
+             transport_type=EXCLUDED.transport_type, provision_type=EXCLUDED.provision_type, \
+             profile_data=EXCLUDED.profile_data, firmware_id=EXCLUDED.firmware_id, \
+             software_id=EXCLUDED.software_id RETURNING *",
+        )
+        .bind(p.id)
+        .bind(p.created_time)
+        .bind(p.tenant_id)
+        .bind(&p.name)
+        .bind(&p.description)
+        .bind(p.is_default)
+        .bind(&p.transport_type)
+        .bind(&p.provision_type)
+        .bind(&p.profile_data)
+        .bind(p.firmware_id)
+        .bind(p.software_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(TbError::db)
     }
 
     pub async fn find_by_id(&self, id: Uuid) -> TbResult<Option<DeviceProfile>> {

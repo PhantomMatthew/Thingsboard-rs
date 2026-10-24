@@ -239,7 +239,11 @@ pub async fn evaluate_and_save(
             }
             CfOutputType::ServerAttr => {
                 attr_dao
-                    .save(entity_id, AttributeScope::ServerScope, std::slice::from_ref(&entry))
+                    .save(
+                        entity_id,
+                        AttributeScope::ServerScope,
+                        std::slice::from_ref(&entry),
+                    )
                     .await
             }
         };
@@ -247,7 +251,14 @@ pub async fn evaluate_and_save(
             tracing::warn!(cf_id = %cf.id, "calculated field output save failed: {e}");
             continue;
         }
-        publish_edqs(producer, tenant_id, entity_id, out.output.r#type, &entry, ts);
+        publish_edqs(
+            producer,
+            tenant_id,
+            entity_id,
+            out.output.r#type,
+            &entry,
+            ts,
+        );
         saved.push(SavedOutput {
             output_type: out.output.r#type,
             key: entry.key,
@@ -289,6 +300,7 @@ fn publish_edqs(
                     scope: common_pb::AttributeScope::ServerScope as i32,
                     updated: vec![kv],
                     deleted_keys: vec![],
+                    update_ts: ts,
                 },
             )),
         },
@@ -359,11 +371,9 @@ mod tests {
         );
         // fetcher 补齐 offset → 算
         let out = e
-            .evaluate(&cfg, &[entry("temperature", 1)], &|source| {
-                match source {
-                    ArgumentSource::ServerAttr => vec![entry("offset", 10)],
-                    _ => vec![],
-                }
+            .evaluate(&cfg, &[entry("temperature", 1)], &|source| match source {
+                ArgumentSource::ServerAttr => vec![entry("offset", 10)],
+                _ => vec![],
             })
             .unwrap();
         assert_eq!(out.value, KvValue::Long(11));

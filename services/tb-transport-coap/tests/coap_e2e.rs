@@ -81,10 +81,7 @@ impl CoapDevice {
             p.add_option(CoapOption::UriPath, seg.as_bytes().to_vec());
         }
         for q in queries {
-            p.add_option_as(
-                CoapOption::UriQuery,
-                OptionValueString(q.to_string()),
-            );
+            p.add_option_as(CoapOption::UriQuery, OptionValueString(q.to_string()));
         }
         if let Some(v) = observe {
             p.set_observe_value(v);
@@ -113,6 +110,10 @@ impl CoapDevice {
         payload: Vec<u8>,
     ) -> Packet {
         let p = self.build_request(method, path, queries, observe, payload);
+        self.request_packet(p).await
+    }
+
+    async fn request_packet(&mut self, p: Packet) -> Packet {
         let mid = p.header.message_id;
         self.send(&p).await;
         let start = std::time::Instant::now();
@@ -121,15 +122,13 @@ impl CoapDevice {
                 .await
                 .expect("coap response timeout")
                 .expect("pump closed");
-            if pkt.header.message_id == mid
-                && matches!(pkt.header.code, MessageClass::Response(_))
+            if pkt.header.message_id == mid && matches!(pkt.header.code, MessageClass::Response(_))
             {
                 return pkt;
             }
             assert!(start.elapsed() < Duration::from_secs(5), "no matching ack");
         }
     }
-
 }
 
 fn status(pkt: &Packet) -> ResponseType {
@@ -164,7 +163,9 @@ async fn coap_uplink_and_get_attributes() {
             "/api/v1/COAP_TOKEN/telemetry",
             &[],
             None,
-            json!({"ts": 1700000000000i64, "values": {"temperature": 25}}).to_string().into_bytes(),
+            json!({"ts": 1700000000000i64, "values": {"temperature": 25}})
+                .to_string()
+                .into_bytes(),
         )
         .await;
     assert_eq!(status(&resp), ResponseType::Changed);
@@ -219,8 +220,10 @@ async fn coap_uplink_and_get_attributes() {
             .await
             .unwrap();
         let body: Value = resp.json().await.unwrap_or(Value::Null);
-        body.as_array()
-            .is_some_and(|a| a.iter().any(|e| e["key"] == "firmware" && e["value"] == "1.0.0"))
+        body.as_array().is_some_and(|a| {
+            a.iter()
+                .any(|e| e["key"] == "firmware" && e["value"] == "1.0.0")
+        })
     })
     .await;
 
@@ -281,7 +284,13 @@ async fn coap_uplink_and_get_attributes() {
 
     // 未知路径 → 4.04
     let resp = device
-        .request(RequestType::Get, "/api/v1/COAP_TOKEN/unknown", &[], None, Vec::new())
+        .request(
+            RequestType::Get,
+            "/api/v1/COAP_TOKEN/unknown",
+            &[],
+            None,
+            Vec::new(),
+        )
         .await;
     assert_eq!(status(&resp), ResponseType::NotFound);
 }
@@ -385,13 +394,24 @@ async fn coap_observe_rpc_round_trip() {
     let (core, coap_addr) = start_servers().await;
     let (admin_token, _tenant_id) =
         setup_tenant_admin(&client, &core, "CoapRpc Tenant", "coap-rpc-tenant@tb.io").await;
-    let device_id =
-        create_device_with_token(&client, &core, &admin_token, "coap-rpc-device", "CRPC_TOKEN")
-            .await;
+    let device_id = create_device_with_token(
+        &client,
+        &core,
+        &admin_token,
+        "coap-rpc-device",
+        "CRPC_TOKEN",
+    )
+    .await;
 
     let mut device = CoapDevice::connect(coap_addr).await;
     let resp = device
-        .request(RequestType::Get, "/api/v1/CRPC_TOKEN/rpc", &[], Some(0), Vec::new())
+        .request(
+            RequestType::Get,
+            "/api/v1/CRPC_TOKEN/rpc",
+            &[],
+            Some(0),
+            Vec::new(),
+        )
         .await;
     assert_eq!(status(&resp), ResponseType::Content);
     let obs_token = resp.get_token().to_vec();
@@ -406,7 +426,9 @@ async fn coap_observe_rpc_round_trip() {
         let resp = client
             .post(format!("{core}/api/rpc/twoway/{device_id}"))
             .header("Authorization", bearer(token))
-            .json(&json!({"method": "getStatus", "params": {"verbose": true}, "timeout": timeout_ms}))
+            .json(
+                &json!({"method": "getStatus", "params": {"verbose": true}, "timeout": timeout_ms}),
+            )
             .send()
             .await
             .unwrap();
@@ -463,4 +485,101 @@ async fn coap_observe_rpc_round_trip() {
         );
     };
     assert_eq!(body, json!({"status": "ok", "fw": 3}));
+}
+
+#[tokio::test]
+async fn coap_observe_same_token_is_isolated_between_devices() {
+    let _guard = INTEGRATION_LOCK.lock().await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let (core, coap_addr) = start_servers().await;
+    let (admin_token, _tenant_id) = setup_tenant_admin(
+        &client,
+        &core,
+        "CoAP Observe Isolation",
+        "coap-observe-isolation@tb.io",
+    )
+    .await;
+    let device_a = create_device_with_token(
+        &client,
+        &core,
+        &admin_token,
+        "observe-device-a",
+        "OBSERVE_A",
+    )
+    .await;
+    let device_b = create_device_with_token(
+        &client,
+        &core,
+        &admin_token,
+        "observe-device-b",
+        "OBSERVE_B",
+    )
+    .await;
+
+    let mut device = CoapDevice::connect(coap_addr).await;
+    for token in ["OBSERVE_A", "OBSERVE_B"] {
+        let mut request = device.build_request(
+            RequestType::Get,
+            &format!("/api/v1/{token}/attributes"),
+            &[],
+            Some(0),
+            Vec::new(),
+        );
+        request.set_token(vec![0x42]);
+        let response = device.request_packet(request).await;
+        assert_eq!(status(&response), ResponseType::Content);
+    }
+
+    let response = client
+        .post(format!(
+            "{core}/api/telemetry/DEVICE/{device_a}/attributes/SHARED_SCOPE"
+        ))
+        .header("Authorization", bearer(&admin_token))
+        .json(&json!({"mustNotLeak": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let leaked = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let packet = device.rx.recv().await.expect("pump closed");
+            if is_notification(&packet) && packet.get_token() == [0x42] {
+                return true;
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(!leaked, "device A update reached device B observer");
+
+    let url = format!("{core}/api/telemetry/DEVICE/{device_b}/attributes/SHARED_SCOPE");
+    let start = std::time::Instant::now();
+    loop {
+        let response = client
+            .post(&url)
+            .header("Authorization", bearer(&admin_token))
+            .json(&json!({"deviceB": "online"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        if let Ok(packet) = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let packet = device.rx.recv().await.expect("pump closed");
+                if is_notification(&packet) && packet.get_token() == [0x42] {
+                    return packet;
+                }
+            }
+        })
+        .await
+        {
+            let body: Value = serde_json::from_slice(&packet.payload).unwrap();
+            assert_eq!(body["deviceB"], "online");
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(40),
+            "device B observer did not receive its own update"
+        );
+    }
 }

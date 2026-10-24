@@ -19,45 +19,30 @@ impl RuleChainDao {
 
     pub async fn save(&self, rule_chain: &RuleChain) -> TbResult<RuleChain> {
         let mut r = rule_chain.clone();
-        if self.find_by_id(r.id).await?.is_some() {
-            sqlx::query(
-                "UPDATE rule_chain SET tenant_id=$2, name=$3, first_rule_node_id=$4, root=$5, \
-                 debug_mode=$6, configuration=$7, additional_info=$8 WHERE id=$1",
-            )
-            .bind(r.id)
-            .bind(r.tenant_id)
-            .bind(&r.name)
-            .bind(r.first_rule_node_id)
-            .bind(r.root)
-            .bind(r.debug_mode)
-            .bind(&r.configuration)
-            .bind(&r.additional_info)
-            .execute(&self.pool)
-            .await
-            .map_err(TbError::db)?;
-        } else {
-            if r.created_time == 0 {
-                r.created_time = now_ms();
-            }
-            sqlx::query(
-                "INSERT INTO rule_chain (id, created_time, tenant_id, name, first_rule_node_id, \
-                 root, debug_mode, configuration, additional_info) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
-            )
-            .bind(r.id)
-            .bind(r.created_time)
-            .bind(r.tenant_id)
-            .bind(&r.name)
-            .bind(r.first_rule_node_id)
-            .bind(r.root)
-            .bind(r.debug_mode)
-            .bind(&r.configuration)
-            .bind(&r.additional_info)
-            .execute(&self.pool)
-            .await
-            .map_err(TbError::db)?;
+        if r.created_time == 0 {
+            r.created_time = now_ms();
         }
-        Ok(r)
+        sqlx::query_as::<_, RuleChain>(
+            "INSERT INTO rule_chain (id, created_time, tenant_id, name, first_rule_node_id, \
+             root, debug_mode, configuration, additional_info) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) \
+             ON CONFLICT (id) DO UPDATE SET tenant_id=EXCLUDED.tenant_id, name=EXCLUDED.name, \
+             first_rule_node_id=EXCLUDED.first_rule_node_id, root=EXCLUDED.root, \
+             debug_mode=EXCLUDED.debug_mode, configuration=EXCLUDED.configuration, \
+             additional_info=EXCLUDED.additional_info RETURNING *",
+        )
+        .bind(r.id)
+        .bind(r.created_time)
+        .bind(r.tenant_id)
+        .bind(&r.name)
+        .bind(r.first_rule_node_id)
+        .bind(r.root)
+        .bind(r.debug_mode)
+        .bind(&r.configuration)
+        .bind(&r.additional_info)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(TbError::db)
     }
 
     pub async fn find_by_id(&self, id: Uuid) -> TbResult<Option<RuleChain>> {
@@ -200,12 +185,14 @@ impl RuleChainDao {
         if r.created_time == 0 {
             r.created_time = now_ms();
         }
-        sqlx::query(
+        sqlx::query_as::<_, RuleChain>(
             "INSERT INTO rule_chain (id, created_time, tenant_id, name, first_rule_node_id, \
              root, debug_mode, configuration, additional_info) \
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) \
-             ON CONFLICT (id) DO UPDATE SET tenant_id=$3, name=$4, first_rule_node_id=$5, \
-             root=$6, debug_mode=$7, configuration=$8, additional_info=$9",
+             ON CONFLICT (id) DO UPDATE SET tenant_id=EXCLUDED.tenant_id, name=EXCLUDED.name, \
+             first_rule_node_id=EXCLUDED.first_rule_node_id, root=EXCLUDED.root, \
+             debug_mode=EXCLUDED.debug_mode, configuration=EXCLUDED.configuration, \
+             additional_info=EXCLUDED.additional_info RETURNING *",
         )
         .bind(r.id)
         .bind(r.created_time)
@@ -216,10 +203,9 @@ impl RuleChainDao {
         .bind(r.debug_mode)
         .bind(&r.configuration)
         .bind(&r.additional_info)
-        .execute(&mut **tx)
+        .fetch_one(&mut **tx)
         .await
-        .map_err(TbError::db)?;
-        Ok(r)
+        .map_err(TbError::db)
     }
 
     pub async fn delete_by_id(&self, id: Uuid) -> TbResult<bool> {
@@ -280,48 +266,32 @@ impl RuleNodeDao {
 
     pub async fn save(&self, rule_node: &RuleNode) -> TbResult<RuleNode> {
         let mut n = rule_node.clone();
-        if self.find_by_id(n.id).await?.is_some() {
-            sqlx::query(
-                "UPDATE rule_node SET rule_chain_id=$2, type=$3, name=$4, debug_mode=$5, \
-                 singleton_mode=$6, queue_name=$7, configuration=$8, additional_info=$9 \
-                 WHERE id=$1",
-            )
-            .bind(n.id)
-            .bind(n.rule_chain_id)
-            .bind(&n.r#type)
-            .bind(&n.name)
-            .bind(n.debug_mode)
-            .bind(n.singleton_mode)
-            .bind(&n.queue_name)
-            .bind(&n.configuration)
-            .bind(&n.additional_info)
-            .execute(&self.pool)
-            .await
-            .map_err(TbError::db)?;
-        } else {
-            if n.created_time == 0 {
-                n.created_time = now_ms();
-            }
-            sqlx::query(
-                "INSERT INTO rule_node (id, created_time, rule_chain_id, type, name, debug_mode, \
-                 singleton_mode, queue_name, configuration, additional_info) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
-            )
-            .bind(n.id)
-            .bind(n.created_time)
-            .bind(n.rule_chain_id)
-            .bind(&n.r#type)
-            .bind(&n.name)
-            .bind(n.debug_mode)
-            .bind(n.singleton_mode)
-            .bind(&n.queue_name)
-            .bind(&n.configuration)
-            .bind(&n.additional_info)
-            .execute(&self.pool)
-            .await
-            .map_err(TbError::db)?;
+        if n.created_time == 0 {
+            n.created_time = now_ms();
         }
-        Ok(n)
+        sqlx::query_as::<_, RuleNode>(
+            "INSERT INTO rule_node (id, created_time, rule_chain_id, type, name, debug_mode, \
+             singleton_mode, queue_name, configuration, additional_info) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) \
+             ON CONFLICT (id) DO UPDATE SET rule_chain_id=EXCLUDED.rule_chain_id, \
+             type=EXCLUDED.type, name=EXCLUDED.name, debug_mode=EXCLUDED.debug_mode, \
+             singleton_mode=EXCLUDED.singleton_mode, queue_name=EXCLUDED.queue_name, \
+             configuration=EXCLUDED.configuration, additional_info=EXCLUDED.additional_info \
+             RETURNING *",
+        )
+        .bind(n.id)
+        .bind(n.created_time)
+        .bind(n.rule_chain_id)
+        .bind(&n.r#type)
+        .bind(&n.name)
+        .bind(n.debug_mode)
+        .bind(n.singleton_mode)
+        .bind(&n.queue_name)
+        .bind(&n.configuration)
+        .bind(&n.additional_info)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(TbError::db)
     }
 
     pub async fn find_by_id(&self, id: Uuid) -> TbResult<Option<RuleNode>> {

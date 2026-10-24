@@ -9,6 +9,7 @@ pub mod node;
 pub mod nodes;
 pub mod registry;
 pub mod seed;
+mod telemetry_cache;
 
 pub use chain::{ChainLoader, RuleChainState};
 pub use context::NodeContext;

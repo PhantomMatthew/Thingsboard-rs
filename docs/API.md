@@ -104,8 +104,9 @@
 | POST | /api/device/{deviceId}/firmware/{otaId} / software/{otaId} | TA | 给设备指派固件/软件 |
 | POST | /api/deviceProfile/{profileId}/firmware/{otaId} / software/{otaId} | TA | 给配置指派固件/软件 |
 | GET | /api/oauth2/clients | SA/TA | 客户端分页 |
-| POST | /api/oauth2/client | SA/TA | 创建/更新客户端 |
-| GET/DELETE | /api/oauth2/client/{id} | SA/TA | 查/删客户端 |
+| POST | /api/oauth2/client | SA | 创建/更新客户端 |
+| GET | /api/oauth2/client/{id} | SA/TA | 查客户端（TA 限本租户） |
+| DELETE | /api/oauth2/client/{id} | SA | 删客户端 |
 | GET | /api/audit/logs | SA/TA | 审计日志分页（?entityType=&entityId=） |
 | GET | /api/usage/{tenantId} | SA/TA（TA 限本租户） | 用量统计 |
 | POST/GET | /api/edqs/query/entityData | SA/TA/CU | 实体数据查询（代理到 tb-edqs；TA/CU 强制本租户） |

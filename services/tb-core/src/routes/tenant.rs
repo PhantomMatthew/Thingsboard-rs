@@ -119,6 +119,7 @@ async fn delete_tenant(
     if !state.tenant_dao.delete_by_id(id).await? {
         return Err(TbError::NotFound(format!("tenant {id}")).into());
     }
+    crate::edqs::publish_tenant_delete(&state, id);
     audit(
         &state,
         &user,

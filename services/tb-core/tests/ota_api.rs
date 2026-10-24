@@ -148,6 +148,42 @@ async fn ota_api_e2e() {
     let device: Value = resp.json().await.unwrap();
     assert_eq!(device["firmwareId"], ota_id);
 
+    // 仅提交更新接口已有字段时，OTA 绑定与创建时间不得被清空。
+    let resp = client
+        .post(format!("{core}/api/device"))
+        .header("Authorization", bearer(&admin_token))
+        .json(&json!({"id": device_id, "name": "ota-dev-renamed"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let updated: Value = resp.json().await.unwrap();
+    assert_eq!(updated["firmwareId"], ota_id);
+    assert_eq!(updated["createdTime"], device["createdTime"]);
+
+    // DAO 元数据查询本身不读取 data；数据库分块与原文一致。
+    let pool = sqlx::PgPool::connect(TEST_URL).await.unwrap();
+    let ota_dao = tb_dao::OtaPackageDao::new(pool);
+    let ota_uuid = uuid::Uuid::parse_str(&ota_id).unwrap();
+    let metadata = ota_dao.find_meta_by_id(ota_uuid).await.unwrap().unwrap();
+    assert!(metadata.data.is_none());
+    let page = ota_dao
+        .find_meta_by_tenant_filtered(
+            uuid::Uuid::parse_str(&_tenant_id).unwrap(),
+            Some(uuid::Uuid::parse_str(&profile_id).unwrap()),
+            Some("FIRMWARE"),
+            &tb_dao::PageLink::new(0, 10),
+        )
+        .await
+        .unwrap();
+    assert!(page.data.iter().all(|package| package.data.is_none()));
+    let chunk = ota_dao
+        .find_data_chunk(ota_uuid, 1, 16384)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(chunk, fw_data[..16384]);
+
     // 档案级绑定
     let resp = client
         .post(format!(

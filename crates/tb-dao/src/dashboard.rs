@@ -19,48 +19,31 @@ impl DashboardDao {
 
     pub async fn save(&self, dashboard: &Dashboard) -> TbResult<Dashboard> {
         let mut d = dashboard.clone();
-        if self.find_by_id(d.id).await?.is_some() {
-            sqlx::query(
-                "UPDATE dashboard SET tenant_id=$2, title=$3, configuration=$4, \
-                 assigned_customers=$5, mobile_hide=$6, mobile_order=$7, image=$8, \
-                 additional_info=$9 WHERE id=$1",
-            )
-            .bind(d.id)
-            .bind(d.tenant_id)
-            .bind(&d.title)
-            .bind(&d.configuration)
-            .bind(&d.assigned_customers)
-            .bind(d.mobile_hide)
-            .bind(d.mobile_order)
-            .bind(&d.image)
-            .bind(&d.additional_info)
-            .execute(&self.pool)
-            .await
-            .map_err(TbError::db)?;
-        } else {
-            if d.created_time == 0 {
-                d.created_time = now_ms();
-            }
-            sqlx::query(
-                "INSERT INTO dashboard (id, created_time, tenant_id, title, configuration, \
-                 assigned_customers, mobile_hide, mobile_order, image, additional_info) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
-            )
-            .bind(d.id)
-            .bind(d.created_time)
-            .bind(d.tenant_id)
-            .bind(&d.title)
-            .bind(&d.configuration)
-            .bind(&d.assigned_customers)
-            .bind(d.mobile_hide)
-            .bind(d.mobile_order)
-            .bind(&d.image)
-            .bind(&d.additional_info)
-            .execute(&self.pool)
-            .await
-            .map_err(TbError::db)?;
+        if d.created_time == 0 {
+            d.created_time = now_ms();
         }
-        Ok(d)
+        sqlx::query_as::<_, Dashboard>(
+            "INSERT INTO dashboard (id, created_time, tenant_id, title, configuration, \
+             assigned_customers, mobile_hide, mobile_order, image, additional_info) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) \
+             ON CONFLICT (id) DO UPDATE SET tenant_id=EXCLUDED.tenant_id, title=EXCLUDED.title, \
+             configuration=EXCLUDED.configuration, assigned_customers=EXCLUDED.assigned_customers, \
+             mobile_hide=EXCLUDED.mobile_hide, mobile_order=EXCLUDED.mobile_order, \
+             image=EXCLUDED.image, additional_info=EXCLUDED.additional_info RETURNING *",
+        )
+        .bind(d.id)
+        .bind(d.created_time)
+        .bind(d.tenant_id)
+        .bind(&d.title)
+        .bind(&d.configuration)
+        .bind(&d.assigned_customers)
+        .bind(d.mobile_hide)
+        .bind(d.mobile_order)
+        .bind(&d.image)
+        .bind(&d.additional_info)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(TbError::db)
     }
 
     pub async fn find_by_id(&self, id: Uuid) -> TbResult<Option<Dashboard>> {

@@ -20,6 +20,7 @@ async fn edqs_proxy_entity_data_query() {
     let edqs_addr = edqs_listener.local_addr().unwrap();
     unsafe {
         std::env::set_var("TB_EDQS_URL", format!("http://{edqs_addr}"));
+        std::env::set_var("TB_EDQS_API_KEY", "edqs-proxy-test-key");
     }
 
     let brokers = std::env::var("TB_KAFKA_BROKERS").unwrap_or_else(|_| "localhost:29092".into());
@@ -60,7 +61,7 @@ async fn edqs_proxy_entity_data_query() {
         .connect(TEST_URL)
         .await
         .expect("connect test db");
-    let edqs_state = tb_edqs::EdqsState::default();
+    let edqs_state = tb_edqs::EdqsState::default().with_api_key("edqs-proxy-test-key");
     tb_edqs::snapshot::load_snapshot(&pool, &edqs_state)
         .await
         .unwrap();

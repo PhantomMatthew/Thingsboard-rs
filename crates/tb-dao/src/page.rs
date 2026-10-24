@@ -25,11 +25,11 @@ impl PageLink {
     }
 
     pub fn offset(&self) -> i64 {
-        self.page.max(0) * self.page_size.max(1)
+        self.page.max(0).saturating_mul(self.limit())
     }
 
     pub fn limit(&self) -> i64 {
-        self.page_size.max(1)
+        self.page_size.clamp(1, 1000)
     }
 
     /// 排序列白名单校验：命中白名单返回该列，否则回退 created_time。
@@ -70,13 +70,13 @@ pub struct PageData<T> {
 
 impl<T> PageData<T> {
     pub fn new(data: Vec<T>, total_elements: i64, page: i64, page_size: i64) -> Self {
-        let page_size = page_size.max(1);
+        let page_size = page_size.clamp(1, 1000);
         let total_pages = (total_elements + page_size - 1) / page_size;
         Self {
             data,
             total_pages,
             total_elements,
-            has_next: page + 1 < total_pages,
+            has_next: page.max(0).saturating_add(1) < total_pages,
         }
     }
 }
@@ -113,5 +113,18 @@ mod tests {
         assert!(p.has_next);
         let p = PageData::new(vec![5], 5, 2, 2);
         assert!(!p.has_next);
+    }
+
+    #[test]
+    fn page_size_and_offset_are_bounded() {
+        let link = PageLink::new(i64::MAX, i64::MAX);
+        assert_eq!(link.limit(), 1000);
+        assert_eq!(link.offset(), i64::MAX.saturating_mul(1000));
+        assert_eq!(PageLink::new(-1, 0).limit(), 1);
+        assert_eq!(PageLink::new(-1, 0).offset(), 0);
+
+        let page = PageData::new(Vec::<i32>::new(), 1001, 0, 5000);
+        assert_eq!(page.total_pages, 2);
+        assert!(page.has_next);
     }
 }

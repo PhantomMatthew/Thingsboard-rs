@@ -195,6 +195,7 @@ async fn start_engine(
         Duration::from_millis(500),
     )
     .await
+    .unwrap()
 }
 
 #[tokio::test]
@@ -581,6 +582,29 @@ async fn debug_events_rest_e2e() {
         .find(|c| c["name"] == "Root Rule Chain")
         .unwrap();
     let chain_id = root["id"].as_str().unwrap().to_string();
+
+    let resp = client
+        .put(format!("{base}/api/ruleChain/{chain_id}/nodes"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&json!({
+            "nodes": [{
+                "type": "action.math",
+                "name": "broken math",
+                "configuration": {"operation": "ADD", "fields": [], "result_key": "sum"},
+            }],
+            "edges": [],
+            "firstNodeIndex": 0,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let error: Value = resp.json().await.unwrap();
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("broken math"))
+    );
 
     let put_body = json!({
         "nodes": [

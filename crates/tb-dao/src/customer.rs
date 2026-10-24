@@ -19,54 +19,35 @@ impl CustomerDao {
 
     pub async fn save(&self, customer: &Customer) -> TbResult<Customer> {
         let mut c = customer.clone();
-        if self.find_by_id(c.id).await?.is_some() {
-            sqlx::query(
-                "UPDATE customer SET tenant_id=$2, title=$3, country=$4, state=$5, city=$6, \
-                 address=$7, address2=$8, zip=$9, phone=$10, email=$11, additional_info=$12 \
-                 WHERE id=$1",
-            )
-            .bind(c.id)
-            .bind(c.tenant_id)
-            .bind(&c.title)
-            .bind(&c.country)
-            .bind(&c.state)
-            .bind(&c.city)
-            .bind(&c.address)
-            .bind(&c.address2)
-            .bind(&c.zip)
-            .bind(&c.phone)
-            .bind(&c.email)
-            .bind(&c.additional_info)
-            .execute(&self.pool)
-            .await
-            .map_err(TbError::db)?;
-        } else {
-            if c.created_time == 0 {
-                c.created_time = now_ms();
-            }
-            sqlx::query(
-                "INSERT INTO customer (id, created_time, tenant_id, title, country, state, city, \
-                 address, address2, zip, phone, email, additional_info) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
-            )
-            .bind(c.id)
-            .bind(c.created_time)
-            .bind(c.tenant_id)
-            .bind(&c.title)
-            .bind(&c.country)
-            .bind(&c.state)
-            .bind(&c.city)
-            .bind(&c.address)
-            .bind(&c.address2)
-            .bind(&c.zip)
-            .bind(&c.phone)
-            .bind(&c.email)
-            .bind(&c.additional_info)
-            .execute(&self.pool)
-            .await
-            .map_err(TbError::db)?;
+        if c.created_time == 0 {
+            c.created_time = now_ms();
         }
-        Ok(c)
+        sqlx::query_as::<_, Customer>(
+            "INSERT INTO customer (id, created_time, tenant_id, title, country, state, city, \
+             address, address2, zip, phone, email, additional_info) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
+             ON CONFLICT (id) DO UPDATE SET tenant_id=EXCLUDED.tenant_id, title=EXCLUDED.title, \
+             country=EXCLUDED.country, state=EXCLUDED.state, city=EXCLUDED.city, \
+             address=EXCLUDED.address, address2=EXCLUDED.address2, zip=EXCLUDED.zip, \
+             phone=EXCLUDED.phone, email=EXCLUDED.email, additional_info=EXCLUDED.additional_info \
+             RETURNING *",
+        )
+        .bind(c.id)
+        .bind(c.created_time)
+        .bind(c.tenant_id)
+        .bind(&c.title)
+        .bind(&c.country)
+        .bind(&c.state)
+        .bind(&c.city)
+        .bind(&c.address)
+        .bind(&c.address2)
+        .bind(&c.zip)
+        .bind(&c.phone)
+        .bind(&c.email)
+        .bind(&c.additional_info)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(TbError::db)
     }
 
     pub async fn find_by_id(&self, id: Uuid) -> TbResult<Option<Customer>> {

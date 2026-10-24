@@ -139,6 +139,22 @@ async fn mqtt_transport_telemetry_and_attributes() {
         matches!(p, Packet::SubAck(_))
     })
     .await;
+    device
+        .client
+        .subscribe("v1/devices/me/unknown", QoS::AtMostOnce)
+        .await
+        .unwrap();
+    let pkt = wait_for(&mut device.rx, Duration::from_secs(10), |p| {
+        matches!(p, Packet::SubAck(_))
+    })
+    .await;
+    match pkt {
+        Packet::SubAck(ack) => assert_eq!(
+            ack.return_codes,
+            vec![rumqttc::SubscribeReasonCode::Failure]
+        ),
+        other => panic!("unexpected {other:?}"),
+    }
 
     // 遥测上行 QoS1：{k:v}
     device
@@ -245,6 +261,39 @@ async fn mqtt_transport_telemetry_and_attributes() {
         })
     })
     .await;
+
+    let resp = client
+        .post(format!(
+            "{core}/api/telemetry/DEVICE/{device_id}/attributes/SHARED_SCOPE"
+        ))
+        .header("Authorization", bearer(&admin_token))
+        .json(&json!({"targetTemp": 60}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    device
+        .client
+        .publish(
+            "v1/devices/me/attributes/request/42",
+            QoS::AtLeastOnce,
+            false,
+            json!({"clientKeys": "firmware", "sharedKeys": "targetTemp"}).to_string(),
+        )
+        .await
+        .unwrap();
+    let response = wait_for(&mut device.rx, Duration::from_secs(15), |packet| {
+        matches!(packet, Packet::Publish(p) if p.topic == "v1/devices/me/attributes/response/42")
+    })
+    .await;
+    let Packet::Publish(response) = response else {
+        unreachable!()
+    };
+    let body: Value = serde_json::from_slice(&response.payload).unwrap();
+    assert_eq!(
+        body,
+        json!({"client": {"firmware": "2.0"}, "shared": {"targetTemp": 60}})
+    );
 
     // 服务端 RPC 上行 QoS1
     device

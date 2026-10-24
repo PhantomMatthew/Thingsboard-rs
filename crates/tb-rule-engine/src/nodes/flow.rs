@@ -86,7 +86,11 @@ impl Node for RuleChainNode {
         };
         msg.metadata
             .insert(CHAIN_DEPTH_KEY.into(), (depth + 1).to_string());
-        chain::execute(ctx, &state, first, msg).await;
+        let failure_msg = msg.clone();
+        if let Err(e) = chain::execute(ctx, &state, first, msg).await {
+            tracing::warn!(chain_id = %self.rule_chain_id, "target rule chain execution failed: {e}");
+            return vec![("Failure".into(), failure_msg)];
+        }
         vec![]
     }
 }

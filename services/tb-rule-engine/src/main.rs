@@ -3,6 +3,7 @@
 use sqlx::postgres::PgPoolOptions;
 
 const DEFAULT_DATABASE_URL: &str = "postgres://thingsboard:thingsboard@localhost:5433/thingsboard";
+const DEFAULT_REDIS_URL: &str = "redis://localhost:16379";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -17,6 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_url =
         std::env::var("TB_DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.into());
     let queue = std::env::var("TB_RE_QUEUE").unwrap_or_else(|_| "Main".into());
+    let redis_url = std::env::var("TB_REDIS_URL").unwrap_or_else(|_| DEFAULT_REDIS_URL.into());
 
     let pool = PgPoolOptions::new()
         .max_connections(10)
@@ -24,8 +26,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     tb_dao::migrate(&pool).await?;
     tracing::info!("migrations applied");
+    let redis = redis::Client::open(redis_url)?;
+    let redis_manager = redis::aio::ConnectionManager::new(redis).await?;
 
-    let handle = tb_rule_engine_server::start_rule_engine(&brokers, pool, &queue).await;
+    let handle =
+        tb_rule_engine_server::start_rule_engine(&brokers, pool, &queue, redis_manager).await?;
     tokio::signal::ctrl_c().await?;
     handle.abort();
     Ok(())

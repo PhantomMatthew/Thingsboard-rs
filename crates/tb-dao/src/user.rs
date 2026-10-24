@@ -19,47 +19,31 @@ impl UserDao {
 
     pub async fn save(&self, user: &User) -> TbResult<User> {
         let mut u = user.clone();
-        if self.find_by_id(u.id).await?.is_some() {
-            sqlx::query(
-                "UPDATE tb_user SET tenant_id=$2, customer_id=$3, authority=$4, email=$5, \
-                 first_name=$6, last_name=$7, phone=$8, additional_info=$9 WHERE id=$1",
-            )
-            .bind(u.id)
-            .bind(u.tenant_id)
-            .bind(u.customer_id)
-            .bind(u.authority)
-            .bind(&u.email)
-            .bind(&u.first_name)
-            .bind(&u.last_name)
-            .bind(&u.phone)
-            .bind(&u.additional_info)
-            .execute(&self.pool)
-            .await
-            .map_err(TbError::db)?;
-        } else {
-            if u.created_time == 0 {
-                u.created_time = now_ms();
-            }
-            sqlx::query(
-                "INSERT INTO tb_user (id, created_time, tenant_id, customer_id, authority, \
-                 email, first_name, last_name, phone, additional_info) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
-            )
-            .bind(u.id)
-            .bind(u.created_time)
-            .bind(u.tenant_id)
-            .bind(u.customer_id)
-            .bind(u.authority)
-            .bind(&u.email)
-            .bind(&u.first_name)
-            .bind(&u.last_name)
-            .bind(&u.phone)
-            .bind(&u.additional_info)
-            .execute(&self.pool)
-            .await
-            .map_err(TbError::db)?;
+        if u.created_time == 0 {
+            u.created_time = now_ms();
         }
-        Ok(u)
+        sqlx::query_as::<_, User>(
+            "INSERT INTO tb_user (id, created_time, tenant_id, customer_id, authority, \
+             email, first_name, last_name, phone, additional_info) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) \
+             ON CONFLICT (id) DO UPDATE SET tenant_id=EXCLUDED.tenant_id, \
+             customer_id=EXCLUDED.customer_id, authority=EXCLUDED.authority, email=EXCLUDED.email, \
+             first_name=EXCLUDED.first_name, last_name=EXCLUDED.last_name, phone=EXCLUDED.phone, \
+             additional_info=EXCLUDED.additional_info RETURNING *",
+        )
+        .bind(u.id)
+        .bind(u.created_time)
+        .bind(u.tenant_id)
+        .bind(u.customer_id)
+        .bind(u.authority)
+        .bind(&u.email)
+        .bind(&u.first_name)
+        .bind(&u.last_name)
+        .bind(&u.phone)
+        .bind(&u.additional_info)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(TbError::db)
     }
 
     pub async fn find_by_id(&self, id: Uuid) -> TbResult<Option<User>> {

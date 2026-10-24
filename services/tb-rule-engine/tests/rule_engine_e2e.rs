@@ -141,7 +141,8 @@ async fn rule_engine_e2e() {
         &format!("tb-rule-engine-e2e-{run_id}"),
         Duration::from_millis(500),
     )
-    .await;
+    .await
+    .unwrap();
     // 等 consumer group join
     tokio::time::sleep(Duration::from_secs(2)).await;
 

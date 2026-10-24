@@ -124,6 +124,7 @@ async fn handle_request(
             )
         }
         Some(Request::ValidateX509(_)) => {
+            tracing::warn!("X509 credential validation is not supported");
             pb::transport_api_response_msg::Response::ValidateCredentials(
                 pb::ValidateCredentialsResponse {
                     valid: false,
@@ -315,6 +316,17 @@ async fn validate_token(state: &AppState, token: &str) -> pb::ValidateCredential
     build_valid_response(state, &credentials).await
 }
 
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let mut difference = left.len() ^ right.len();
+    for i in 0..left.len().max(right.len()) {
+        difference |=
+            usize::from(left.get(i).copied().unwrap_or(0) ^ right.get(i).copied().unwrap_or(0));
+    }
+    difference == 0
+}
+
 /// Java 兼容语义：先按 MQTT_BASIC 的 credentials_id = "{clientId}|{userName}" 查并比对
 /// credentials_value JSON 里的 password；查不到再按 userName 当 ACCESS_TOKEN 查。
 async fn validate_mqtt_basic(
@@ -332,7 +344,9 @@ async fn validate_mqtt_basic(
             .is_some_and(|body| {
                 body["clientId"].as_str() == Some(r.client_id.as_str())
                     && body["userName"].as_str() == Some(r.username.as_str())
-                    && body["password"].as_str() == Some(r.password.as_str())
+                    && body["password"]
+                        .as_str()
+                        .is_some_and(|password| constant_time_eq(password, &r.password))
             });
         if ok {
             return build_valid_response(state, &credentials).await;
@@ -388,10 +402,23 @@ async fn get_or_create_gateway_device(
         credentials_id: Some(Uuid::now_v7().to_string()),
         credentials_value: None,
     };
-    let (saved, _) = state
+    let (saved, _) = match state
         .device_credentials_dao
         .save_device_with_credentials(&device, &credentials)
-        .await?;
+        .await
+    {
+        Ok(saved) => saved,
+        Err(e) => {
+            if let Some(existing) = state
+                .device_dao
+                .find_by_name(tenant_id, &r.device_name)
+                .await?
+            {
+                return Ok(device_proto(&existing));
+            }
+            return Err(e);
+        }
+    };
     let relation = EntityRelation {
         from_id: gateway_id,
         from_type: EntityType::Device,
@@ -448,25 +475,34 @@ async fn get_ota_package(
     Ok(pkg.as_ref().map(ota_proto))
 }
 
+const MAX_OTA_CHUNK_SIZE: i32 = 1024 * 1024;
+
+fn ota_chunk_location(chunk_index: i32, chunk_size: i32) -> Option<(i32, i32)> {
+    let chunk_size = chunk_size.clamp(1, MAX_OTA_CHUNK_SIZE);
+    let start = i64::from(chunk_index.max(0)) * i64::from(chunk_size);
+    let sql_start = i32::try_from(start.saturating_add(1)).ok()?;
+    Some((sql_start, chunk_size))
+}
+
 /// OTA 分块：越界/包不存在返回空 data。
 async fn get_ota_chunk(state: &AppState, r: &pb::GetOtaChunkRequest) -> pb::GetOtaChunkResponse {
     let empty = pb::GetOtaChunkResponse { data: Vec::new() };
     let Ok(id) = Uuid::parse_str(&r.ota_package_id) else {
         return empty;
     };
-    let Ok(Some(pkg)) = state.ota_package_dao.find_by_id(id).await else {
+    let Some((sql_start, chunk_size)) = ota_chunk_location(r.chunk_index, r.chunk_size) else {
         return empty;
     };
-    let Some(data) = pkg.data else { return empty };
-    let chunk_size = r.chunk_size.max(1) as usize;
-    let start = r.chunk_index.max(0) as usize * chunk_size;
-    if start >= data.len() {
-        return empty;
-    }
-    let end = (start + chunk_size).min(data.len());
-    pb::GetOtaChunkResponse {
-        data: data[start..end].to_vec(),
-    }
+    let data = state
+        .ota_package_dao
+        .find_data_chunk(id, sql_start, chunk_size)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(%id, "read OTA chunk failed: {e}");
+            None
+        })
+        .unwrap_or_default();
+    pb::GetOtaChunkResponse { data }
 }
 
 /// 设备 provisioning：profile_data.provisionConfiguration 校验 key/secret；
@@ -574,5 +610,30 @@ async fn provision_device(
             error_msg: String::new(),
         },
         _ => failure("credentials missing"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mqtt_password_comparison_handles_content_and_length() {
+        assert!(constant_time_eq("secret", "secret"));
+        assert!(constant_time_eq("密码", "密码"));
+        assert!(!constant_time_eq("secret", "secreu"));
+        assert!(!constant_time_eq("secret", "secret2"));
+        assert!(!constant_time_eq("", "non-empty"));
+    }
+
+    #[test]
+    fn ota_chunk_size_is_bounded_and_offset_is_checked() {
+        assert_eq!(ota_chunk_location(1, 4096), Some((4097, 4096)));
+        assert_eq!(
+            ota_chunk_location(0, MAX_OTA_CHUNK_SIZE * 2),
+            Some((1, MAX_OTA_CHUNK_SIZE))
+        );
+        assert_eq!(ota_chunk_location(-1, -1), Some((1, 1)));
+        assert_eq!(ota_chunk_location(i32::MAX, MAX_OTA_CHUNK_SIZE), None);
     }
 }

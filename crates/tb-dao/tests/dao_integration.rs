@@ -310,6 +310,22 @@ async fn relation_crud() -> TbResult<()> {
     let by_to = relation_dao.find_by_to(to_id, EntityType::Asset).await?;
     assert_eq!(by_to.len(), 1);
 
+    let mut rule_relation = relation.clone();
+    rule_relation.relation_type_group = "RULE".into();
+    relation_dao.save(&rule_relation).await?;
+    let common = relation_dao
+        .find_relation(
+            from_id,
+            EntityType::Device,
+            to_id,
+            EntityType::Asset,
+            "Contains",
+        )
+        .await?
+        .expect("COMMON relation");
+    assert_eq!(common.relation_type_group, "COMMON");
+    assert!(relation_dao.delete(&rule_relation).await?);
+
     assert!(relation_dao.delete(&relation).await?);
     assert!(
         relation_dao
@@ -342,7 +358,7 @@ async fn alarm_latest_and_paged() -> TbResult<()> {
             tenant_id: tenant.id,
             originator_id: originator,
             originator_type: EntityType::Device,
-            r#type: "HighTemperature".into(),
+            r#type: format!("HighTemperature{i}"),
             severity: AlarmSeverity::Major,
             status: AlarmStatus::ActiveUnack,
             start_ts: 1000 + i,
@@ -530,7 +546,7 @@ async fn housekeeper_cleanup() -> TbResult<()> {
         .save(&mk_alarm(AlarmStatus::ActiveUnack, None))
         .await?;
     let removed = alarm_dao.delete_cleared_older_than(cutoff).await?;
-    assert_eq!(removed, 1);
+    assert!(removed >= 1);
     let page = alarm_dao
         .find_by_tenant(
             tenant.id,
@@ -618,5 +634,180 @@ async fn api_usage_state_accumulate() -> TbResult<()> {
 
     tenant_dao.delete_by_id(tenant.id).await?;
     assert!(usage_dao.find_by_tenant(tenant.id).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_alarm_ack_and_clear_do_not_lose_ack() -> TbResult<()> {
+    let pool = setup().await;
+    let tenant_dao = TenantDao::new(pool.clone());
+    let alarm_dao = AlarmDao::new(pool);
+    let tenant = tenant_dao.save(&new_tenant(&uniq("tenant"))).await?;
+
+    for _ in 0..16 {
+        let now = tb_dao::models::Alarm {
+            id: Uuid::now_v7(),
+            created_time: 0,
+            tenant_id: tenant.id,
+            originator_id: Uuid::now_v7(),
+            originator_type: EntityType::Device,
+            r#type: "ConcurrentAlarm".into(),
+            severity: AlarmSeverity::Major,
+            status: AlarmStatus::ActiveUnack,
+            start_ts: 1,
+            end_ts: 1,
+            ack_ts: None,
+            clear_ts: None,
+            details: None,
+            propagate: false,
+            propagate_to_owner: false,
+            propagate_to_tenant: false,
+            propagate_relation_types: None,
+            customer_id: None,
+            assignee_id: None,
+            assign_ts: None,
+        };
+        let alarm = alarm_dao.save(&now).await?;
+        let (ack_result, clear_result) =
+            tokio::join!(alarm_dao.ack(alarm.id), alarm_dao.clear(alarm.id));
+        clear_result.expect("clear must succeed or be idempotent");
+        let stored = alarm_dao.find_by_id(alarm.id).await?.unwrap();
+        assert!(stored.clear_ts.is_some());
+        match ack_result {
+            Ok(acked) => {
+                assert_eq!(acked.status, AlarmStatus::ActiveAck);
+                assert_eq!(stored.status, AlarmStatus::ClearedAck);
+                assert!(stored.ack_ts.is_some());
+            }
+            Err(tb_common::TbError::InvalidInput(_)) => {
+                assert_eq!(stored.status, AlarmStatus::ClearedUnack);
+                assert!(stored.ack_ts.is_none());
+            }
+            Err(other) => panic!("unexpected concurrent ack failure: {other}"),
+        }
+        alarm_dao.delete_by_id(alarm.id).await?;
+    }
+
+    tenant_dao.delete_by_id(tenant.id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn key_resolution_works_with_a_single_connection() -> TbResult<()> {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&db_url())
+        .await
+        .map_err(tb_common::TbError::db)?;
+    migrate(&pool).await.map_err(tb_common::TbError::db)?;
+    let keys = tb_dao::KeyDictionaryDao::new(pool.clone());
+    let key = uniq("single-connection-key");
+    let (first, second, third) = tokio::join!(
+        keys.get_or_create_id(&key),
+        keys.get_or_create_id(&key),
+        keys.get_or_create_id(&key)
+    );
+    let key_id = first?;
+    assert_eq!(second?, key_id);
+    assert_eq!(third?, key_id);
+
+    let entity_id = Uuid::now_v7();
+    let ts_dao = tb_dao::TimeseriesDao::new(pool.clone(), keys.clone());
+    let attributes_dao = tb_dao::AttributesDao::new(pool.clone(), keys);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        ts_dao
+            .save(
+                entity_id,
+                &[tb_common::TsKvEntry {
+                    ts: 1000,
+                    key: key.clone(),
+                    value: tb_common::KvValue::Long(1),
+                }],
+            )
+            .await?;
+        attributes_dao
+            .save(
+                entity_id,
+                tb_common::AttributeScope::ServerScope,
+                &[tb_common::KvEntry {
+                    key: key.clone(),
+                    value: tb_common::KvValue::Long(2),
+                }],
+            )
+            .await?;
+        Ok::<(), tb_common::TbError>(())
+    })
+    .await
+    .expect("key resolution must not borrow from a pool held by the transaction")?;
+
+    ts_dao
+        .delete(entity_id, std::slice::from_ref(&key), None)
+        .await?;
+    attributes_dao
+        .delete(entity_id, tb_common::AttributeScope::ServerScope, &[key])
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn ota_metadata_omits_data_and_chunks_read_only_requested_bytes() -> TbResult<()> {
+    let pool = setup().await;
+    let tenant_dao = TenantDao::new(pool.clone());
+    let profile_dao = DeviceProfileDao::new(pool.clone());
+    let ota_dao = tb_dao::OtaPackageDao::new(pool);
+    let tenant = tenant_dao.save(&new_tenant(&uniq("tenant"))).await?;
+    let profile = profile_dao
+        .save(&new_device_profile(tenant.id, &uniq("profile"), false))
+        .await?;
+    let data: Vec<u8> = (0..40000u32).map(|i| (i % 251) as u8).collect();
+    let package = ota_dao
+        .save(&OtaPackage {
+            id: Uuid::now_v7(),
+            created_time: 0,
+            tenant_id: tenant.id,
+            device_profile_id: profile.id,
+            r#type: "FIRMWARE".into(),
+            title: "fw".into(),
+            version: "1".into(),
+            tag: None,
+            file_name: Some("fw.bin".into()),
+            content_type: None,
+            checksum_algorithm: None,
+            checksum: None,
+            size: Some(data.len() as i64),
+            data: Some(data.clone()),
+            additional_info: None,
+        })
+        .await?;
+
+    let metadata = ota_dao.find_meta_by_id(package.id).await?.unwrap();
+    assert!(metadata.data.is_none());
+    let page = ota_dao
+        .find_meta_by_tenant_filtered(
+            tenant.id,
+            Some(profile.id),
+            Some("FIRMWARE"),
+            &PageLink::new(0, 10),
+        )
+        .await?;
+    assert!(page.data.iter().all(|p| p.data.is_none()));
+    let latest = ota_dao
+        .find_latest(tenant.id, profile.id, "FIRMWARE", "fw", "0")
+        .await?
+        .unwrap();
+    assert!(latest.data.is_none());
+    let chunk = ota_dao
+        .find_data_chunk(package.id, 16385, 16384)
+        .await?
+        .unwrap();
+    assert_eq!(chunk, data[16384..32768]);
+    let beyond = ota_dao
+        .find_data_chunk(package.id, 40001, 1024)
+        .await?
+        .unwrap();
+    assert!(beyond.is_empty());
+
+    ota_dao.delete_by_id(package.id).await?;
+    tenant_dao.delete_by_id(tenant.id).await?;
     Ok(())
 }

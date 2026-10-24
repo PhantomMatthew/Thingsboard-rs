@@ -19,40 +19,26 @@ impl AssetProfileDao {
 
     pub async fn save(&self, profile: &AssetProfile) -> TbResult<AssetProfile> {
         let mut p = profile.clone();
-        if self.find_by_id(p.id).await?.is_some() {
-            sqlx::query(
-                "UPDATE asset_profile SET tenant_id=$2, name=$3, description=$4, is_default=$5, \
-                 profile_data=$6 WHERE id=$1",
-            )
-            .bind(p.id)
-            .bind(p.tenant_id)
-            .bind(&p.name)
-            .bind(&p.description)
-            .bind(p.is_default)
-            .bind(&p.profile_data)
-            .execute(&self.pool)
-            .await
-            .map_err(TbError::db)?;
-        } else {
-            if p.created_time == 0 {
-                p.created_time = now_ms();
-            }
-            sqlx::query(
-                "INSERT INTO asset_profile (id, created_time, tenant_id, name, description, \
-                 is_default, profile_data) VALUES ($1,$2,$3,$4,$5,$6,$7)",
-            )
-            .bind(p.id)
-            .bind(p.created_time)
-            .bind(p.tenant_id)
-            .bind(&p.name)
-            .bind(&p.description)
-            .bind(p.is_default)
-            .bind(&p.profile_data)
-            .execute(&self.pool)
-            .await
-            .map_err(TbError::db)?;
+        if p.created_time == 0 {
+            p.created_time = now_ms();
         }
-        Ok(p)
+        sqlx::query_as::<_, AssetProfile>(
+            "INSERT INTO asset_profile (id, created_time, tenant_id, name, description, \
+             is_default, profile_data) VALUES ($1,$2,$3,$4,$5,$6,$7) \
+             ON CONFLICT (id) DO UPDATE SET tenant_id=EXCLUDED.tenant_id, name=EXCLUDED.name, \
+             description=EXCLUDED.description, is_default=EXCLUDED.is_default, \
+             profile_data=EXCLUDED.profile_data RETURNING *",
+        )
+        .bind(p.id)
+        .bind(p.created_time)
+        .bind(p.tenant_id)
+        .bind(&p.name)
+        .bind(&p.description)
+        .bind(p.is_default)
+        .bind(&p.profile_data)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(TbError::db)
     }
 
     pub async fn find_by_id(&self, id: Uuid) -> TbResult<Option<AssetProfile>> {

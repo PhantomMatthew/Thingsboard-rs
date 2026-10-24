@@ -87,7 +87,9 @@ pub async fn start_servers() -> (String, SocketAddr) {
         .expect("bind udp random port");
     let coap_addr = socket.local_addr().unwrap();
     tokio::spawn(async move {
-        tb_transport_coap::serve(transport_state, socket).await.unwrap();
+        tb_transport_coap::serve(transport_state, socket)
+            .await
+            .unwrap();
     });
 
     // 等 Kafka consumer group 完成 join（auto.offset.reset=latest，未 join 会丢早到的消息）。

@@ -1,43 +1,107 @@
 //! EDQS 事件发布：实体/属性/latest 遥测变更同步到读模型。
-//! fire-and-forget + 超时保护，失败仅 warn —— edqs 是读模型，不阻塞主链路。
+//! 单个有界通道 + 专用任务串行发送；失败或队列满仅丢弃并 warn，不阻塞主链路。
 
+use std::future::Future;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use tb_common::{AttributeScope, EntityType, KvEntry, KvValue, TsKvEntry};
 use tb_proto::common as common_pb;
 use tb_proto::edqs as pb;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::AppState;
 
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
+const EVENT_QUEUE_CAPACITY: usize = 100_000;
+
+struct QueuedEvent {
+    state: AppState,
+    tenant_id: Uuid,
+    event: pb::EdqsEventMsg,
+}
+
+static EVENT_QUEUE: OnceLock<mpsc::Sender<QueuedEvent>> = OnceLock::new();
+
+fn spawn_serial_sender<T, F, Fut>(capacity: usize, mut send: F) -> mpsc::Sender<T>
+where
+    T: Send + 'static,
+    F: FnMut(T) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let (tx, mut rx) = mpsc::channel(capacity);
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            send(event).await;
+        }
+    });
+    tx
+}
+
+fn event_sender() -> &'static mpsc::Sender<QueuedEvent> {
+    EVENT_QUEUE.get_or_init(|| spawn_serial_sender(EVENT_QUEUE_CAPACITY, send_event))
+}
+
+async fn send_event(queued: QueuedEvent) {
+    let QueuedEvent {
+        state,
+        tenant_id,
+        event,
+    } = queued;
+    let producer = match state.queue_producer().await {
+        Ok(p) => p.clone(),
+        Err(e) => {
+            tracing::warn!(%tenant_id, "edqs publish skipped, producer unavailable: {e}");
+            return;
+        }
+    };
+    match tokio::time::timeout(
+        PUBLISH_TIMEOUT,
+        tb_queue::edqs::publish_event(&producer, tenant_id, &event),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(%tenant_id, "edqs event publish failed: {e}"),
+        Err(_) => tracing::warn!(%tenant_id, "edqs event publish timed out"),
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
 
 fn kv_proto(key: &str, value: &KvValue) -> common_pb::KeyValueProto {
     // key_id 置 0：edqs 侧以 key 字符串为准。
     tb_proto::convert::kv_to_proto_named(0, key, value)
 }
 
-pub fn publish(state: &AppState, tenant_id: Uuid, event: pb::EdqsEventMsg) {
-    let state = state.clone();
-    tokio::spawn(async move {
-        let producer = match state.queue_producer().await {
-            Ok(p) => p.clone(),
-            Err(e) => {
-                tracing::warn!("edqs publish skipped, producer unavailable: {e}");
-                return;
-            }
-        };
-        match tokio::time::timeout(
-            PUBLISH_TIMEOUT,
-            tb_queue::edqs::publish_event(&producer, tenant_id, &event),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!("edqs event publish failed: {e}"),
-            Err(_) => tracing::warn!("edqs event publish timed out"),
+// EDQS 是可重建的读模型：反压时允许丢失增量，不能反阻塞认证/遥测等主链路。
+fn enqueue<T>(sender: &mpsc::Sender<T>, event: T, tenant_id: Uuid) -> bool {
+    match sender.try_send(event) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            tracing::warn!(%tenant_id, "edqs event queue full; dropping event");
+            false
         }
-    });
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            tracing::warn!(%tenant_id, "edqs event queue closed; dropping event");
+            false
+        }
+    }
+}
+
+pub fn publish(state: &AppState, tenant_id: Uuid, event: pb::EdqsEventMsg) {
+    let queued = QueuedEvent {
+        state: state.clone(),
+        tenant_id,
+        event,
+    };
+    enqueue(event_sender(), queued, tenant_id);
 }
 
 pub fn publish_latest(state: &AppState, tenant_id: Uuid, entity_id: Uuid, entries: &[TsKvEntry]) {
@@ -82,6 +146,7 @@ pub fn publish_attribute_update(
                     scope: common_pb::AttributeScope::from(scope) as i32,
                     updated: updated.iter().map(|e| kv_proto(&e.key, &e.value)).collect(),
                     deleted_keys,
+                    update_ts: now_ms(),
                 },
             )),
         },
@@ -139,4 +204,67 @@ pub fn publish_entity_delete(
             )),
         },
     );
+}
+
+fn tenant_delete_event(tenant_id: Uuid) -> pb::EdqsEventMsg {
+    pb::EdqsEventMsg {
+        tenant_id: tenant_id.to_string(),
+        event: Some(pb::edqs_event_msg::Event::TenantDelete(
+            pb::TenantDeleteMsg {
+                tenant_id: tenant_id.to_string(),
+            },
+        )),
+    }
+}
+
+pub fn publish_tenant_delete(state: &AppState, tenant_id: Uuid) {
+    publish(state, tenant_id, tenant_delete_event(tenant_id));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn serial_sender_preserves_enqueue_order() {
+        let (delivered_tx, mut delivered_rx) = mpsc::unbounded_channel();
+        let tx = spawn_serial_sender(8, move |value: u64| {
+            let delivered = delivered_tx.clone();
+            async move {
+                tokio::task::yield_now().await;
+                delivered.send(value).unwrap();
+            }
+        });
+        for value in 0..32 {
+            tx.send(value).await.unwrap();
+        }
+        drop(tx);
+        for value in 0..32 {
+            assert_eq!(delivered_rx.recv().await, Some(value));
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_queue_drops_when_full() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let tenant_id = Uuid::now_v7();
+        assert!(enqueue(&tx, 1, tenant_id));
+        assert!(!enqueue(&tx, 2, tenant_id));
+        assert_eq!(rx.recv().await, Some(1));
+        assert!(enqueue(&tx, 3, tenant_id));
+        assert_eq!(rx.recv().await, Some(3));
+    }
+
+    #[test]
+    fn tenant_delete_event_contains_tenant_in_envelope_and_payload() {
+        let tenant_id = Uuid::now_v7();
+        let event = tenant_delete_event(tenant_id);
+        assert_eq!(event.tenant_id, tenant_id.to_string());
+        match event.event {
+            Some(pb::edqs_event_msg::Event::TenantDelete(delete)) => {
+                assert_eq!(delete.tenant_id, tenant_id.to_string());
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
 }

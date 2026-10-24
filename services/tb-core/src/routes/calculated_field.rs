@@ -35,6 +35,7 @@ pub fn router() -> Router<AppState> {
 pub struct SaveCalculatedFieldRequest {
     pub id: Option<Uuid>,
     pub entity_id: Uuid,
+    pub entity_type: Option<EntityType>,
     pub name: String,
     pub configuration: Value,
 }
@@ -51,6 +52,13 @@ async fn save_calculated_field(
         )
         .into());
     }
+    let entity_type = match req.entity_type {
+        Some(entity_type) => entity_type,
+        None if state.device_dao.find_by_id(req.entity_id).await?.is_some() => EntityType::Device,
+        None => EntityType::Asset,
+    };
+    crate::routes::telemetry::check_entity_access(&state, &user, entity_type, req.entity_id)
+        .await?;
     let (id, created_time) = match req.id {
         Some(id) => {
             let existing = load_and_check(&state, &user, id).await?;

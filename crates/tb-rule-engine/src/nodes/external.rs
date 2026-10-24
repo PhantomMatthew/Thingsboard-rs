@@ -8,7 +8,6 @@ use bytes::Bytes;
 use serde::Deserialize;
 use tb_common::msg::TbMsg;
 use tb_common::{TbError, TbResult};
-use tb_queue::QueueProducer;
 
 use crate::context::NodeContext;
 use crate::node::Node;
@@ -48,14 +47,26 @@ fn render_template(template: &str, msg: &TbMsg) -> String {
     out
 }
 
-/// external.rest_call：HTTP 调用，2xx → "Success"，其余/错误 → "Failure"；
-/// 响应状态码写 metadata.rest_call_status。超时 10s。
+/// external.rest_call：HTTP 调用，2xx → "Success"，其余/错误 → "Failure"。
+/// 禁止跟随重定向；TB_RE_ALLOWED_HOSTS 可配置逗号分隔的精确主机白名单。
 pub struct RestCallNode {
     url: String,
     method: reqwest::Method,
     headers: HashMap<String, String>,
     body_script: Option<String>,
     client: reqwest::Client,
+    allowed_hosts: Option<std::collections::HashSet<String>>,
+}
+
+fn host_allowed(
+    allowed_hosts: Option<&std::collections::HashSet<String>>,
+    url: &reqwest::Url,
+) -> bool {
+    let Some(allowed_hosts) = allowed_hosts else {
+        return true;
+    };
+    url.host_str()
+        .is_some_and(|host| allowed_hosts.contains(&host.to_ascii_lowercase()))
 }
 
 impl RestCallNode {
@@ -86,14 +97,27 @@ impl RestCallNode {
         };
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(TbError::internal)?;
+        let allowed_hosts = std::env::var("TB_RE_ALLOWED_HOSTS")
+            .ok()
+            .map(|hosts| {
+                hosts
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|host| !host.is_empty())
+                    .map(str::to_ascii_lowercase)
+                    .collect::<std::collections::HashSet<_>>()
+            })
+            .filter(|hosts| !hosts.is_empty());
         Ok(Self {
             url: c.url,
             method,
             headers: c.headers,
             body_script: c.body_script,
             client,
+            allowed_hosts,
         })
     }
 }
@@ -102,7 +126,18 @@ impl RestCallNode {
 impl Node for RestCallNode {
     async fn on_msg(&self, ctx: &NodeContext, mut msg: TbMsg) -> Vec<(String, TbMsg)> {
         let url = render_template(&self.url, &msg);
-        let mut req = self.client.request(self.method.clone(), &url);
+        let parsed_url = match reqwest::Url::parse(&url) {
+            Ok(url) => url,
+            Err(e) => {
+                tracing::warn!(url = %url, "rest_call URL invalid: {e}");
+                return vec![("Failure".into(), msg)];
+            }
+        };
+        if !host_allowed(self.allowed_hosts.as_ref(), &parsed_url) {
+            tracing::warn!(url = %url, "rest_call host is not allowed");
+            return vec![("Failure".into(), msg)];
+        }
+        let mut req = self.client.request(self.method.clone(), parsed_url);
         for (k, v) in &self.headers {
             req = req.header(k, render_template(v, &msg));
         }
@@ -203,6 +238,27 @@ pub struct MqttNode {
     topic: String,
     qos: rumqttc::QoS,
     client: tokio::sync::OnceCell<rumqttc::AsyncClient>,
+    eventloop_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+fn is_terminal_mqtt_error(error: &rumqttc::ConnectionError) -> bool {
+    matches!(error, rumqttc::ConnectionError::RequestsDone)
+}
+
+async fn drive_mqtt_eventloop(mut eventloop: rumqttc::EventLoop) {
+    loop {
+        match eventloop.poll().await {
+            Ok(_) => {}
+            Err(e) if is_terminal_mqtt_error(&e) => {
+                tracing::debug!("mqtt request channel closed; eventloop stopped");
+                break;
+            }
+            Err(e) => {
+                tracing::warn!("mqtt eventloop error: {e}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
 }
 
 impl MqttNode {
@@ -243,25 +299,38 @@ impl MqttNode {
             topic: c.topic,
             qos,
             client: tokio::sync::OnceCell::new(),
+            eventloop_task: std::sync::Mutex::new(None),
         })
     }
 
     async fn client(&self) -> TbResult<&rumqttc::AsyncClient> {
         self.client
             .get_or_init(|| async {
-                let (client, mut eventloop) = rumqttc::AsyncClient::new(self.options.clone(), 16);
-                tokio::spawn(async move {
-                    loop {
-                        if let Err(e) = eventloop.poll().await {
-                            tracing::warn!("mqtt eventloop error: {e}");
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        }
-                    }
-                });
+                let (client, eventloop) = rumqttc::AsyncClient::new(self.options.clone(), 16);
+                let task = tokio::spawn(drive_mqtt_eventloop(eventloop));
+                let mut slot = self
+                    .eventloop_task
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *slot = Some(task);
                 client
             })
             .await;
-        Ok(self.client.get().expect("initialized above"))
+        self.client
+            .get()
+            .ok_or_else(|| TbError::Internal("mqtt client initialization failed".into()))
+    }
+}
+
+impl Drop for MqttNode {
+    fn drop(&mut self) {
+        let slot = self
+            .eventloop_task
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(task) = slot.take() {
+            task.abort();
+        }
     }
 }
 
@@ -291,5 +360,56 @@ impl Node for MqttNode {
             }
         };
         vec![(rel.into(), msg)]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rest_allowlist_matches_exact_host() {
+        let allowed = ["Example.COM".to_ascii_lowercase()].into_iter().collect();
+        assert!(host_allowed(
+            Some(&allowed),
+            &reqwest::Url::parse("http://example.com:8080/path").unwrap()
+        ));
+        assert!(!host_allowed(
+            Some(&allowed),
+            &reqwest::Url::parse("http://example.com.evil.test/path").unwrap()
+        ));
+        assert!(host_allowed(
+            None,
+            &reqwest::Url::parse("http://anywhere.test/path").unwrap()
+        ));
+    }
+
+    #[test]
+    fn mqtt_requests_done_is_terminal() {
+        assert!(is_terminal_mqtt_error(
+            &rumqttc::ConnectionError::RequestsDone
+        ));
+        assert!(!is_terminal_mqtt_error(
+            &rumqttc::ConnectionError::NetworkTimeout
+        ));
+    }
+
+    #[tokio::test]
+    async fn mqtt_drop_aborts_eventloop_task() {
+        let node = MqttNode::new(&serde_json::json!({
+            "host": "127.0.0.1", "port": 1, "topic": "tb/test"
+        }))
+        .unwrap();
+        node.client().await.unwrap();
+        let abort_handle = node
+            .eventloop_task
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+        drop(node);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(abort_handle.is_finished());
     }
 }

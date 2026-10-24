@@ -11,7 +11,6 @@ use std::time::Duration;
 
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
-use tb_dao::{AlarmDao, KeyDictionaryDao, RuleNodeDebugEventDao, TimeseriesDao};
 
 const DEFAULT_DATABASE_URL: &str = "postgres://thingsboard:thingsboard@localhost:5433/thingsboard";
 const DAY_MS: i64 = 24 * 3600 * 1000;
@@ -52,34 +51,33 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+fn cutoff(now: i64, ttl_days: i64) -> i64 {
+    now.saturating_sub(ttl_days.saturating_mul(DAY_MS))
+}
+
 /// 跑一轮清理，返回各类删除行数。
-async fn cleanup_round(
-    config: &Config,
-    ts_dao: &TimeseriesDao,
-    debug_dao: &RuleNodeDebugEventDao,
-    alarm_dao: &AlarmDao,
-) -> (u64, usize, u64) {
+async fn cleanup_round(config: &Config, pool: &PgPool) -> (u64, u64, u64) {
     let now = now_ms();
     let mut ts_deleted = 0;
     if config.ts_ttl_days > 0 {
-        let cutoff = now - config.ts_ttl_days * DAY_MS;
-        match ts_dao.delete_older_than(cutoff).await {
+        match tb_housekeeper::cleanup_ts_kv(pool, cutoff(now, config.ts_ttl_days)).await {
             Ok(n) => ts_deleted = n,
             Err(e) => tracing::error!("ts_kv cleanup failed: {e}"),
         }
     }
     let mut debug_deleted = 0;
     if config.debug_event_ttl_days > 0 {
-        let cutoff = now - config.debug_event_ttl_days * DAY_MS;
-        match debug_dao.delete_older_than(cutoff).await {
+        match tb_housekeeper::cleanup_debug_events(pool, cutoff(now, config.debug_event_ttl_days))
+            .await
+        {
             Ok(n) => debug_deleted = n,
             Err(e) => tracing::error!("debug event cleanup failed: {e}"),
         }
     }
     let mut alarm_deleted = 0;
     if config.alarm_ttl_days > 0 {
-        let cutoff = now - config.alarm_ttl_days * DAY_MS;
-        match alarm_dao.delete_cleared_older_than(cutoff).await {
+        match tb_housekeeper::cleanup_cleared_alarms(pool, cutoff(now, config.alarm_ttl_days)).await
+        {
             Ok(n) => alarm_deleted = n,
             Err(e) => tracing::error!("alarm cleanup failed: {e}"),
         }
@@ -94,14 +92,10 @@ async fn cleanup_round(
 }
 
 async fn run(config: Config, pool: PgPool) {
-    let keys = KeyDictionaryDao::new(pool.clone());
-    let ts_dao = TimeseriesDao::new(pool.clone(), keys);
-    let debug_dao = RuleNodeDebugEventDao::new(pool.clone());
-    let alarm_dao = AlarmDao::new(pool);
     let mut ticker = tokio::time::interval(config.interval);
     loop {
         ticker.tick().await;
-        cleanup_round(&config, &ts_dao, &debug_dao, &alarm_dao).await;
+        cleanup_round(&config, &pool).await;
     }
 }
 

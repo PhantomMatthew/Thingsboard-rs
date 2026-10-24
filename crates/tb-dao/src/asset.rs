@@ -19,45 +19,30 @@ impl AssetDao {
 
     pub async fn save(&self, asset: &Asset) -> TbResult<Asset> {
         let mut a = asset.clone();
-        if self.find_by_id(a.id).await?.is_some() {
-            sqlx::query(
-                "UPDATE asset SET tenant_id=$2, customer_id=$3, asset_profile_id=$4, name=$5, \
-                 label=$6, external_id=$7, additional_info=$8 WHERE id=$1",
-            )
-            .bind(a.id)
-            .bind(a.tenant_id)
-            .bind(a.customer_id)
-            .bind(a.asset_profile_id)
-            .bind(&a.name)
-            .bind(&a.label)
-            .bind(a.external_id)
-            .bind(&a.additional_info)
-            .execute(&self.pool)
-            .await
-            .map_err(TbError::db)?;
-        } else {
-            if a.created_time == 0 {
-                a.created_time = now_ms();
-            }
-            sqlx::query(
-                "INSERT INTO asset (id, created_time, tenant_id, customer_id, asset_profile_id, \
-                 name, label, external_id, additional_info) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
-            )
-            .bind(a.id)
-            .bind(a.created_time)
-            .bind(a.tenant_id)
-            .bind(a.customer_id)
-            .bind(a.asset_profile_id)
-            .bind(&a.name)
-            .bind(&a.label)
-            .bind(a.external_id)
-            .bind(&a.additional_info)
-            .execute(&self.pool)
-            .await
-            .map_err(TbError::db)?;
+        if a.created_time == 0 {
+            a.created_time = now_ms();
         }
-        Ok(a)
+        sqlx::query_as::<_, Asset>(
+            "INSERT INTO asset (id, created_time, tenant_id, customer_id, asset_profile_id, \
+             name, label, external_id, additional_info) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) \
+             ON CONFLICT (id) DO UPDATE SET tenant_id=EXCLUDED.tenant_id, \
+             customer_id=EXCLUDED.customer_id, asset_profile_id=EXCLUDED.asset_profile_id, \
+             name=EXCLUDED.name, label=EXCLUDED.label, external_id=EXCLUDED.external_id, \
+             additional_info=EXCLUDED.additional_info RETURNING *",
+        )
+        .bind(a.id)
+        .bind(a.created_time)
+        .bind(a.tenant_id)
+        .bind(a.customer_id)
+        .bind(a.asset_profile_id)
+        .bind(&a.name)
+        .bind(&a.label)
+        .bind(a.external_id)
+        .bind(&a.additional_info)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(TbError::db)
     }
 
     /// 全表分页扫描（EDQS 快照加载用），按 id 排序保证翻页稳定。
@@ -82,6 +67,15 @@ impl AssetDao {
         let res = sqlx::query("DELETE FROM asset WHERE id = $1")
             .bind(id)
             .execute(&self.pool)
+            .await
+            .map_err(TbError::db)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    pub async fn delete_by_id_in(&self, tx: &mut sqlx::PgConnection, id: Uuid) -> TbResult<bool> {
+        let res = sqlx::query("DELETE FROM asset WHERE id = $1")
+            .bind(id)
+            .execute(tx)
             .await
             .map_err(TbError::db)?;
         Ok(res.rows_affected() > 0)

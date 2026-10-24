@@ -19,55 +19,37 @@ impl DeviceDao {
 
     pub async fn save(&self, device: &Device) -> TbResult<Device> {
         let mut d = device.clone();
-        if self.find_by_id(d.id).await?.is_some() {
-            sqlx::query(
-                "UPDATE device SET tenant_id=$2, customer_id=$3, device_profile_id=$4, name=$5, \
-                 type=$6, label=$7, external_id=$8, firmware_id=$9, software_id=$10, \
-                 additional_info=$11, device_data=$12 WHERE id=$1",
-            )
-            .bind(d.id)
-            .bind(d.tenant_id)
-            .bind(d.customer_id)
-            .bind(d.device_profile_id)
-            .bind(&d.name)
-            .bind(&d.r#type)
-            .bind(&d.label)
-            .bind(d.external_id)
-            .bind(d.firmware_id)
-            .bind(d.software_id)
-            .bind(&d.additional_info)
-            .bind(&d.device_data)
-            .execute(&self.pool)
-            .await
-            .map_err(TbError::db)?;
-        } else {
-            if d.created_time == 0 {
-                d.created_time = now_ms();
-            }
-            sqlx::query(
-                "INSERT INTO device (id, created_time, tenant_id, customer_id, \
-                 device_profile_id, name, type, label, external_id, firmware_id, software_id, \
-                 additional_info, device_data) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
-            )
-            .bind(d.id)
-            .bind(d.created_time)
-            .bind(d.tenant_id)
-            .bind(d.customer_id)
-            .bind(d.device_profile_id)
-            .bind(&d.name)
-            .bind(&d.r#type)
-            .bind(&d.label)
-            .bind(d.external_id)
-            .bind(d.firmware_id)
-            .bind(d.software_id)
-            .bind(&d.additional_info)
-            .bind(&d.device_data)
-            .execute(&self.pool)
-            .await
-            .map_err(TbError::db)?;
+        if d.created_time == 0 {
+            d.created_time = now_ms();
         }
-        Ok(d)
+        sqlx::query_as::<_, Device>(
+            "INSERT INTO device (id, created_time, tenant_id, customer_id, \
+             device_profile_id, name, type, label, external_id, firmware_id, software_id, \
+             additional_info, device_data) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
+             ON CONFLICT (id) DO UPDATE SET tenant_id=EXCLUDED.tenant_id, \
+             customer_id=EXCLUDED.customer_id, device_profile_id=EXCLUDED.device_profile_id, \
+             name=EXCLUDED.name, type=EXCLUDED.type, label=EXCLUDED.label, \
+             external_id=EXCLUDED.external_id, firmware_id=EXCLUDED.firmware_id, \
+             software_id=EXCLUDED.software_id, additional_info=EXCLUDED.additional_info, \
+             device_data=EXCLUDED.device_data RETURNING *",
+        )
+        .bind(d.id)
+        .bind(d.created_time)
+        .bind(d.tenant_id)
+        .bind(d.customer_id)
+        .bind(d.device_profile_id)
+        .bind(&d.name)
+        .bind(&d.r#type)
+        .bind(&d.label)
+        .bind(d.external_id)
+        .bind(d.firmware_id)
+        .bind(d.software_id)
+        .bind(&d.additional_info)
+        .bind(&d.device_data)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(TbError::db)
     }
 
     pub async fn find_by_id(&self, id: Uuid) -> TbResult<Option<Device>> {
@@ -100,6 +82,15 @@ impl DeviceDao {
         let res = sqlx::query("DELETE FROM device WHERE id = $1")
             .bind(id)
             .execute(&self.pool)
+            .await
+            .map_err(TbError::db)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    pub async fn delete_by_id_in(&self, tx: &mut sqlx::PgConnection, id: Uuid) -> TbResult<bool> {
+        let res = sqlx::query("DELETE FROM device WHERE id = $1")
+            .bind(id)
+            .execute(tx)
             .await
             .map_err(TbError::db)?;
         Ok(res.rows_affected() > 0)

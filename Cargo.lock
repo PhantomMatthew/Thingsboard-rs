@@ -3102,6 +3102,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -3140,10 +3141,10 @@ dependencies = [
  "axum",
  "bytes",
  "chrono",
- "dashmap",
  "futures",
  "moka",
  "prost",
+ "redis",
  "reqwest",
  "rumqttc",
  "serde",
@@ -3164,10 +3165,12 @@ dependencies = [
 name = "tb-rule-engine-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "bytes",
  "chrono",
  "prost",
+ "redis",
  "reqwest",
  "serde",
  "serde_json",

@@ -21,8 +21,9 @@ async fn start_fake_provider() -> String {
             return AxumStatus::BAD_REQUEST.into_response();
         }
         match form.get("code").map(String::as_str) {
-            Some("good") => AxumJson(json!({"access_token": "fake-at", "token_type": "Bearer"}))
-                .into_response(),
+            Some("good") => {
+                AxumJson(json!({"access_token": "fake-at", "token_type": "Bearer"})).into_response()
+            }
             Some("noemail") => {
                 AxumJson(json!({"access_token": "noemail-at", "token_type": "Bearer"}))
                     .into_response()
@@ -228,17 +229,27 @@ async fn oauth2_login_end_to_end() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-    // 8. TENANT_ADMIN 管理本租户客户端（tenantId 强制覆写；看不到平台级）
+    // 8. 仅 SYS_ADMIN 可写客户端配置；TENANT_ADMIN 仍可读取本租户客户端。
+    let tenant_client_body = json!({
+        "tenantId": tenant_id,
+        "title": "Tenant SSO",
+        "clientId": "tenant-fake",
+        "authorizationUri": format!("{provider}/authorize"),
+        "tokenUri": format!("{provider}/token"),
+        "userInfoUri": format!("{provider}/userinfo"),
+    });
     let resp = client
         .post(format!("{base}/api/oauth2/client"))
         .header("Authorization", bearer(&tenant_token))
-        .json(&json!({
-            "title": "Tenant SSO",
-            "clientId": "tenant-fake",
-            "authorizationUri": format!("{provider}/authorize"),
-            "tokenUri": format!("{provider}/token"),
-            "userInfoUri": format!("{provider}/userinfo"),
-        }))
+        .json(&tenant_client_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let resp = client
+        .post(format!("{base}/api/oauth2/client"))
+        .header("Authorization", bearer(&sys_token))
+        .json(&tenant_client_body)
         .send()
         .await
         .unwrap();
@@ -298,10 +309,16 @@ async fn oauth2_login_end_to_end() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-    // tenant admin 删除本租户客户端
     let resp = client
         .delete(format!("{base}/api/oauth2/client/{tenant_client_id}"))
         .header("Authorization", bearer(&tenant_token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let resp = client
+        .delete(format!("{base}/api/oauth2/client/{tenant_client_id}"))
+        .header("Authorization", bearer(&sys_token))
         .send()
         .await
         .unwrap();

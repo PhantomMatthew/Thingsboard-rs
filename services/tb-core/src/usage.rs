@@ -104,6 +104,49 @@ impl UsageTracker {
         })
     }
 
+    fn snapshot(&self) -> Vec<(Uuid, UsageDelta)> {
+        self.counters
+            .iter()
+            .map(|e| {
+                (
+                    *e.key(),
+                    UsageDelta {
+                        transport_msgs: e.transport_msgs,
+                        re_msgs: e.re_msgs,
+                        rest_requests: e.rest_requests,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn subtract_snapshot(&self, tenant_id: Uuid, delta: UsageDelta) {
+        if let Some(mut c) = self.counters.get_mut(&tenant_id) {
+            c.transport_msgs -= delta.transport_msgs;
+            c.re_msgs -= delta.re_msgs;
+            c.rest_requests -= delta.rest_requests;
+        }
+    }
+
+    async fn flush(&self, state: &AppState) {
+        for (tenant_id, delta) in self.snapshot() {
+            if delta.transport_msgs == 0 && delta.re_msgs == 0 && delta.rest_requests == 0 {
+                continue;
+            }
+            let result = if delta.transport_msgs == 0 && delta.re_msgs == 0 {
+                Ok(())
+            } else {
+                state.api_usage_state_dao.add_delta(tenant_id, delta).await
+            };
+            match result {
+                Ok(()) => self.subtract_snapshot(tenant_id, delta),
+                Err(e) => {
+                    tracing::warn!(%tenant_id, "usage flush failed, counters kept: {e}")
+                }
+            }
+        }
+    }
+
     /// 周期性把内存计数累加进 api_usage_state（rest_requests 不落库，仅清零）。
     pub fn start_flush(self, state: AppState) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
@@ -111,37 +154,31 @@ impl UsageTracker {
             ticker.tick().await; // 跳过首次立即触发
             loop {
                 ticker.tick().await;
-                let snapshot: Vec<(Uuid, UsageDelta)> = self
-                    .counters
-                    .iter()
-                    .map(|e| {
-                        (
-                            *e.key(),
-                            UsageDelta {
-                                transport_msgs: e.transport_msgs,
-                                re_msgs: e.re_msgs,
-                                rest_requests: 0,
-                            },
-                        )
-                    })
-                    .collect();
-                for (tenant_id, delta) in snapshot {
-                    if delta.transport_msgs == 0 && delta.re_msgs == 0 {
-                        continue;
-                    }
-                    match state.api_usage_state_dao.add_delta(tenant_id, delta).await {
-                        Ok(()) => {
-                            if let Some(mut c) = self.counters.get_mut(&tenant_id) {
-                                c.transport_msgs -= delta.transport_msgs;
-                                c.re_msgs -= delta.re_msgs;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(%tenant_id, "usage flush failed, counters kept: {e}")
-                        }
-                    }
-                }
+                self.flush(&state).await;
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rest_requests_use_snapshot_subtract_without_losing_new_counts() {
+        let tracker = UsageTracker::default();
+        let tenant_id = Uuid::now_v7();
+        tracker.inc_rest_request(tenant_id);
+        tracker.inc_rest_request(tenant_id);
+        let snapshot = tracker.snapshot();
+        let (_, delta) = snapshot
+            .into_iter()
+            .find(|(id, _)| *id == tenant_id)
+            .unwrap();
+        assert_eq!(delta.rest_requests, 2);
+
+        tracker.inc_rest_request(tenant_id);
+        tracker.subtract_snapshot(tenant_id, delta);
+        assert_eq!(tracker.counters.get(&tenant_id).unwrap().rest_requests, 1);
     }
 }

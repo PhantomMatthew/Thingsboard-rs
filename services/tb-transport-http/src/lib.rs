@@ -1,12 +1,14 @@
 //! tb-transport-http：设备 HTTP 接入。
 //! 上行：遥测/属性/RPC 经 transport-api 或 tb_rule_engine.Main；
 //! 同步能力：GET attributes 走 transport-api 请求/响应；GET rpc 长轮询
-//! （注册临时会话 → subscribe_rpc → 等本节点 notifications consumer 推 to_device_rpc）。
+//! （复用长轮询会话 → subscribe_rpc → 等本节点 notifications consumer 推 to_device_rpc；
+//! 未取走的 RPC 留给后续轮询，会话空闲超时后清理）。
 
 pub mod downlink;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
@@ -16,6 +18,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use prost::Message as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -24,13 +27,33 @@ use tb_proto::core as core_pb;
 use tb_proto::transport as pb;
 use tb_queue::{KafkaQueueProducer, QueueError, QueueProducer as _, TbTopic};
 use tb_transport_api::TransportApiClient;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc, watch};
 use uuid::Uuid;
 
 const LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+const RPC_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const RPC_SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
-/// 长轮询会话：session_id → to_device_rpc 投递通道。
-pub type RpcSessions = Arc<DashMap<String, mpsc::Sender<core_pb::ToDeviceRpcRequestMsg>>>;
+pub struct RpcSession {
+    pub device: pb::DeviceInfoProto,
+    pub info: core_pb::SessionInfoProto,
+    pub tx: mpsc::Sender<core_pb::ToDeviceRpcRequestMsg>,
+    pub rx: Mutex<mpsc::Receiver<core_pb::ToDeviceRpcRequestMsg>>,
+    pub last_activity_ms: AtomicI64,
+    close_tx: watch::Sender<bool>,
+    close_rx: watch::Receiver<bool>,
+}
+
+impl RpcSession {
+    fn close(&self) {
+        let _ = self.close_tx.send(true);
+    }
+}
+
+/// device_id → 持久长轮询会话；接收队列跨 GET rpc 请求保留。
+pub type RpcSessions = Arc<DashMap<String, Arc<RpcSession>>>;
+/// session_id → device_id，供下行通知按会话路由。
+pub type RpcSessionIds = Arc<DashMap<String, String>>;
 
 pub struct RpcReplyRoute {
     pub session_id: String,
@@ -47,6 +70,7 @@ pub struct TransportState {
     pub node_id: String,
     pub brokers: String,
     pub rpc_sessions: RpcSessions,
+    pub rpc_session_ids: RpcSessionIds,
     pub rpc_reply_routes: RpcReplyRoutes,
     /// GET rpc 长轮询时长（测试可调小）。
     pub long_poll_timeout: Duration,
@@ -60,6 +84,7 @@ impl TransportState {
             node_id: node_id.to_string(),
             brokers: brokers.to_string(),
             rpc_sessions: Arc::new(DashMap::new()),
+            rpc_session_ids: Arc::new(DashMap::new()),
             rpc_reply_routes: Arc::new(DashMap::new()),
             long_poll_timeout: LONG_POLL_TIMEOUT,
         })
@@ -67,6 +92,7 @@ impl TransportState {
 }
 
 pub fn build_router(state: TransportState) -> Router {
+    tokio::spawn(sweep_rpc_sessions(state.clone()));
     Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/{token}/telemetry", post(post_telemetry))
@@ -159,6 +185,111 @@ async fn send_core(
         )
         .await
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+fn get_or_create_rpc_session(
+    state: &TransportState,
+    device: &pb::DeviceInfoProto,
+) -> (Arc<RpcSession>, bool) {
+    match state.rpc_sessions.entry(device.device_id.clone()) {
+        Entry::Occupied(entry) => (entry.get().clone(), false),
+        Entry::Vacant(entry) => {
+            let session_id = Uuid::now_v7().to_string();
+            let (tx, rx) = mpsc::channel(32);
+            let (close_tx, close_rx) = watch::channel(false);
+            let session = Arc::new(RpcSession {
+                device: device.clone(),
+                info: session_info(state, device, &session_id),
+                tx,
+                rx: Mutex::new(rx),
+                last_activity_ms: AtomicI64::new(now_ms()),
+                close_tx,
+                close_rx,
+            });
+            entry.insert(session.clone());
+            state
+                .rpc_session_ids
+                .insert(session_id, device.device_id.clone());
+            (session, true)
+        }
+    }
+}
+
+pub(crate) fn remove_rpc_session(
+    state: &TransportState,
+    session_id: &str,
+) -> Option<Arc<RpcSession>> {
+    let device_id = state
+        .rpc_session_ids
+        .remove(session_id)
+        .map(|(_, device_id)| device_id)?;
+    let session = state
+        .rpc_sessions
+        .remove(&device_id)
+        .map(|(_, session)| session);
+    if let Some(session) = &session {
+        session.close();
+    }
+    state
+        .rpc_reply_routes
+        .retain(|_, route| route.session_id != session_id);
+    session
+}
+
+fn remove_rpc_session_if_same(
+    state: &TransportState,
+    device_id: &str,
+    expected: &Arc<RpcSession>,
+) -> Option<Arc<RpcSession>> {
+    let removed = match state.rpc_sessions.entry(device_id.to_string()) {
+        Entry::Occupied(entry) if Arc::ptr_eq(entry.get(), expected) => Some(entry.remove()),
+        _ => None,
+    };
+    if let Some(session) = &removed {
+        session.close();
+        state.rpc_session_ids.remove(&expected.info.session_id);
+        state
+            .rpc_reply_routes
+            .retain(|_, route| route.session_id != expected.info.session_id);
+    }
+    removed
+}
+
+async fn close_expired_rpc_sessions(state: &TransportState) {
+    let now = now_ms();
+    let expired: Vec<_> = state
+        .rpc_sessions
+        .iter()
+        .filter(|entry| {
+            now - entry.last_activity_ms.load(Ordering::Relaxed)
+                > RPC_SESSION_IDLE_TIMEOUT.as_millis() as i64
+        })
+        .map(|entry| (entry.key().clone(), entry.value().clone()))
+        .collect();
+    for (device_id, session) in expired {
+        let Some(session) = remove_rpc_session_if_same(state, &device_id, &session) else {
+            continue;
+        };
+        if let Err(e) = send_core(
+            state,
+            &session.device,
+            core_pb::to_core_msg::Msg::SessionClose(core_pb::SessionCloseMsg {
+                session: Some(session.info.clone()),
+                reason: "http RPC session idle timeout".into(),
+            }),
+        )
+        .await
+        {
+            tracing::warn!("failed to close idle HTTP RPC session: {}", e.1);
+        }
+    }
+}
+
+async fn sweep_rpc_sessions(state: TransportState) {
+    loop {
+        tokio::time::sleep(RPC_SESSION_SWEEP_INTERVAL).await;
+        close_expired_rpc_sessions(&state).await;
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -321,27 +452,44 @@ async fn post_rpc(
     Ok(StatusCode::ACCEPTED)
 }
 
-/// GET rpc 长轮询：注册临时会话并 subscribe_rpc，等 notifications consumer 推 to_device_rpc；
-/// 超时返回空 200。结束时发 session_close 清理 core 侧注册表。
+/// GET rpc 长轮询：复用设备会话并保留未取走的 RPC；空闲超时或 core 踢线时才关闭。
 async fn get_rpc(
     State(state): State<TransportState>,
     Path(token): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let device = validate(&state, &token).await?;
-    let session_id = Uuid::now_v7().to_string();
-    let (tx, mut rx) = mpsc::channel(4);
-    state.rpc_sessions.insert(session_id.clone(), tx);
-    let info = session_info(&state, &device, &session_id);
-    send_core(
-        &state,
-        &device,
-        core_pb::to_core_msg::Msg::SubscribeRpc(core_pb::SubscribeRpcMsg {
-            session: Some(info.clone()),
-            subscribe: true,
-        }),
-    )
-    .await?;
-    let result = match tokio::time::timeout(state.long_poll_timeout, rx.recv()).await {
+    let (session, created) = get_or_create_rpc_session(&state, &device);
+    session.last_activity_ms.store(now_ms(), Ordering::Relaxed);
+    if created
+        && let Err(error) = send_core(
+            &state,
+            &device,
+            core_pb::to_core_msg::Msg::SubscribeRpc(core_pb::SubscribeRpcMsg {
+                session: Some(session.info.clone()),
+                subscribe: true,
+            }),
+        )
+        .await
+    {
+        remove_rpc_session(&state, &session.info.session_id);
+        return Err(error);
+    }
+    let received = {
+        let mut rx = session.rx.lock().await;
+        let mut closed = session.close_rx.clone();
+        tokio::time::timeout(state.long_poll_timeout, async move {
+            if *closed.borrow() {
+                return None;
+            }
+            tokio::select! {
+                rpc = rx.recv() => rpc,
+                _ = closed.changed() => None,
+            }
+        })
+        .await
+    };
+    session.last_activity_ms.store(now_ms(), Ordering::Relaxed);
+    let result = match received {
         Ok(Some(rpc)) => {
             state
                 .rpc_reply_routes
@@ -349,7 +497,7 @@ async fn get_rpc(
             state.rpc_reply_routes.insert(
                 (device.device_id.clone(), rpc.request_id),
                 RpcReplyRoute {
-                    session_id: session_id.clone(),
+                    session_id: session.info.session_id.clone(),
                     reply_node_id: rpc.reply_node_id.clone(),
                     expiration_ts: rpc.expiration_ts,
                 },
@@ -359,16 +507,6 @@ async fn get_rpc(
         }
         _ => json!({}),
     };
-    state.rpc_sessions.remove(&session_id);
-    send_core(
-        &state,
-        &device,
-        core_pb::to_core_msg::Msg::SessionClose(core_pb::SessionCloseMsg {
-            session: Some(info),
-            reason: "http long-poll ended".into(),
-        }),
-    )
-    .await?;
     Ok(Json(result))
 }
 
@@ -404,6 +542,14 @@ async fn post_rpc_response(
 }
 
 const DEFAULT_CHUNK_SIZE: i32 = 16 * 1024;
+const MAX_CHUNK_SIZE: i32 = 1024 * 1024;
+
+fn firmware_chunk_size(requested: Option<i32>) -> i32 {
+    requested
+        .filter(|size| *size > 0)
+        .unwrap_or(DEFAULT_CHUNK_SIZE)
+        .min(MAX_CHUNK_SIZE)
+}
 
 #[derive(Debug, Deserialize)]
 struct FirmwareQuery {
@@ -440,7 +586,7 @@ async fn get_firmware(
         .get_ota_chunk(
             &package.ota_package_id,
             query.chunk.unwrap_or(0).max(0),
-            query.size.filter(|s| *s > 0).unwrap_or(DEFAULT_CHUNK_SIZE),
+            firmware_chunk_size(query.size),
         )
         .await?;
     Ok((
@@ -482,5 +628,58 @@ async fn provision(
         Ok(Json(
             json!({"status": "FAILURE", "errorMsg": resp.error_msg}),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn firmware_chunk_size_is_positive_and_capped() {
+        assert_eq!(firmware_chunk_size(Some(100)), 100);
+        assert_eq!(firmware_chunk_size(Some(0)), DEFAULT_CHUNK_SIZE);
+        assert_eq!(firmware_chunk_size(None), DEFAULT_CHUNK_SIZE);
+        assert_eq!(
+            firmware_chunk_size(Some(MAX_CHUNK_SIZE + 1)),
+            MAX_CHUNK_SIZE
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_rpcs_survive_multiple_poll_windows() {
+        let state =
+            TransportState::new("localhost:29092", &format!("http-unit-{}", Uuid::now_v7()))
+                .unwrap();
+        let device = pb::DeviceInfoProto {
+            device_id: "device-a".into(),
+            ..Default::default()
+        };
+        let (session, created) = get_or_create_rpc_session(&state, &device);
+        assert!(created);
+        let (same_session, created) = get_or_create_rpc_session(&state, &device);
+        assert!(!created);
+        assert!(Arc::ptr_eq(&session, &same_session));
+
+        for request_id in [1, 2] {
+            session
+                .tx
+                .send(core_pb::ToDeviceRpcRequestMsg {
+                    request_id,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let first = session.rx.lock().await.recv().await.unwrap();
+        assert_eq!(first.request_id, 1);
+        assert_eq!(state.rpc_sessions.len(), 1);
+        let second = session.rx.lock().await.recv().await.unwrap();
+        assert_eq!(second.request_id, 2);
+
+        remove_rpc_session(&state, &session.info.session_id).unwrap();
+        assert!(state.rpc_sessions.is_empty());
+        assert!(state.rpc_session_ids.is_empty());
+        assert!(*session.close_rx.borrow());
     }
 }

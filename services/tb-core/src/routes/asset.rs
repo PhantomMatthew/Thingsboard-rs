@@ -51,34 +51,55 @@ async fn save_asset(
 ) -> Result<Json<Asset>, ApiError> {
     require_authority(&user, &[Authority::TenantAdmin])?;
     let tenant_id = user.0.tenant_id;
-    let profile_id = match req.asset_profile_id {
-        Some(id) => id,
-        None => ensure_default_asset_profile(&state, tenant_id).await?.id,
-    };
-    if let Some(customer_id) = req.customer_id {
-        let customer = load_customer(&state, customer_id).await?;
-        check_tenant_scope(&user, customer.tenant_id)?;
-    }
-    let is_new = req.id.is_none();
-    let (id, created_time) = match req.id {
+    let existing = match req.id {
         Some(id) => {
             let existing = load_asset(&state, id).await?;
             check_tenant_scope(&user, existing.tenant_id)?;
-            (id, existing.created_time)
+            Some(existing)
         }
-        None => (Uuid::now_v7(), 0),
+        None => None,
     };
-    let asset = Asset {
-        id,
-        created_time,
+    let is_new = existing.is_none();
+    let profile_id = match req.asset_profile_id {
+        Some(id) => id,
+        None => match existing.as_ref() {
+            Some(existing) => existing.asset_profile_id,
+            None => ensure_default_asset_profile(&state, tenant_id).await?.id,
+        },
+    };
+    let profile = state
+        .asset_profile_dao
+        .find_by_id(profile_id)
+        .await?
+        .ok_or_else(|| TbError::NotFound(format!("asset profile {profile_id}")))?;
+    check_tenant_scope(&user, profile.tenant_id)?;
+    let customer_id = req
+        .customer_id
+        .or_else(|| existing.as_ref().and_then(|asset| asset.customer_id));
+    if let Some(customer_id) = customer_id {
+        let customer = load_customer(&state, customer_id).await?;
+        check_tenant_scope(&user, customer.tenant_id)?;
+    }
+    let mut asset = existing.unwrap_or(Asset {
+        id: Uuid::now_v7(),
+        created_time: 0,
         tenant_id,
-        customer_id: req.customer_id,
+        customer_id: None,
         asset_profile_id: profile_id,
-        name: req.name,
-        label: req.label,
+        name: String::new(),
+        label: None,
         external_id: None,
-        additional_info: req.additional_info,
-    };
+        additional_info: None,
+    });
+    asset.name = req.name;
+    asset.asset_profile_id = profile_id;
+    asset.customer_id = customer_id;
+    if req.label.is_some() {
+        asset.label = req.label;
+    }
+    if req.additional_info.is_some() {
+        asset.additional_info = req.additional_info;
+    }
     let saved = state.asset_dao.save(&asset).await?;
     audit(
         &state,
@@ -127,7 +148,17 @@ async fn delete_asset(
     require_authority(&user, &[Authority::TenantAdmin])?;
     let asset = load_asset(&state, id).await?;
     check_tenant_scope(&user, asset.tenant_id)?;
-    state.asset_dao.delete_by_id(id).await?;
+    let mut tx = state.pool.begin().await.map_err(TbError::db)?;
+    state.timeseries_dao.delete_by_entity(&mut tx, id).await?;
+    state.attributes_dao.delete_by_entity(&mut tx, id).await?;
+    state.alarm_dao.delete_by_entity(&mut tx, id).await?;
+    state
+        .calculated_field_dao
+        .delete_by_entity(&mut tx, id)
+        .await?;
+    state.asset_dao.delete_by_id_in(&mut tx, id).await?;
+    tx.commit().await.map_err(TbError::db)?;
+    crate::telemetry_cache::invalidate_latest(&state, id).await;
     audit(
         &state,
         &user,

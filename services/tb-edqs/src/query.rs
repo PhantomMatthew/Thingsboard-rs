@@ -340,17 +340,27 @@ pub fn execute_query(repo: &TenantRepo, query: &EntityDataQuery) -> PageDataResu
     if let Some(sort) = &query.page_link.sort_by {
         let desc = sort.direction == SortDirection::Desc;
         matched.sort_by(|a, b| {
-            let ord = SortVal::of(repo, a, sort).cmp_asc(&SortVal::of(repo, b, sort));
-            if desc { ord.reverse() } else { ord }
+            let left = SortVal::of(repo, a, sort);
+            let right = SortVal::of(repo, b, sort);
+            match (&left, &right) {
+                (SortVal::Missing, SortVal::Missing) => Ordering::Equal,
+                (SortVal::Missing, _) => Ordering::Greater,
+                (_, SortVal::Missing) => Ordering::Less,
+                _ => {
+                    let ord = left.cmp_asc(&right);
+                    if desc { ord.reverse() } else { ord }
+                }
+            }
         });
     } else {
         matched.sort_by_key(|r| r.created_time);
     }
 
     let total = matched.len() as i64;
-    let page_size = query.page_link.page_size.max(1);
-    let total_pages = (total + page_size - 1) / page_size;
-    let start = (query.page_link.page.max(0) * page_size) as usize;
+    let page = query.page_link.page.max(0);
+    let page_size = query.page_link.page_size.clamp(1, 1000);
+    let total_pages = total / page_size + i64::from(total % page_size != 0);
+    let start = usize::try_from(page.saturating_mul(page_size)).unwrap_or(usize::MAX);
     let data = matched
         .into_iter()
         .skip(start)
@@ -373,7 +383,7 @@ pub fn execute_query(repo: &TenantRepo, query: &EntityDataQuery) -> PageDataResu
         data,
         total_elements: total,
         total_pages,
-        has_next: query.page_link.page + 1 < total_pages,
+        has_next: page.saturating_add(1) < total_pages,
     }
 }
 
@@ -381,5 +391,96 @@ fn kv_to_json(v: KvValue) -> Value {
     match v {
         KvValue::Json(j) => j,
         other => json!(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    fn record(name: &str, created_time: i64) -> EntityRecord {
+        EntityRecord {
+            id: Uuid::now_v7(),
+            entity_type: EntityType::Device,
+            customer_id: None,
+            name: name.into(),
+            type_or_profile: "sensor".into(),
+            label: None,
+            created_time,
+        }
+    }
+
+    fn query(page: i64, page_size: i64, sort_by: Option<SortBy>) -> EntityDataQuery {
+        EntityDataQuery {
+            tenant_id: Uuid::nil(),
+            entity_filter: EntityFilter::All,
+            key_filters: vec![],
+            page_link: PageLinkReq {
+                page,
+                page_size,
+                sort_by,
+            },
+            fields: vec![],
+        }
+    }
+
+    #[test]
+    fn descending_sort_keeps_missing_values_last() {
+        let mut repo = TenantRepo::default();
+        let low = record("low", 1);
+        let high = record("high", 2);
+        let missing = record("missing", 3);
+        repo.latest.insert(
+            low.id,
+            HashMap::from([("rank".into(), (1, KvValue::Long(10)))]),
+        );
+        repo.latest.insert(
+            high.id,
+            HashMap::from([("rank".into(), (1, KvValue::Long(20)))]),
+        );
+        for entity in [low.clone(), high.clone(), missing.clone()] {
+            repo.upsert_entity(entity);
+        }
+        let result = execute_query(
+            &repo,
+            &query(
+                0,
+                10,
+                Some(SortBy {
+                    key: "rank".into(),
+                    source: KeySource::Latest,
+                    direction: SortDirection::Desc,
+                }),
+            ),
+        );
+        let ids: Vec<_> = result.data.into_iter().map(|row| row.entity_id).collect();
+        assert_eq!(ids, vec![high.id, low.id, missing.id]);
+    }
+
+    #[test]
+    fn pagination_clamps_size_and_saturates_offsets() {
+        let mut repo = TenantRepo::default();
+        for i in 0..1001 {
+            repo.upsert_entity(record(&format!("device-{i:04}"), i));
+        }
+        let result = execute_query(&repo, &query(0, 5000, None));
+        assert_eq!(result.data.len(), 1000);
+        assert_eq!(result.total_pages, 2);
+        assert!(result.has_next);
+
+        let first = execute_query(&repo, &query(0, 1, None));
+        let negative = execute_query(&repo, &query(-10, 1, None));
+        assert_eq!(negative.data[0].entity_id, first.data[0].entity_id);
+        assert!(negative.has_next);
+
+        let overflow = execute_query(&repo, &query(i64::MAX, i64::MAX, None));
+        assert!(overflow.data.is_empty());
+        assert!(!overflow.has_next);
+
+        let negative_size = execute_query(&repo, &query(0, -10, None));
+        assert_eq!(negative_size.data.len(), 1);
+        assert_eq!(negative_size.total_pages, 1001);
     }
 }

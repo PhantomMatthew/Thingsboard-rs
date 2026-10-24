@@ -32,7 +32,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = EdqsState::default();
     tb_edqs::snapshot::load_snapshot(&pool, &state).await?;
     let consumer =
-        tb_edqs::consumer::start_consumer_for_group(&brokers, &group, state.clone()).await;
+        tb_edqs::consumer::start_consumer_for_group_checked(&brokers, &group, state.clone())
+            .await?;
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!(port, "tb-edqs listening");

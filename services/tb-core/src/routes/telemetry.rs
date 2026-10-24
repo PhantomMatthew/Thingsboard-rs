@@ -119,6 +119,10 @@ fn parse_keys(raw: &Option<String>) -> Option<Vec<String>> {
     })
 }
 
+fn history_limit(limit: Option<i64>) -> i64 {
+    limit.unwrap_or(100).clamp(1, 5000)
+}
+
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -302,7 +306,7 @@ async fn get_timeseries(
                             key,
                             start_ts,
                             end_ts,
-                            query.limit.unwrap_or(100),
+                            history_limit(query.limit),
                             query.order_by.as_deref() == Some("ASC"),
                         )
                         .await?
@@ -360,7 +364,9 @@ async fn delete_timeseries(
         }
     };
     let deleted = state.timeseries_dao.delete(entity_id, &keys, range).await?;
-    if range.is_none() {
+    if range.is_some() {
+        telemetry_cache::invalidate_latest(&state, entity_id).await;
+    } else {
         telemetry_cache::delete_latest(&state, entity_id, &keys).await;
     }
     Ok(Json(json!({"deleted": deleted})))
@@ -540,4 +546,17 @@ async fn delete_attributes(
         notify_shared_attribute_update(&state, entity_type, entity_id, kvs).await;
     }
     Ok(Json(json!({"deleted": deleted})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_limit_is_bounded() {
+        assert_eq!(history_limit(None), 100);
+        assert_eq!(history_limit(Some(0)), 1);
+        assert_eq!(history_limit(Some(5001)), 5000);
+        assert_eq!(history_limit(Some(i64::MAX)), 5000);
+    }
 }

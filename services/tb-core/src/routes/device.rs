@@ -91,38 +91,63 @@ async fn save_device(
 ) -> Result<Json<Device>, ApiError> {
     require_authority(&user, &[Authority::TenantAdmin])?;
     let tenant_id = user.0.tenant_id;
+    let existing = match req.id {
+        Some(id) => {
+            let existing = load_device(&state, id).await?;
+            check_tenant_scope(&user, existing.tenant_id)?;
+            Some(existing)
+        }
+        None => None,
+    };
+    let is_new = existing.is_none();
     let profile_id = match req.device_profile_id {
         Some(id) => id,
-        None => ensure_default_device_profile(&state, tenant_id).await?.id,
+        None => match existing.as_ref() {
+            Some(existing) => existing.device_profile_id,
+            None => ensure_default_device_profile(&state, tenant_id).await?.id,
+        },
     };
-    if let Some(customer_id) = req.customer_id {
+    let profile = state
+        .device_profile_dao
+        .find_by_id(profile_id)
+        .await?
+        .ok_or_else(|| TbError::NotFound(format!("device profile {profile_id}")))?;
+    check_tenant_scope(&user, profile.tenant_id)?;
+    let customer_id = req
+        .customer_id
+        .or_else(|| existing.as_ref().and_then(|device| device.customer_id));
+    if let Some(customer_id) = customer_id {
         let customer = load_customer(&state, customer_id).await?;
         check_tenant_scope(&user, customer.tenant_id)?;
     }
 
-    let (id, created_time, is_new) = match req.id {
-        Some(id) => {
-            let existing = load_device(&state, id).await?;
-            check_tenant_scope(&user, existing.tenant_id)?;
-            (id, existing.created_time, false)
-        }
-        None => (Uuid::now_v7(), 0, true),
-    };
-    let device = Device {
-        id,
-        created_time,
+    let mut device = existing.unwrap_or(Device {
+        id: Uuid::now_v7(),
+        created_time: 0,
         tenant_id,
-        customer_id: req.customer_id,
+        customer_id: None,
         device_profile_id: profile_id,
-        name: req.name,
-        r#type: req.r#type,
-        label: req.label,
+        name: String::new(),
+        r#type: None,
+        label: None,
         external_id: None,
         firmware_id: None,
         software_id: None,
-        additional_info: req.additional_info,
+        additional_info: None,
         device_data: json!({}),
-    };
+    });
+    device.name = req.name;
+    device.device_profile_id = profile_id;
+    device.customer_id = customer_id;
+    if req.r#type.is_some() {
+        device.r#type = req.r#type;
+    }
+    if req.label.is_some() {
+        device.label = req.label;
+    }
+    if req.additional_info.is_some() {
+        device.additional_info = req.additional_info;
+    }
 
     // 新设备总是带凭证；更新仅在显式给 accessToken 时轮换。
     let rotate_credentials = is_new || req.access_token.is_some();
@@ -189,7 +214,17 @@ async fn delete_device(
     require_authority(&user, &[Authority::TenantAdmin])?;
     let device = load_device(&state, id).await?;
     check_tenant_scope(&user, device.tenant_id)?;
-    state.device_dao.delete_by_id(id).await?;
+    let mut tx = state.pool.begin().await.map_err(TbError::db)?;
+    state.timeseries_dao.delete_by_entity(&mut tx, id).await?;
+    state.attributes_dao.delete_by_entity(&mut tx, id).await?;
+    state.alarm_dao.delete_by_entity(&mut tx, id).await?;
+    state
+        .calculated_field_dao
+        .delete_by_entity(&mut tx, id)
+        .await?;
+    state.device_dao.delete_by_id_in(&mut tx, id).await?;
+    tx.commit().await.map_err(TbError::db)?;
+    crate::telemetry_cache::invalidate_latest(&state, id).await;
     close_device_sessions(&state, &device, "device deleted").await?;
     audit(
         &state,

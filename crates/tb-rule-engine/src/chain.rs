@@ -1,22 +1,18 @@
-//! 规则链状态构建与执行：BFS 遍历，relation 边路由，100 跳环路保护。
-//! 附加语义：
-//! - debug_mode 节点：on_msg 前后各写一条 rule_node_debug_event（IN/OUT，panic 记 error 列）。
-//! - DLQ："Failure" relation 无匹配边（含 on_msg panic 合成的 Failure）时发 `tb_rule_engine.dlq`，
-//!   metadata 加 error/fromNodeId/chainId。其余 relation 无边匹配维持原有丢弃语义
-//!   （否则默认链终端节点的 "Success" 会刷屏 DLQ）。
-//! - flow.checkpoint：节点的 "Success" 输出不在本地转发，而是携带 rule_chain_id/下一跳
-//!   rule_node_id requeue 回 `tb_rule_engine.<queue>`，由消费循环从该节点恢复执行。
+//! 规则链状态构建与执行：BFS 遍历、跨 Kafka 重投的全局跳数限制与 DLQ。
+//! debug 节点记录 IN/OUT；Failure 无边、checkpoint 无 Success 边及环路截断均进入 DLQ。
 
 use std::collections::{HashMap, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::time::Duration;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use futures::FutureExt;
 use prost::Message as _;
 use sqlx::PgPool;
 use tb_common::msg::TbMsg;
-use tb_common::{EntityType, TbResult};
+use tb_common::{EntityType, TbError, TbResult};
 use tb_dao::models::RuleNode;
 use tb_dao::{RelationDao, RuleChainDao, RuleNodeDao, RuleNodeDebugEvent};
 use tb_proto::convert::tb_msg_to_proto;
@@ -26,9 +22,11 @@ use uuid::Uuid;
 
 use crate::context::NodeContext;
 use crate::node::Node;
+use crate::nodes::DelayNode;
 use crate::registry;
 
 const MAX_HOPS: usize = 100;
+const HOPS_KEY: &str = "_hops";
 
 pub struct RuleChainState {
     pub chain_id: Uuid,
@@ -36,6 +34,15 @@ pub struct RuleChainState {
     /// from_node_id → [(relation_type, to_node_id)]
     pub edges: HashMap<Uuid, Vec<(String, Uuid)>>,
     pub first_node_id: Option<Uuid>,
+}
+
+struct ErrorPlaceholderNode;
+
+#[async_trait]
+impl Node for ErrorPlaceholderNode {
+    async fn on_msg(&self, _ctx: &NodeContext, msg: TbMsg) -> Vec<(String, TbMsg)> {
+        vec![("Failure".into(), msg)]
+    }
 }
 
 pub struct ChainLoader {
@@ -60,7 +67,19 @@ impl ChainLoader {
         let mut edges: HashMap<Uuid, Vec<(String, Uuid)>> = HashMap::new();
         for rn in rule_nodes {
             let config = rn.configuration.clone().unwrap_or(serde_json::json!({}));
-            let node = registry::create_node(&rn.r#type, &config)?;
+            let node = match registry::create_node(&rn.r#type, &config) {
+                Ok(node) => node,
+                Err(e) => {
+                    tracing::error!(
+                        node_id = %rn.id,
+                        node = %rn.name,
+                        node_type = %rn.r#type,
+                        error = %e,
+                        "rule node initialization failed; using failure placeholder"
+                    );
+                    Arc::new(ErrorPlaceholderNode)
+                }
+            };
             for rel in relation_dao
                 .find_by_from(rn.id, EntityType::RuleNode)
                 .await?
@@ -106,55 +125,95 @@ async fn save_debug_event(
     }
 }
 
-/// 发 DLQ：metadata 追加 error/fromNodeId/chainId。
-async fn send_to_dlq(
-    ctx: &NodeContext,
-    state: &RuleChainState,
-    node: &RuleNode,
+async fn send_dlq(
+    producer: &Arc<dyn QueueProducer>,
+    chain_id: Uuid,
+    from_node_id: Uuid,
     mut msg: TbMsg,
     error: String,
-) {
+) -> TbResult<()> {
     msg.metadata.insert("error".into(), error);
     msg.metadata
-        .insert("fromNodeId".into(), node.id.to_string());
-    msg.metadata
-        .insert("chainId".into(), state.chain_id.to_string());
+        .insert("fromNodeId".into(), from_node_id.to_string());
+    msg.metadata.insert("chainId".into(), chain_id.to_string());
     let envelope = ToRuleEngineMsg {
         tenant_id: msg.tenant_id.to_string(),
         tb_msg: Some(tb_msg_to_proto(&msg)),
     };
     let key = msg.originator.id.to_string();
-    if let Err(e) = ctx
-        .kafka_producer
+    producer
         .send(
             TbTopic::RULE_ENGINE_DLQ,
             &key,
             Bytes::from(envelope.encode_to_vec()),
         )
         .await
-    {
-        tracing::error!("send to DLQ failed: {e}");
-    }
+        .map_err(|e| {
+            tracing::error!("send to DLQ failed: {e}");
+            TbError::internal(e)
+        })
 }
 
-/// checkpoint requeue：携带 rule_chain_id + 下一跳 rule_node_id 发回原队列。
-async fn requeue(ctx: &NodeContext, state: &RuleChainState, next_node: Uuid, msg: TbMsg) {
-    let mut proto = tb_msg_to_proto(&msg);
-    proto.rule_chain_id = state.chain_id.to_string();
-    proto.rule_node_id = next_node.to_string();
+/// 经 TbMsg 自身的 checkpoint 字段重投到原规则队列。
+async fn requeue(
+    producer: &Arc<dyn QueueProducer>,
+    chain_id: Uuid,
+    next_node: Uuid,
+    mut msg: TbMsg,
+) -> TbResult<()> {
+    msg.rule_chain_id = Some(chain_id);
+    msg.rule_node_id = Some(next_node);
     let envelope = ToRuleEngineMsg {
         tenant_id: msg.tenant_id.to_string(),
-        tb_msg: Some(proto),
+        tb_msg: Some(tb_msg_to_proto(&msg)),
     };
     let topic = TbTopic::rule_engine(&msg.queue_name);
     let key = msg.originator.id.to_string();
-    if let Err(e) = ctx
-        .kafka_producer
+    producer
         .send(&topic, &key, Bytes::from(envelope.encode_to_vec()))
         .await
-    {
-        tracing::error!("checkpoint requeue failed: {e}");
-    }
+        .map_err(|e| {
+            tracing::error!("rule engine requeue failed: {e}");
+            TbError::internal(e)
+        })
+}
+
+async fn schedule_requeue(
+    ctx: &NodeContext,
+    state: &RuleChainState,
+    rule_node: &RuleNode,
+    next_node: Uuid,
+    msg: TbMsg,
+    delay: Duration,
+) -> TbResult<()> {
+    let permit = match ctx.delay_semaphore.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            let error = "delayed task limit (10000) exceeded".to_string();
+            return send_dlq(
+                &ctx.kafka_producer,
+                state.chain_id,
+                rule_node.id,
+                msg,
+                error,
+            )
+            .await;
+        }
+    };
+    let producer = ctx.kafka_producer.clone();
+    let chain_id = state.chain_id;
+    let from_node_id = rule_node.id;
+    tokio::spawn(async move {
+        let _permit = permit;
+        tokio::time::sleep(delay).await;
+        if let Err(e) = requeue(&producer, chain_id, next_node, msg.clone()).await {
+            let error = format!("delayed requeue failed: {e}");
+            if let Err(dlq_error) = send_dlq(&producer, chain_id, from_node_id, msg, error).await {
+                tracing::error!("delayed requeue DLQ failed: {dlq_error}");
+            }
+        }
+    });
+    Ok(())
 }
 
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
@@ -167,20 +226,42 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// 从 start_node 起 BFS 执行：节点产出按 relation 匹配边转发。
-pub async fn execute(ctx: &NodeContext, state: &RuleChainState, start_node: Uuid, msg: TbMsg) {
+/// 从 start_node 起 BFS 执行；`_hops` 随 checkpoint/delay 重投跨消费累计。
+pub async fn execute(
+    ctx: &NodeContext,
+    state: &RuleChainState,
+    start_node: Uuid,
+    msg: TbMsg,
+) -> TbResult<()> {
+    let mut hops = msg
+        .metadata
+        .get(HOPS_KEY)
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
     let mut queue = VecDeque::from([(start_node, msg)]);
-    let mut hops = 0usize;
-    while let Some((node_id, msg)) = queue.pop_front() {
-        hops += 1;
-        if hops > MAX_HOPS {
-            tracing::warn!("rule chain exceeded {MAX_HOPS} hops, message dropped (loop?)");
-            break;
-        }
+    while let Some((node_id, mut msg)) = queue.pop_front() {
         let Some((rule_node, node)) = state.nodes.get(&node_id) else {
             tracing::debug!(%node_id, "edge points to unknown node, dropped");
             continue;
         };
+        if hops >= MAX_HOPS {
+            hops = hops.saturating_add(1);
+            msg.metadata.insert(HOPS_KEY.into(), hops.to_string());
+            let error = format!("maximum rule chain hops ({MAX_HOPS}) exceeded; possible loop");
+            tracing::warn!(node = %rule_node.name, %msg.id, "{error}");
+            return send_dlq(
+                &ctx.kafka_producer,
+                state.chain_id,
+                rule_node.id,
+                msg,
+                error,
+            )
+            .await;
+        }
+        hops += 1;
+        msg.metadata.insert(HOPS_KEY.into(), hops.to_string());
+        msg.rule_chain_id = Some(state.chain_id);
+        msg.rule_node_id = Some(node_id);
         let debug = rule_node.debug_mode;
         if debug {
             save_debug_event(ctx, state, node_id, &msg, "IN", None).await;
@@ -191,7 +272,6 @@ pub async fn execute(ctx: &NodeContext, state: &RuleChainState, start_node: Uuid
         let outs = match result {
             Ok(outs) => {
                 if debug {
-                    // OUT 事件记录首个输出（无输出时记录原消息）。
                     let out_msg = outs.first().map(|(_, m)| m).unwrap_or(&msg);
                     save_debug_event(ctx, state, node_id, out_msg, "OUT", None).await;
                 }
@@ -207,6 +287,15 @@ pub async fn execute(ctx: &NodeContext, state: &RuleChainState, start_node: Uuid
             }
         };
         let is_checkpoint = rule_node.r#type == registry::CHECKPOINT;
+        let delay = if rule_node.r#type == registry::DELAY {
+            let config = rule_node
+                .configuration
+                .clone()
+                .unwrap_or(serde_json::json!({}));
+            DelayNode::new(&config).ok().map(|node| node.delay())
+        } else {
+            None
+        };
         for (rel, m) in outs {
             let matched = state
                 .edges
@@ -220,12 +309,12 @@ pub async fn execute(ctx: &NodeContext, state: &RuleChainState, start_node: Uuid
                 })
                 .unwrap_or_default();
             if matched.is_empty() {
-                if rel == "Failure" {
+                if rel == "Failure" || (is_checkpoint && rel == "Success") {
                     let error = format!(
-                        "no outgoing edge for relation 'Failure' at node '{}'",
+                        "no outgoing edge for relation '{rel}' at node '{}'",
                         rule_node.name
                     );
-                    send_to_dlq(ctx, state, rule_node, m, error).await;
+                    send_dlq(&ctx.kafka_producer, state.chain_id, rule_node.id, m, error).await?;
                 } else {
                     tracing::debug!(
                         node = %rule_node.name,
@@ -237,11 +326,16 @@ pub async fn execute(ctx: &NodeContext, state: &RuleChainState, start_node: Uuid
             }
             for to in matched {
                 if is_checkpoint && rel == "Success" {
-                    requeue(ctx, state, to, m.clone()).await;
+                    requeue(&ctx.kafka_producer, state.chain_id, to, m.clone()).await?;
+                } else if rel == "Success"
+                    && let Some(delay) = delay
+                {
+                    schedule_requeue(ctx, state, rule_node, to, m.clone(), delay).await?;
                 } else {
                     queue.push_back((to, m.clone()));
                 }
             }
         }
     }
+    Ok(())
 }

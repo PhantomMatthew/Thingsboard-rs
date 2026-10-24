@@ -58,6 +58,7 @@ ThingsBoard IoT 平台的 Rust 重写版（微服务架构，非兼容重设计�
 | `TB_JWT_ACCESS_EXPIRATION_SEC` / `TB_JWT_REFRESH_EXPIRATION_SEC` | tb-auth | 900 / 604800 | token 有效期 |
 | `TB_REDIS_URL` | tb-core | `redis://localhost:16379` | latest 遥测缓存 |
 | `TB_EDQS_URL` | tb-core | `http://localhost:8090` | EDQS 代理目标 |
+| `TB_EDQS_API_KEY` | tb-core / tb-edqs | 空 | 内部 API 密钥，生产必须配置且两服务一致 |
 | `TB_INGEST_ENABLED` | tb-core | false | 开启旧直通遥测落库（Phase 4 起由 rule-engine 接管，默认关） |
 | `TB_RE_QUEUE` | tb-rule-engine | `Main` | 消费的规则引擎队列名 |
 | `TB_MQTT_BIND` | tb-transport-mqtt | `0.0.0.0:1883` | MQTT 监听地址 |

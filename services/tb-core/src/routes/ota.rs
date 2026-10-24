@@ -1,7 +1,7 @@
 //! /api/otaPackage(s)：OTA 包管理（multipart 上传/下载/分页）与设备、档案级绑定。
 //! 绑定后设备在线时经 tb_transport.notifications.<node_id> 推 ota_update。
 
-use axum::extract::{Multipart, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -23,9 +23,23 @@ use crate::AppState;
 use crate::audit::audit;
 use crate::auth_middleware::{check_tenant_scope, require_authority};
 
+pub(crate) const MAX_OTA_PACKAGE_SIZE: usize = 256 * 1024 * 1024;
+
+fn validate_ota_package_size(size: usize) -> TbResult<()> {
+    if size > MAX_OTA_PACKAGE_SIZE {
+        return Err(TbError::InvalidInput(
+            "ota package file exceeds 256 MiB".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/api/otaPackage", post(save_ota_package))
+        .route(
+            "/api/otaPackage",
+            post(save_ota_package).layer(DefaultBodyLimit::max(MAX_OTA_PACKAGE_SIZE)),
+        )
         .route(
             "/api/otaPackage/{id}",
             get(get_ota_package).delete(delete_ota_package),
@@ -51,6 +65,14 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn load_ota(state: &AppState, id: Uuid) -> TbResult<OtaPackage> {
+    state
+        .ota_package_dao
+        .find_meta_by_id(id)
+        .await?
+        .ok_or_else(|| TbError::NotFound(format!("ota package {id}")))
+}
+
+async fn load_ota_with_data(state: &AppState, id: Uuid) -> TbResult<OtaPackage> {
     state
         .ota_package_dao
         .find_by_id(id)
@@ -89,7 +111,9 @@ async fn save_ota_package(
             Some("file") => {
                 file_name = field.file_name().map(str::to_string);
                 content_type = field.content_type().map(str::to_string);
-                data = Some(field.bytes().await.map_err(TbError::internal)?);
+                let bytes = field.bytes().await.map_err(TbError::internal)?;
+                validate_ota_package_size(bytes.len())?;
+                data = Some(bytes);
             }
             _ => {}
         }
@@ -181,7 +205,7 @@ async fn download_ota_package(
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
     require_authority(&user, &[Authority::TenantAdmin])?;
-    let package = load_ota(&state, id).await?;
+    let package = load_ota_with_data(&state, id).await?;
     check_tenant_scope(&user, package.tenant_id)?;
     let data = package
         .data
@@ -217,7 +241,7 @@ async fn list_ota_packages(
     Ok(Json(
         state
             .ota_package_dao
-            .find_by_tenant_id_filtered(
+            .find_meta_by_tenant_filtered(
                 user.0.tenant_id,
                 query.device_profile_id,
                 query.r#type.as_deref(),
@@ -348,4 +372,15 @@ async fn assign_profile_software(
     require_authority(&user, &[Authority::TenantAdmin])?;
     assign_profile_ota(&state, &user, profile_id, ota_id, OtaPackageType::Software).await?;
     Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ota_package_size_limit_is_explicit() {
+        assert!(validate_ota_package_size(MAX_OTA_PACKAGE_SIZE).is_ok());
+        assert!(validate_ota_package_size(MAX_OTA_PACKAGE_SIZE + 1).is_err());
+    }
 }

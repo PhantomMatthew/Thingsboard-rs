@@ -3,8 +3,8 @@
 //! 下行：GET attributes/rpc 带 Observe=0 注册观察（内存注册表 session_id → observer），
 //! observe 注册时向 tb_core 发 session_open + subscribe_attributes/subscribe_rpc，
 //! 本节点 notifications consumer 收到 attribute_update/to_device_rpc 后 NON 推送；
-//! observer 无活动超时（10 分钟）清理并发 session_close。
-//! CON 请求回 ACK 响应，推送一律 NON。
+//! observer 无入站活动超时（10 分钟）清理并发 session_close，推送不续期。
+//! CON 请求回 ACK 响应并缓存 60 秒去重，推送一律 NON。
 
 pub mod downlink;
 
@@ -12,25 +12,26 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU16, AtomicU32, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU16, AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use coap_lite::option_value::OptionValueString;
 use coap_lite::{
-    CoapOption, CoapRequest, ContentFormat, MessageClass, Packet, RequestType,
+    CoapOption, CoapRequest, ContentFormat, MessageClass, MessageType, Packet, RequestType,
     ResponseType,
 };
 use dashmap::DashMap;
 use prost::Message as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tb_common::{KvEntry, KvValue, TsKvEntry};
+use tb_common::{KvEntry, KvValue, TbError, TbResult, TsKvEntry};
 use tb_proto::core as core_pb;
 use tb_proto::transport as pb;
 use tb_queue::{KafkaQueueProducer, QueueError, QueueProducer as _, TbTopic};
 use tb_transport_api::TransportApiClient;
 use tokio::net::UdpSocket;
+use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore};
 use uuid::Uuid;
 
 /// observer 无活动超时：清理注册并发 session_close。
@@ -38,6 +39,93 @@ pub const OBSERVE_TIMEOUT: Duration = Duration::from_secs(600);
 const OBSERVE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// 单请求处理超时：UDP 无重传窗口控制，超时即放弃响应（客户端自行重试）。
 const HANDLER_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_CONCURRENT_HANDLERS: usize = 1024;
+const ADDRESS_RATE_PER_SECOND: f64 = 100.0;
+const CON_DEDUP_TTL: Duration = Duration::from_secs(60);
+
+struct AddressRateLimiter {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl AddressRateLimiter {
+    fn new(now: Instant) -> Self {
+        Self {
+            tokens: ADDRESS_RATE_PER_SECOND,
+            last_refill: now,
+        }
+    }
+
+    fn allow(&mut self, now: Instant) -> bool {
+        let elapsed = now
+            .checked_duration_since(self.last_refill)
+            .unwrap_or_default()
+            .as_secs_f64();
+        self.tokens =
+            (self.tokens + elapsed * ADDRESS_RATE_PER_SECOND).min(ADDRESS_RATE_PER_SECOND);
+        self.last_refill = now;
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
+
+struct CachedConResponse {
+    bytes: Vec<u8>,
+    stored_at: Instant,
+}
+
+#[derive(Default)]
+struct ConResponseCache {
+    entries: DashMap<(SocketAddr, u16), CachedConResponse>,
+    locks: DashMap<(SocketAddr, u16), Arc<Mutex<()>>>,
+}
+
+impl ConResponseCache {
+    async fn lock(&self, addr: SocketAddr, message_id: u16) -> OwnedMutexGuard<()> {
+        let lock = self
+            .locks
+            .entry((addr, message_id))
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        lock.lock_owned().await
+    }
+
+    fn get(&self, addr: SocketAddr, message_id: u16, now: Instant) -> Option<Vec<u8>> {
+        let key = (addr, message_id);
+        let cached = self.entries.get(&key).and_then(|entry| {
+            (now.checked_duration_since(entry.stored_at)
+                .unwrap_or_default()
+                < CON_DEDUP_TTL)
+                .then(|| entry.bytes.clone())
+        });
+        if cached.is_none() {
+            self.entries.remove(&key);
+        }
+        cached
+    }
+
+    fn insert(&self, addr: SocketAddr, message_id: u16, bytes: Vec<u8>, now: Instant) {
+        self.entries.insert(
+            (addr, message_id),
+            CachedConResponse {
+                bytes,
+                stored_at: now,
+            },
+        );
+    }
+
+    fn retain_fresh(&self, now: Instant) {
+        self.entries.retain(|_, entry| {
+            now.checked_duration_since(entry.stored_at)
+                .unwrap_or_default()
+                < CON_DEDUP_TTL
+        });
+        self.locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ObserverKind {
@@ -55,6 +143,8 @@ pub struct Observer {
     pub kind: ObserverKind,
     pub observe_seq: AtomicU32,
     pub last_activity_ms: AtomicI64,
+    pub consecutive_send_failures: AtomicU8,
+    pub last_push_mid: AtomicU16,
     /// request_id → (reply_node_id, expiration_ts)。
     pub rpc_reply_nodes: DashMap<i32, (String, i64)>,
 }
@@ -67,6 +157,9 @@ pub struct TransportState {
     pub brokers: String,
     pub observers: Arc<DashMap<String, Arc<Observer>>>,
     pub next_mid: Arc<AtomicU16>,
+    handler_permits: Arc<Semaphore>,
+    rate_limiters: Arc<DashMap<SocketAddr, AddressRateLimiter>>,
+    con_responses: Arc<ConResponseCache>,
 }
 
 impl TransportState {
@@ -78,6 +171,9 @@ impl TransportState {
             brokers: brokers.to_string(),
             observers: Arc::new(DashMap::new()),
             next_mid: Arc::new(AtomicU16::new(1)),
+            handler_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_HANDLERS)),
+            rate_limiters: Arc::new(DashMap::new()),
+            con_responses: Arc::new(ConResponseCache::default()),
         })
     }
 
@@ -98,9 +194,14 @@ pub async fn serve(state: TransportState, socket: UdpSocket) -> io::Result<()> {
             tracing::debug!(%peer, "undecodable coap packet");
             continue;
         };
+        let Ok(permit) = state.handler_permits.clone().try_acquire_owned() else {
+            tracing::debug!(%peer, "CoAP handler capacity exhausted; dropping packet");
+            continue;
+        };
         let state = state.clone();
         let socket = socket.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             handle_packet(state, socket, packet, peer).await;
         });
     }
@@ -112,26 +213,58 @@ async fn handle_packet(
     packet: Packet,
     peer: SocketAddr,
 ) {
-    // 只处理请求；ACK/RST（客户端对 NON 推送的反应）直接忽略。
+    if packet.header.get_type() == MessageType::Reset {
+        reset_observers(&state, peer, packet.get_token(), packet.header.message_id).await;
+        return;
+    }
     if !matches!(packet.header.code, MessageClass::Request(_)) {
         return;
     }
+    let dedup_key = (packet.header.get_type() == MessageType::Confirmable)
+        .then_some((peer, packet.header.message_id));
+    let _con_guard = match dedup_key {
+        Some((addr, message_id)) => Some(state.con_responses.lock(addr, message_id).await),
+        None => None,
+    };
+    if let Some((addr, message_id)) = dedup_key
+        && let Some(bytes) = state.con_responses.get(addr, message_id, Instant::now())
+    {
+        if let Err(e) = socket.send_to(&bytes, peer).await {
+            tracing::debug!(%peer, "cached CoAP response send failed: {e}");
+        }
+        return;
+    }
+
     let request = CoapRequest::from_packet(packet, peer);
     touch_observers(&state, peer);
-    let result = tokio::time::timeout(
-        HANDLER_TIMEOUT,
-        dispatch(&state, &request),
-    )
-    .await
-    .unwrap_or_else(|_| reply(&request, ResponseType::InternalServerError, Vec::new()));
-    if let Some(bytes) = result
-        && let Err(e) = socket.send_to(&bytes, peer).await
-    {
-        tracing::debug!(%peer, "coap response send failed: {e}");
+    let now = Instant::now();
+    let allowed = {
+        let mut limiter = state
+            .rate_limiters
+            .entry(peer)
+            .or_insert_with(|| AddressRateLimiter::new(now));
+        limiter.allow(now)
+    };
+    let result = if allowed {
+        tokio::time::timeout(HANDLER_TIMEOUT, dispatch(&state, &request))
+            .await
+            .unwrap_or_else(|_| reply(&request, ResponseType::InternalServerError, Vec::new()))
+    } else {
+        reply(&request, ResponseType::TooManyRequests, Vec::new())
+    };
+    if let Some(bytes) = result {
+        if let Some((addr, message_id)) = dedup_key {
+            state
+                .con_responses
+                .insert(addr, message_id, bytes.clone(), Instant::now());
+        }
+        if let Err(e) = socket.send_to(&bytes, peer).await {
+            tracing::debug!(%peer, "coap response send failed: {e}");
+        }
     }
 }
 
-/// 同地址 observer 有任何活动即续期。
+/// 同地址 observer 有入站请求即续期；下行推送不续期。
 fn touch_observers(state: &TransportState, addr: SocketAddr) {
     let now = now_ms();
     for entry in state.observers.iter() {
@@ -141,11 +274,68 @@ fn touch_observers(state: &TransportState, addr: SocketAddr) {
     }
 }
 
+async fn notify_observer_close(state: &TransportState, observer: &Observer, reason: &str) {
+    send_core(
+        state,
+        &observer.device,
+        core_pb::to_core_msg::Msg::SessionClose(core_pb::SessionCloseMsg {
+            session: Some(observer.info.clone()),
+            reason: reason.into(),
+        }),
+    )
+    .await;
+}
+
+pub(crate) async fn close_observer(state: &TransportState, session_id: &str, reason: &str) {
+    if let Some((_, observer)) = state.observers.remove(session_id) {
+        tracing::info!(session_id, reason, "observe closed");
+        notify_observer_close(state, &observer, reason).await;
+    }
+}
+
+fn resettable_observers(
+    state: &TransportState,
+    addr: SocketAddr,
+    token: &[u8],
+    message_id: u16,
+) -> Vec<String> {
+    state
+        .observers
+        .iter()
+        .filter(|entry| {
+            if entry.addr != addr {
+                return false;
+            }
+            if token.is_empty() {
+                let last_push_mid = entry.last_push_mid.load(Ordering::Relaxed);
+                last_push_mid != 0 && last_push_mid == message_id
+            } else {
+                entry.token == token
+            }
+        })
+        .map(|entry| entry.key().clone())
+        .collect()
+}
+
+async fn reset_observers(state: &TransportState, addr: SocketAddr, token: &[u8], message_id: u16) {
+    for session_id in resettable_observers(state, addr, token, message_id) {
+        close_observer(state, &session_id, "coap observer reset").await;
+    }
+}
+
 /// 周期清理超时 observer，并为剩余 observer 发送会话租约心跳。
 async fn sweep_observers(state: TransportState) {
     loop {
         tokio::time::sleep(OBSERVE_SWEEP_INTERVAL).await;
         let now = now_ms();
+        let instant = Instant::now();
+        state.con_responses.retain_fresh(instant);
+        state.rate_limiters.retain(|_, limiter| {
+            instant
+                .checked_duration_since(limiter.last_refill)
+                .unwrap_or_default()
+                < OBSERVE_TIMEOUT
+        });
         let expired: Vec<String> = state
             .observers
             .iter()
@@ -156,18 +346,7 @@ async fn sweep_observers(state: TransportState) {
             .map(|e| e.key().clone())
             .collect();
         for session_id in expired {
-            if let Some((_, observer)) = state.observers.remove(&session_id) {
-                tracing::info!(session_id, "observe timed out");
-                send_core(
-                    &state,
-                    &observer.device,
-                    core_pb::to_core_msg::Msg::SessionClose(core_pb::SessionCloseMsg {
-                        session: Some(observer.info.clone()),
-                        reason: "coap observe timeout".into(),
-                    }),
-                )
-                .await;
-            }
+            close_observer(&state, &session_id, "coap observe timeout").await;
         }
         let active: Vec<_> = state
             .observers
@@ -188,10 +367,7 @@ async fn sweep_observers(state: TransportState) {
     }
 }
 
-async fn dispatch(
-    state: &TransportState,
-    request: &CoapRequest<SocketAddr>,
-) -> Option<Vec<u8>> {
+async fn dispatch(state: &TransportState, request: &CoapRequest<SocketAddr>) -> Option<Vec<u8>> {
     let method = *request.get_method();
     let segments = request.get_path_as_vec().unwrap_or_default();
     // /api/v1/{token}/{feature}[/{requestId}]
@@ -210,8 +386,9 @@ async fn dispatch(
 
     match (method, feature, request_id) {
         (RequestType::Post, "telemetry", None) => {
-            let Some(device) = validate(state, token).await else {
-                return unauthorized(request);
+            let device = match validate(state, token).await {
+                Ok(device) => device,
+                Err(status) => return reply(request, status, Vec::new()),
             };
             let payload: TelemetryPayload = match serde_json::from_slice(&request.message.payload) {
                 Ok(p) => p,
@@ -223,12 +400,13 @@ async fn dispatch(
                 .await
             {
                 Ok(()) => reply(request, ResponseType::Changed, Vec::new()),
-                Err(_) => reply(request, ResponseType::InternalServerError, Vec::new()),
+                Err(error) => reply(request, transport_error_response(&error), Vec::new()),
             }
         }
         (RequestType::Post, "attributes", None) => {
-            let Some(device) = validate(state, token).await else {
-                return unauthorized(request);
+            let device = match validate(state, token).await {
+                Ok(device) => device,
+                Err(status) => return reply(request, status, Vec::new()),
             };
             let values: HashMap<String, KvValue> =
                 match serde_json::from_slice(&request.message.payload) {
@@ -245,12 +423,13 @@ async fn dispatch(
                 .await
             {
                 Ok(()) => reply(request, ResponseType::Changed, Vec::new()),
-                Err(_) => reply(request, ResponseType::InternalServerError, Vec::new()),
+                Err(error) => reply(request, transport_error_response(&error), Vec::new()),
             }
         }
         (RequestType::Get, "attributes", None) => {
-            let Some(device) = validate(state, token).await else {
-                return unauthorized(request);
+            let device = match validate(state, token).await {
+                Ok(device) => device,
+                Err(status) => return reply(request, status, Vec::new()),
             };
             match observe {
                 Some(true) => {
@@ -273,8 +452,9 @@ async fn dispatch(
             }
         }
         (RequestType::Get, "rpc", None) => {
-            let Some(device) = validate(state, token).await else {
-                return unauthorized(request);
+            let device = match validate(state, token).await {
+                Ok(device) => device,
+                Err(status) => return reply(request, status, Vec::new()),
             };
             match observe {
                 Some(true) => {
@@ -289,8 +469,9 @@ async fn dispatch(
             }
         }
         (RequestType::Post, "rpc", None) => {
-            let Some(device) = validate(state, token).await else {
-                return unauthorized(request);
+            let device = match validate(state, token).await {
+                Ok(device) => device,
+                Err(status) => return reply(request, status, Vec::new()),
             };
             #[derive(Deserialize)]
             struct RpcPayload {
@@ -315,12 +496,13 @@ async fn dispatch(
                 .await
             {
                 Ok(()) => reply(request, ResponseType::Changed, Vec::new()),
-                Err(_) => reply(request, ResponseType::InternalServerError, Vec::new()),
+                Err(error) => reply(request, transport_error_response(&error), Vec::new()),
             }
         }
         (RequestType::Post, "rpc", Some(request_id)) => {
-            let Some(device) = validate(state, token).await else {
-                return unauthorized(request);
+            let device = match validate(state, token).await {
+                Ok(device) => device,
+                Err(status) => return reply(request, status, Vec::new()),
             };
             let Ok(request_id) = request_id.parse::<i32>() else {
                 return reply(request, ResponseType::BadRequest, Vec::new());
@@ -393,7 +575,38 @@ async fn current_attributes(
     Some(body.to_string().into_bytes())
 }
 
-/// observe 注册：建 sync 会话 → session_open + subscribe_*，登记注册表。
+enum ExistingObserve {
+    New,
+    Reuse,
+    Replaced(Arc<Observer>),
+}
+
+fn prepare_observe_registration(
+    state: &TransportState,
+    addr: SocketAddr,
+    token: &[u8],
+    device_id: &str,
+    kind: ObserverKind,
+) -> ExistingObserve {
+    let existing = state
+        .observers
+        .iter()
+        .find(|entry| entry.addr == addr && entry.token == token && entry.kind == kind)
+        .map(|entry| (entry.key().clone(), entry.value().clone()));
+    let Some((session_id, observer)) = existing else {
+        return ExistingObserve::New;
+    };
+    if observer.device.device_id == device_id {
+        observer.last_activity_ms.store(now_ms(), Ordering::Relaxed);
+        return ExistingObserve::Reuse;
+    }
+    match state.observers.remove(&session_id) {
+        Some((_, observer)) => ExistingObserve::Replaced(observer),
+        None => ExistingObserve::New,
+    }
+}
+
+/// observe 注册：同键同设备续期；同键跨设备替换并关闭旧 core 会话。
 async fn observe_register(
     state: &TransportState,
     request: &CoapRequest<SocketAddr>,
@@ -402,17 +615,12 @@ async fn observe_register(
 ) {
     let addr = request.source.unwrap();
     let token = request.message.get_token().to_vec();
-    // 同 (addr, token, kind) 重复注册视为续期：直接沿用原会话。
-    if let Some(existing) = state
-        .observers
-        .iter()
-        .find(|e| e.addr == addr && e.token == token && e.kind == kind)
-        .map(|e| e.key().clone())
-    {
-        if let Some(entry) = state.observers.get(&existing) {
-            entry.last_activity_ms.store(now_ms(), Ordering::Relaxed);
+    match prepare_observe_registration(state, addr, &token, &device.device_id, kind) {
+        ExistingObserve::Reuse => return,
+        ExistingObserve::Replaced(observer) => {
+            notify_observer_close(state, &observer, "observe replaced by another device").await;
         }
-        return;
+        ExistingObserve::New => {}
     }
     let session_id = Uuid::now_v7().to_string();
     let info = session_info(state, &device, &session_id);
@@ -425,12 +633,12 @@ async fn observe_register(
     )
     .await;
     let subscribe = match kind {
-        ObserverKind::Attributes => core_pb::to_core_msg::Msg::SubscribeAttributes(
-            core_pb::SubscribeAttributesMsg {
+        ObserverKind::Attributes => {
+            core_pb::to_core_msg::Msg::SubscribeAttributes(core_pb::SubscribeAttributesMsg {
                 session: Some(info.clone()),
                 subscribe: true,
-            },
-        ),
+            })
+        }
         ObserverKind::Rpc => core_pb::to_core_msg::Msg::SubscribeRpc(core_pb::SubscribeRpcMsg {
             session: Some(info.clone()),
             subscribe: true,
@@ -447,6 +655,8 @@ async fn observe_register(
             kind,
             observe_seq: AtomicU32::new(0),
             last_activity_ms: AtomicI64::new(now_ms()),
+            consecutive_send_failures: AtomicU8::new(0),
+            last_push_mid: AtomicU16::new(0),
             rpc_reply_nodes: DashMap::new(),
         }),
     );
@@ -466,31 +676,39 @@ async fn observe_deregister(
         .iter()
         .find(|e| e.addr == addr && e.token == token && e.kind == kind)
         .map(|e| e.key().clone());
-    if let Some(session_id) = found
-        && let Some((_, observer)) = state.observers.remove(&session_id)
-    {
-        send_core(
-            state,
-            &observer.device,
-            core_pb::to_core_msg::Msg::SessionClose(core_pb::SessionCloseMsg {
-                session: Some(observer.info.clone()),
-                reason: "coap observe deregister".into(),
-            }),
-        )
-        .await;
-        tracing::info!(session_id, %addr, ?kind, "observe deregistered");
+    if let Some(session_id) = found {
+        close_observer(state, &session_id, "coap observe deregister").await;
     }
 }
 
-async fn validate(state: &TransportState, token: &str) -> Option<pb::DeviceInfoProto> {
-    match state.transport_api.validate_token(token).await {
-        Ok(resp) if resp.valid => resp.device,
-        _ => None,
+fn validation_response(
+    response: TbResult<pb::ValidateCredentialsResponse>,
+) -> Result<pb::DeviceInfoProto, ResponseType> {
+    match response {
+        Ok(response) if response.valid => response.device.ok_or_else(|| {
+            tracing::warn!("valid CoAP credentials without device info");
+            ResponseType::InternalServerError
+        }),
+        Ok(_) => Err(ResponseType::Unauthorized),
+        Err(error) => {
+            tracing::warn!("CoAP credential validation infrastructure failed: {error}");
+            Err(ResponseType::InternalServerError)
+        }
     }
 }
 
-fn unauthorized(request: &CoapRequest<SocketAddr>) -> Option<Vec<u8>> {
-    reply(request, ResponseType::Unauthorized, Vec::new())
+async fn validate(
+    state: &TransportState,
+    token: &str,
+) -> Result<pb::DeviceInfoProto, ResponseType> {
+    validation_response(state.transport_api.validate_token(token).await)
+}
+
+fn transport_error_response(error: &TbError) -> ResponseType {
+    match error {
+        TbError::RateLimitExceeded(_) => ResponseType::TooManyRequests,
+        _ => ResponseType::InternalServerError,
+    }
 }
 
 fn session_info(
@@ -553,7 +771,9 @@ fn reply_json(
 ) -> Option<Vec<u8>> {
     let mut response = request.response.clone()?;
     response.set_status(status);
-    response.message.set_content_format(ContentFormat::ApplicationJSON);
+    response
+        .message
+        .set_content_format(ContentFormat::ApplicationJSON);
     response.message.payload = payload;
     response.message.to_bytes().ok()
 }
@@ -568,7 +788,9 @@ fn reply_observed(
     response.set_status(status);
     response.message.set_observe_value(0);
     if let Some(p) = payload {
-        response.message.set_content_format(ContentFormat::ApplicationJSON);
+        response
+            .message
+            .set_content_format(ContentFormat::ApplicationJSON);
         response.message.payload = p;
     }
     response.message.to_bytes().ok()
@@ -630,5 +852,155 @@ impl TelemetryPayload {
                 })
                 .collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state() -> TransportState {
+        TransportState::new("localhost:29092", &format!("coap-unit-{}", Uuid::now_v7())).unwrap()
+    }
+
+    fn observer(
+        addr: SocketAddr,
+        token: &[u8],
+        device_id: &str,
+        session_id: &str,
+    ) -> Arc<Observer> {
+        Arc::new(Observer {
+            addr,
+            token: token.to_vec(),
+            device: pb::DeviceInfoProto {
+                device_id: device_id.into(),
+                ..Default::default()
+            },
+            info: core_pb::SessionInfoProto {
+                session_id: session_id.into(),
+                device_id: device_id.into(),
+                ..Default::default()
+            },
+            kind: ObserverKind::Attributes,
+            observe_seq: AtomicU32::new(0),
+            last_activity_ms: AtomicI64::new(0),
+            consecutive_send_failures: AtomicU8::new(0),
+            last_push_mid: AtomicU16::new(0),
+            rpc_reply_nodes: DashMap::new(),
+        })
+    }
+
+    #[test]
+    fn address_token_bucket_limits_and_refills() {
+        let now = Instant::now();
+        let mut limiter = AddressRateLimiter::new(now);
+        for _ in 0..ADDRESS_RATE_PER_SECOND as usize {
+            assert!(limiter.allow(now));
+        }
+        assert!(!limiter.allow(now));
+        assert!(limiter.allow(now + Duration::from_millis(20)));
+    }
+
+    #[test]
+    fn confirmable_response_cache_replays_and_expires() {
+        let cache = ConResponseCache::default();
+        let addr: SocketAddr = "127.0.0.1:5683".parse().unwrap();
+        let now = Instant::now();
+        cache.insert(addr, 7, vec![1, 2, 3], now);
+        assert_eq!(
+            cache.get(addr, 7, now + Duration::from_secs(59)),
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(cache.get(addr, 7, now + CON_DEDUP_TTL), None);
+    }
+
+    #[tokio::test]
+    async fn confirmable_retransmission_waits_for_the_first_handler() {
+        let cache = Arc::new(ConResponseCache::default());
+        let addr: SocketAddr = "127.0.0.1:5683".parse().unwrap();
+        let first = cache.lock(addr, 7).await;
+        let waiting = {
+            let cache = cache.clone();
+            tokio::spawn(async move {
+                let _guard = cache.lock(addr, 7).await;
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn observe_rekey_between_devices_replaces_old_session() {
+        let state = test_state();
+        let addr: SocketAddr = "127.0.0.1:5683".parse().unwrap();
+        state
+            .observers
+            .insert("old".into(), observer(addr, b"token", "device-a", "old"));
+
+        assert!(matches!(
+            prepare_observe_registration(
+                &state,
+                addr,
+                b"token",
+                "device-a",
+                ObserverKind::Attributes
+            ),
+            ExistingObserve::Reuse
+        ));
+        let replaced = prepare_observe_registration(
+            &state,
+            addr,
+            b"token",
+            "device-b",
+            ObserverKind::Attributes,
+        );
+        let ExistingObserve::Replaced(old) = replaced else {
+            panic!("cross-device registration must replace the old observer");
+        };
+        assert_eq!(old.info.session_id, "old");
+        assert!(state.observers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reset_matches_token_or_latest_push_mid() {
+        let state = test_state();
+        let addr: SocketAddr = "127.0.0.1:5683".parse().unwrap();
+        let first = observer(addr, b"one", "device-a", "first");
+        first.last_push_mid.store(41, Ordering::Relaxed);
+        let second = observer(addr, b"two", "device-b", "second");
+        second.last_push_mid.store(42, Ordering::Relaxed);
+        state.observers.insert("first".into(), first);
+        state.observers.insert("second".into(), second);
+
+        assert_eq!(
+            resettable_observers(&state, addr, b"", 41),
+            vec!["first".to_string()]
+        );
+        assert_eq!(
+            resettable_observers(&state, addr, b"two", 0),
+            vec!["second".to_string()]
+        );
+        assert!(resettable_observers(&state, addr, b"", 99).is_empty());
+    }
+
+    #[test]
+    fn credential_and_rate_limit_errors_have_distinct_response_codes() {
+        assert_eq!(
+            validation_response(Ok(pb::ValidateCredentialsResponse::default())).unwrap_err(),
+            ResponseType::Unauthorized
+        );
+        assert_eq!(
+            validation_response(Err(TbError::Internal("timeout".into()))).unwrap_err(),
+            ResponseType::InternalServerError
+        );
+        assert_eq!(
+            transport_error_response(&TbError::RateLimitExceeded("flood".into())),
+            ResponseType::TooManyRequests
+        );
     }
 }

@@ -37,8 +37,23 @@ impl RuleEngineService {
         kafka_producer: KafkaQueueProducer,
         cache_ttl: Duration,
     ) -> Self {
+        let ctx = NodeContext::new(pool.clone(), kafka_producer);
+        Self::build(pool, ctx, cache_ttl)
+    }
+
+    pub fn with_cache_ttl_and_redis(
+        pool: PgPool,
+        kafka_producer: KafkaQueueProducer,
+        cache_ttl: Duration,
+        redis_manager: redis::aio::ConnectionManager,
+    ) -> Self {
+        let ctx = NodeContext::new(pool.clone(), kafka_producer).with_redis_manager(redis_manager);
+        Self::build(pool, ctx, cache_ttl)
+    }
+
+    fn build(pool: PgPool, ctx: NodeContext, cache_ttl: Duration) -> Self {
         Self {
-            ctx: NodeContext::new(pool.clone(), kafka_producer),
+            ctx,
             loader: ChainLoader::new(pool.clone()),
             chain_dao: RuleChainDao::new(pool),
             chain_cache: moka::future::Cache::builder()
@@ -54,7 +69,7 @@ impl RuleEngineService {
         match self.root_chain(msg.tenant_id).await? {
             Some(state) => {
                 if let Some(first) = state.first_node_id {
-                    chain::execute(&self.ctx, &state, first, msg).await;
+                    chain::execute(&self.ctx, &state, first, msg).await?;
                 } else {
                     tracing::debug!(tenant_id = %msg.tenant_id, "root chain has no first node, dropped");
                 }
@@ -64,12 +79,12 @@ impl RuleEngineService {
         Ok(())
     }
 
-    /// checkpoint 恢复入口：从指定链的指定节点继续执行。
+    /// checkpoint/delay 恢复入口：从指定链的指定节点继续执行。
     pub async fn handle_at(&self, msg: TbMsg, chain_id: Uuid, node_id: Uuid) -> TbResult<()> {
         match self.chain_by_id(chain_id).await? {
             Some(state) => {
                 if state.nodes.contains_key(&node_id) {
-                    chain::execute(&self.ctx, &state, node_id, msg).await;
+                    chain::execute(&self.ctx, &state, node_id, msg).await?;
                 } else {
                     tracing::warn!(%chain_id, %node_id, "checkpoint target node not in chain, dropped");
                 }

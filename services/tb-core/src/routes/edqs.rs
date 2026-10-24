@@ -37,6 +37,13 @@ fn resolve_tenant(user: &AuthUser, body: &mut Value) -> TbResult<Uuid> {
     }
 }
 
+fn with_api_key(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match std::env::var("TB_EDQS_API_KEY") {
+        Ok(key) if !key.is_empty() => request.header("X-EDQS-KEY", key),
+        _ => request,
+    }
+}
+
 fn bad_gateway(e: impl std::fmt::Display) -> Response {
     (
         StatusCode::BAD_GATEWAY,
@@ -65,13 +72,11 @@ async fn query_entity_data(
     Json(mut body): Json<Value>,
 ) -> Result<Response, ApiError> {
     resolve_tenant(&user, &mut body)?;
-    match state
+    let request = state
         .http_client
         .post(format!("{}/api/query/entityData", state.edqs_url))
-        .json(&body)
-        .send()
-        .await
-    {
+        .json(&body);
+    match with_api_key(request).send().await {
         Ok(r) => Ok(forward(r).await),
         Err(e) => Ok(bad_gateway(e)),
     }
@@ -110,13 +115,11 @@ async fn query_entity_data_get(
     push("pageSize", params.page_size.map(|v| v.to_string()));
     push("sortBy", params.sort_by);
     push("sortOrder", params.sort_order);
-    match state
+    let request = state
         .http_client
         .get(format!("{}/api/query/entityData", state.edqs_url))
-        .query(&qs)
-        .send()
-        .await
-    {
+        .query(&qs);
+    match with_api_key(request).send().await {
         Ok(r) => Ok(forward(r).await),
         Err(e) => Ok(bad_gateway(e)),
     }

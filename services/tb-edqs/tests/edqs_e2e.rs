@@ -279,6 +279,7 @@ async fn edqs_end_to_end() {
                     scope: tb_proto::common::AttributeScope::ServerScope as i32,
                     updated: vec![],
                     deleted_keys: vec!["firmware".into()],
+                    update_ts: 3000,
                 },
             )),
         },
@@ -331,6 +332,26 @@ async fn edqs_end_to_end() {
     assert_eq!(resp["totalElements"], 2);
     assert_eq!(resp["totalPages"], 2);
     assert_eq!(resp["hasNext"], true);
+
+    // 事件 4：删除整个租户 → 查询不再返回残留实体。
+    tb_queue::edqs::publish_event(
+        &producer,
+        tenant_id,
+        &pb::EdqsEventMsg {
+            tenant_id: tenant_id.to_string(),
+            event: Some(pb::edqs_event_msg::Event::TenantDelete(
+                pb::TenantDeleteMsg {
+                    tenant_id: tenant_id.to_string(),
+                },
+            )),
+        },
+    )
+    .await
+    .unwrap();
+    poll_query(&client, &base, &all_query, |resp| {
+        resp["totalElements"] == 0
+    })
+    .await;
 
     consumer.abort();
 }

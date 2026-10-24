@@ -11,7 +11,7 @@ use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use prost::Message as _;
 use serde::Deserialize;
-use tb_common::{KvEntry, KvValue, TsKvEntry};
+use tb_common::{KvEntry, KvValue, TbResult, TsKvEntry};
 use tb_proto::core as core_pb;
 use tb_proto::transport as pb;
 use tb_queue::{QueueProducer as _, TbTopic};
@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::codec::{
     ConnectPacket, LEVEL_3_1_1, MqttCodec, MqttPacket, PublishPacket, connack_code,
 };
-use crate::{SessionCommand, SessionHandle, TransportState, UNSUBSCRIBED};
+use crate::{SessionCommand, SessionHandle, SessionRegistry, TransportState, UNSUBSCRIBED};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DOWNLINK_CHANNEL_SIZE: usize = 32;
@@ -33,6 +33,7 @@ const NO_KEEPALIVE: Duration = Duration::from_secs(24 * 3600);
 pub const TOPIC_TELEMETRY: &str = "v1/devices/me/telemetry";
 pub const TOPIC_ATTRIBUTES: &str = "v1/devices/me/attributes";
 pub const TOPIC_ATTRIBUTES_REQUEST_PREFIX: &str = "v1/devices/me/attributes/request/";
+pub const TOPIC_ATTRIBUTES_RESPONSE_PREFIX: &str = "v1/devices/me/attributes/response/";
 pub const TOPIC_RPC_REQUEST_PREFIX: &str = "v1/devices/me/rpc/request/";
 pub const TOPIC_RPC_RESPONSE_PREFIX: &str = "v1/devices/me/rpc/response/";
 pub const TOPIC_RPC_SUBSCRIBE: &str = "v1/devices/me/rpc/request/+";
@@ -41,7 +42,7 @@ pub async fn run(socket: TcpStream, peer: SocketAddr, state: TransportState) {
     if let Err(e) = socket.set_nodelay(true) {
         tracing::debug!(%peer, "set_nodelay failed: {e}");
     }
-    let mut framed = Framed::new(socket, MqttCodec);
+    let mut framed = Framed::new(socket, MqttCodec::default());
     let Some(mut session) = connect(&mut framed, peer, &state).await else {
         return;
     };
@@ -122,17 +123,24 @@ async fn connect(
         crate::provision::serve(framed, state).await;
         return None;
     }
-    let Some((device, _profile)) = authenticate(state, &connect).await else {
-        send(
-            framed,
-            MqttPacket::ConnAck {
-                session_present: false,
-                return_code: connack_code::BAD_USERNAME_PASSWORD,
-            },
-        )
-        .await;
-        tracing::debug!(%peer, client_id = connect.client_id, "authentication failed");
-        return None;
+    let device = match authenticate(state, &connect).await {
+        Ok(Some((device, _profile))) => device,
+        Ok(None) => {
+            send(
+                framed,
+                MqttPacket::ConnAck {
+                    session_present: false,
+                    return_code: connack_code::BAD_USERNAME_PASSWORD,
+                },
+            )
+            .await;
+            tracing::debug!(%peer, client_id = connect.client_id, "invalid credentials");
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(%peer, "transport-api authentication infrastructure failed: {e}");
+            return None;
+        }
     };
     send(
         framed,
@@ -171,6 +179,10 @@ async fn connect(
         gateway_rpc_qos: Arc::new(AtomicU8::new(UNSUBSCRIBED)),
         next_packet_id: 0,
         inflight: HashSet::new(),
+        _registry_guard: RegistryCleanupGuard {
+            sessions: state.sessions.clone(),
+            tx: tx.clone(),
+        },
     };
     state.sessions.insert(
         session.info.session_id.clone(),
@@ -194,11 +206,11 @@ async fn connect(
 }
 
 /// Java 语义：username+password+client_id 齐备先走 MQTT_BASIC（内部回退 token）；
-/// 仅 username 非空按 access token。
+/// 仅 username 非空按 access token。Err 表示基础设施失败，Ok(None) 表示凭证无效。
 async fn authenticate(
     state: &TransportState,
     connect: &ConnectPacket,
-) -> Option<(pb::DeviceInfoProto, pb::DeviceProfileProto)> {
+) -> TbResult<Option<(pb::DeviceInfoProto, pb::DeviceProfileProto)>> {
     let username = connect.username.as_deref().unwrap_or("");
     let password = connect.password.as_deref().map(String::from_utf8_lossy);
     let resp = if !username.is_empty() && password.is_some() && !connect.client_id.is_empty() {
@@ -213,21 +225,29 @@ async fn authenticate(
     } else if !username.is_empty() {
         state.transport_api.validate_token(username).await
     } else {
-        return None;
+        return Ok(None);
     };
-    match resp {
-        Ok(r) if r.valid => match (r.device, r.profile) {
-            (Some(d), Some(p)) => Some((d, p)),
-            _ => {
-                tracing::warn!("valid credentials without device/profile");
-                None
-            }
-        },
-        Ok(_) => None,
-        Err(e) => {
-            tracing::warn!("transport-api validate failed: {e}");
-            None
-        }
+    let resp = resp?;
+    if !resp.valid {
+        return Ok(None);
+    }
+    match (resp.device, resp.profile) {
+        (Some(device), Some(profile)) => Ok(Some((device, profile))),
+        _ => Err(tb_common::TbError::Internal(
+            "valid credentials without device/profile".into(),
+        )),
+    }
+}
+
+struct RegistryCleanupGuard {
+    sessions: SessionRegistry,
+    tx: mpsc::Sender<SessionCommand>,
+}
+
+impl Drop for RegistryCleanupGuard {
+    fn drop(&mut self) {
+        self.sessions
+            .retain(|_, handle| !handle.tx.same_channel(&self.tx));
     }
 }
 
@@ -255,12 +275,18 @@ pub struct Session {
     next_packet_id: u16,
     /// 下行 QoS1 未 ack 的 packet_id 集合（PUBACK 清除；断连即整会话丢弃，无需重传）。
     inflight: HashSet<u16>,
+    _registry_guard: RegistryCleanupGuard,
 }
 
 impl Session {
-    fn alloc_packet_id(&mut self) -> u16 {
-        self.next_packet_id = self.next_packet_id.wrapping_add(1).max(1);
-        self.next_packet_id
+    fn alloc_packet_id(&mut self) -> Option<u16> {
+        for _ in 0..u16::MAX {
+            self.next_packet_id = self.next_packet_id.wrapping_add(1).max(1);
+            if !self.inflight.contains(&self.next_packet_id) {
+                return Some(self.next_packet_id);
+            }
+        }
+        None
     }
 }
 
@@ -304,6 +330,8 @@ async fn serve(
     } else {
         NO_KEEPALIVE
     };
+    let keepalive = tokio::time::sleep(keep_alive);
+    tokio::pin!(keepalive);
     let mut heartbeat = tokio::time::interval_at(
         tokio::time::Instant::now() + ACTIVITY_HEARTBEAT,
         ACTIVITY_HEARTBEAT,
@@ -336,7 +364,9 @@ async fn serve(
                 if let MqttPacket::Publish(p) = &mut packet
                     && p.qos == 1 && p.packet_id.is_none()
                 {
-                    let packet_id = session.alloc_packet_id();
+                    let Some(packet_id) = session.alloc_packet_id() else {
+                        return "too many inflight downlink packets".into();
+                    };
                     p.packet_id = Some(packet_id);
                     session.inflight.insert(packet_id);
                 }
@@ -355,12 +385,15 @@ async fn serve(
                     report_device_activity(state, &device, &info).await;
                 }
             }
-            pkt = tokio::time::timeout(keep_alive, framed.next()) => {
+            _ = &mut keepalive => {
+                return "keepalive timeout".into();
+            }
+            pkt = framed.next() => {
+                keepalive.as_mut().reset(tokio::time::Instant::now() + keep_alive);
                 match pkt {
-                    Err(_) => return "keepalive timeout".into(),
-                    Ok(None) => return "eof".into(),
-                    Ok(Some(Err(e))) => return format!("codec error: {e}"),
-                    Ok(Some(Ok(packet))) => {
+                    None => return "eof".into(),
+                    Some(Err(e)) => return format!("codec error: {e}"),
+                    Some(Ok(packet)) => {
                         if let Err(reason) = handle(framed, state, session, packet).await {
                             return reason;
                         }
@@ -428,7 +461,11 @@ async fn handle(
                         // 订阅即视为 OTA 就绪：主动检查并推 fw_* 元信息。
                         crate::ota::check_firmware(framed, state, session).await;
                     }
-                    other => tracing::debug!(topic = other, "ignored subscribe"),
+                    other => {
+                        tracing::debug!(topic = other, "rejected unknown subscribe");
+                        granted.push(0x80);
+                        continue;
+                    }
                 }
                 granted.push(granted_qos);
             }
@@ -586,9 +623,8 @@ async fn handle_publish(
             }
             Err(_) => tracing::warn!(topic, "bad rpc response request id"),
         }
-    } else if topic.starts_with(TOPIC_ATTRIBUTES_REQUEST_PREFIX) {
-        // Phase 5 补全 get_attributes 请求/响应。
-        tracing::debug!(topic, "attributes request not supported yet");
+    } else if let Some(request_id) = topic.strip_prefix(TOPIC_ATTRIBUTES_REQUEST_PREFIX) {
+        handle_attributes_request(framed, state, session, request_id, &p.payload).await;
     } else {
         tracing::debug!(topic, "ignored publish topic");
     }
@@ -598,6 +634,77 @@ async fn handle_publish(
         send(framed, MqttPacket::PubAck(packet_id)).await;
     }
     Ok(())
+}
+
+fn split_attribute_keys(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn attributes_to_json(kvs: &[tb_proto::common::KeyValueProto]) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for kv in kvs {
+        if let Some((key, value)) = tb_proto::convert::kv_from_proto(kv, kv.key.clone()) {
+            map.insert(key, serde_json::to_value(&value).unwrap_or_default());
+        }
+    }
+    serde_json::Value::Object(map)
+}
+
+/// 响应格式为 {"client":{...},"shared":{...}}，两种 scope 保留分组。
+async fn handle_attributes_request(
+    framed: &mut Framed<TcpStream, MqttCodec>,
+    state: &TransportState,
+    session: &Session,
+    request_id: &str,
+    payload: &[u8],
+) {
+    let request = if payload.is_empty() {
+        AttributesRequestPayload::default()
+    } else {
+        match serde_json::from_slice::<AttributesRequestPayload>(payload) {
+            Ok(request) => request,
+            Err(e) => {
+                tracing::warn!(request_id, "bad attributes request payload: {e}");
+                return;
+            }
+        }
+    };
+    let response = match state
+        .transport_api
+        .get_attributes(
+            &session.device.device_id,
+            split_attribute_keys(request.client_keys.as_deref()),
+            split_attribute_keys(request.shared_keys.as_deref()),
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            tracing::warn!(request_id, "attributes request failed: {e}");
+            return;
+        }
+    };
+    let body = serde_json::json!({
+        "client": attributes_to_json(&response.client_attributes),
+        "shared": attributes_to_json(&response.shared_attributes),
+    });
+    send(
+        framed,
+        MqttPacket::Publish(PublishPacket {
+            dup: false,
+            qos: 0,
+            retain: false,
+            topic: format!("{TOPIC_ATTRIBUTES_RESPONSE_PREFIX}{request_id}"),
+            packet_id: None,
+            payload: Bytes::from(body.to_string()),
+        }),
+    )
+    .await;
 }
 
 async fn report_activity(state: &TransportState, session: &Session) {
@@ -618,6 +725,13 @@ async fn report_device_activity(
         }),
     )
     .await;
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AttributesRequestPayload {
+    client_keys: Option<String>,
+    shared_keys: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -709,5 +823,69 @@ mod tests {
     #[test]
     fn parse_telemetry_invalid() {
         assert!(parse_telemetry(b"not json").is_err());
+    }
+
+    fn empty_session() -> Session {
+        let (tx, rx) = mpsc::channel(1);
+        let sessions = Arc::new(dashmap::DashMap::new());
+        Session {
+            info: core_pb::SessionInfoProto::default(),
+            device: pb::DeviceInfoProto::default(),
+            keep_alive: 0,
+            tx: tx.clone(),
+            rx,
+            is_gateway: false,
+            sub_devices: HashMap::new(),
+            attributes_qos: Arc::new(AtomicU8::new(UNSUBSCRIBED)),
+            rpc_qos: Arc::new(AtomicU8::new(UNSUBSCRIBED)),
+            gateway_rpc_qos: Arc::new(AtomicU8::new(UNSUBSCRIBED)),
+            next_packet_id: 0,
+            inflight: HashSet::new(),
+            _registry_guard: RegistryCleanupGuard { sessions, tx },
+        }
+    }
+
+    #[test]
+    fn packet_id_allocation_skips_zero_and_inflight_ids() {
+        let mut session = empty_session();
+        session.next_packet_id = u16::MAX;
+        session.inflight.extend([1, 2]);
+        assert_eq!(session.alloc_packet_id(), Some(3));
+        session.inflight.insert(3);
+        assert_eq!(session.alloc_packet_id(), Some(4));
+    }
+
+    #[test]
+    fn registry_guard_removes_all_sessions_on_the_same_connection() {
+        let registry: SessionRegistry = Arc::new(dashmap::DashMap::new());
+        let (tx, _rx) = mpsc::channel(1);
+        let (other_tx, _other_rx) = mpsc::channel(1);
+        let handle = |tx: &mpsc::Sender<SessionCommand>| SessionHandle {
+            tx: tx.clone(),
+            attributes_qos: Arc::new(AtomicU8::new(UNSUBSCRIBED)),
+            rpc_qos: Arc::new(AtomicU8::new(UNSUBSCRIBED)),
+            gateway_device: None,
+        };
+        registry.insert("root".into(), handle(&tx));
+        registry.insert("sub-device".into(), handle(&tx));
+        registry.insert("unrelated".into(), handle(&other_tx));
+
+        drop(RegistryCleanupGuard {
+            sessions: registry.clone(),
+            tx,
+        });
+
+        assert!(!registry.contains_key("root"));
+        assert!(!registry.contains_key("sub-device"));
+        assert!(registry.contains_key("unrelated"));
+    }
+
+    #[test]
+    fn attribute_request_keys_are_trimmed() {
+        assert_eq!(
+            split_attribute_keys(Some(" firmware, serial,, ")),
+            vec!["firmware".to_string(), "serial".to_string()]
+        );
+        assert!(split_attribute_keys(None).is_empty());
     }
 }

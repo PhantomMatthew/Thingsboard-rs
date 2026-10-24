@@ -19,53 +19,35 @@ impl Oauth2ClientDao {
 
     pub async fn save(&self, client: &Oauth2Client) -> TbResult<Oauth2Client> {
         let mut c = client.clone();
-        if self.find_by_id(c.id).await?.is_some() {
-            sqlx::query(
-                "UPDATE oauth2_client SET tenant_id=$2, title=$3, client_id=$4, client_secret=$5, \
-                 authorization_uri=$6, token_uri=$7, user_info_uri=$8, redirect_uri_template=$9, \
-                 scope=$10, enabled=$11 WHERE id=$1",
-            )
-            .bind(c.id)
-            .bind(c.tenant_id)
-            .bind(&c.title)
-            .bind(&c.client_id)
-            .bind(&c.client_secret)
-            .bind(&c.authorization_uri)
-            .bind(&c.token_uri)
-            .bind(&c.user_info_uri)
-            .bind(&c.redirect_uri_template)
-            .bind(&c.scope)
-            .bind(c.enabled)
-            .execute(&self.pool)
-            .await
-            .map_err(TbError::db)?;
-        } else {
-            if c.created_time == 0 {
-                c.created_time = now_ms();
-            }
-            sqlx::query(
-                "INSERT INTO oauth2_client (id, created_time, tenant_id, title, client_id, \
-                 client_secret, authorization_uri, token_uri, user_info_uri, \
-                 redirect_uri_template, scope, enabled) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
-            )
-            .bind(c.id)
-            .bind(c.created_time)
-            .bind(c.tenant_id)
-            .bind(&c.title)
-            .bind(&c.client_id)
-            .bind(&c.client_secret)
-            .bind(&c.authorization_uri)
-            .bind(&c.token_uri)
-            .bind(&c.user_info_uri)
-            .bind(&c.redirect_uri_template)
-            .bind(&c.scope)
-            .bind(c.enabled)
-            .execute(&self.pool)
-            .await
-            .map_err(TbError::db)?;
+        if c.created_time == 0 {
+            c.created_time = now_ms();
         }
-        Ok(c)
+        sqlx::query_as::<_, Oauth2Client>(
+            "INSERT INTO oauth2_client (id, created_time, tenant_id, title, client_id, \
+             client_secret, authorization_uri, token_uri, user_info_uri, \
+             redirect_uri_template, scope, enabled) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) \
+             ON CONFLICT (id) DO UPDATE SET tenant_id=EXCLUDED.tenant_id, title=EXCLUDED.title, \
+             client_id=EXCLUDED.client_id, client_secret=EXCLUDED.client_secret, \
+             authorization_uri=EXCLUDED.authorization_uri, token_uri=EXCLUDED.token_uri, \
+             user_info_uri=EXCLUDED.user_info_uri, redirect_uri_template=EXCLUDED.redirect_uri_template, \
+             scope=EXCLUDED.scope, enabled=EXCLUDED.enabled RETURNING *",
+        )
+        .bind(c.id)
+        .bind(c.created_time)
+        .bind(c.tenant_id)
+        .bind(&c.title)
+        .bind(&c.client_id)
+        .bind(&c.client_secret)
+        .bind(&c.authorization_uri)
+        .bind(&c.token_uri)
+        .bind(&c.user_info_uri)
+        .bind(&c.redirect_uri_template)
+        .bind(&c.scope)
+        .bind(c.enabled)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(TbError::db)
     }
 
     pub async fn find_by_id(&self, id: Uuid) -> TbResult<Option<Oauth2Client>> {

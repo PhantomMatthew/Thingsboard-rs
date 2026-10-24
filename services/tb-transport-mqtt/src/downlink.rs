@@ -9,6 +9,7 @@ use bytes::Bytes;
 use prost::Message as _;
 use tb_proto::core as core_pb;
 use tb_queue::{QueueConsumer as _, StreamQueueConsumer, TbTopic};
+use tokio::sync::mpsc;
 
 use crate::codec::{MqttPacket, PublishPacket};
 use crate::{SessionCommand, TransportState, UNSUBSCRIBED, session};
@@ -20,7 +21,7 @@ pub async fn run(state: TransportState) {
     }
     let group_id = format!("tb-transport-mqtt-{}", state.node_id);
     let mut consumer = loop {
-        match StreamQueueConsumer::new(&state.brokers, &group_id, &[&topic]) {
+        match StreamQueueConsumer::new_manual_commit(&state.brokers, &group_id, &[&topic]) {
             Ok(c) => break c,
             Err(e) => {
                 tracing::error!("notifications consumer failed to start: {e}");
@@ -30,7 +31,14 @@ pub async fn run(state: TransportState) {
     };
     loop {
         match consumer.recv().await {
-            Ok(msg) => handle(&state, msg.payload).await,
+            Ok(msg) => match handle(&state, msg.payload.clone()).await {
+                Ok(()) => {
+                    if let Err(e) = consumer.commit(&msg).await {
+                        tracing::error!("notifications commit failed: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!("notification delivery failed: {e}"),
+            },
             Err(e) => {
                 tracing::error!("notifications consumer error: {e}");
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -39,23 +47,42 @@ pub async fn run(state: TransportState) {
     }
 }
 
-async fn handle(state: &TransportState, payload: Bytes) {
+struct DownlinkTarget {
+    tx: mpsc::Sender<SessionCommand>,
+    gateway_device: Option<String>,
+}
+
+fn target(state: &TransportState, session_id: &str) -> Option<DownlinkTarget> {
+    state.sessions.get(session_id).map(|handle| DownlinkTarget {
+        tx: handle.tx.clone(),
+        gateway_device: handle.gateway_device.clone(),
+    })
+}
+
+async fn handle(state: &TransportState, payload: Bytes) -> Result<(), String> {
     let registry = &state.sessions;
     let Ok(msg) = core_pb::ToTransportMsg::decode(payload) else {
         tracing::warn!("undecodable transport notification");
-        return;
+        return Ok(());
     };
     let Some(oneof) = msg.msg else {
-        return;
+        return Ok(());
     };
     match oneof {
         core_pb::to_transport_msg::Msg::AttributeUpdate(n) => {
-            let Some(handle) = registry.get(&msg.session_id) else {
-                return;
+            let Some((target, qos)) = registry.get(&msg.session_id).map(|handle| {
+                (
+                    DownlinkTarget {
+                        tx: handle.tx.clone(),
+                        gateway_device: handle.gateway_device.clone(),
+                    },
+                    handle.attributes_qos.load(Ordering::Relaxed),
+                )
+            }) else {
+                return Ok(());
             };
-            let qos = handle.attributes_qos.load(Ordering::Relaxed);
             if qos == UNSUBSCRIBED {
-                return;
+                return Ok(());
             }
             // value 缺省 = 删除通知，JSON null；key 用字符串（core 侧已带）。
             let mut body = serde_json::Map::new();
@@ -72,23 +99,28 @@ async fn handle(state: &TransportState, payload: Bytes) {
                 body.insert(key, value);
             }
             send(
-                handle,
+                &target.tx,
                 session::TOPIC_ATTRIBUTES.to_string(),
                 serde_json::to_vec(&body).unwrap_or_default(),
                 qos,
             )
-            .await;
+            .await?;
         }
         core_pb::to_transport_msg::Msg::ToDeviceRpc(rpc) => {
             if rpc.expiration_ts > 0 && rpc.expiration_ts < chrono::Utc::now().timestamp_millis() {
-                return;
+                return Ok(());
             }
-            let Some(handle) = registry.get(&msg.session_id) else {
-                return;
+            let Some(target) = target(state, &msg.session_id) else {
+                return Ok(());
             };
-            let qos = handle.rpc_qos.load(Ordering::Relaxed);
+            let Some(qos) = registry
+                .get(&msg.session_id)
+                .map(|handle| handle.rpc_qos.load(Ordering::Relaxed))
+            else {
+                return Ok(());
+            };
             if qos == UNSUBSCRIBED {
-                return;
+                return Ok(());
             }
             state
                 .rpc_reply_nodes
@@ -100,7 +132,7 @@ async fn handle(state: &TransportState, payload: Bytes) {
             let params: serde_json::Value =
                 serde_json::from_str(&rpc.params_json).unwrap_or(serde_json::Value::Null);
             // 网关子设备会话：包装成 v1/gateway/rpc {"device","data":{"id","method","params"}}。
-            let (topic, body) = match &handle.gateway_device {
+            let (topic, body) = match &target.gateway_device {
                 Some(name) => (
                     crate::gateway::TOPIC_RPC.to_string(),
                     serde_json::json!({
@@ -113,29 +145,36 @@ async fn handle(state: &TransportState, payload: Bytes) {
                     serde_json::json!({"method": rpc.method, "params": params}),
                 ),
             };
-            send(handle, topic, body.to_string().into_bytes(), qos).await;
+            send(&target.tx, topic, body.to_string().into_bytes(), qos).await?;
         }
         core_pb::to_transport_msg::Msg::OtaUpdate(n) => {
-            let Some(handle) = registry.get(&msg.session_id) else {
-                return;
+            let Some((target, qos)) = registry.get(&msg.session_id).map(|handle| {
+                (
+                    DownlinkTarget {
+                        tx: handle.tx.clone(),
+                        gateway_device: handle.gateway_device.clone(),
+                    },
+                    handle.attributes_qos.load(Ordering::Relaxed),
+                )
+            }) else {
+                return Ok(());
             };
             let Some(pkg) = n.ota_package else {
-                return;
+                return Ok(());
             };
             state
                 .ota_packages
                 .insert(msg.session_id.clone(), pkg.clone())
                 .await;
             let body = crate::ota::fw_attributes_body(&pkg);
-            let qos = handle.attributes_qos.load(Ordering::Relaxed);
             let qos = if qos == UNSUBSCRIBED { 0 } else { qos };
             send(
-                handle,
+                &target.tx,
                 session::TOPIC_ATTRIBUTES.to_string(),
                 body.to_string().into_bytes(),
                 qos,
             )
-            .await;
+            .await?;
         }
         core_pb::to_transport_msg::Msg::SessionCloseNotification(n) => {
             tracing::info!(
@@ -143,15 +182,16 @@ async fn handle(state: &TransportState, payload: Bytes) {
                 reason = n.reason,
                 "kick session"
             );
-            let delivered = if let Some(handle) = registry.get(&msg.session_id) {
-                handle
-                    .tx
-                    .send(SessionCommand::Close {
-                        session_id: msg.session_id.clone(),
-                        reason: n.reason,
-                    })
-                    .await
-                    .is_ok()
+            let tx = registry
+                .get(&msg.session_id)
+                .map(|handle| handle.tx.clone());
+            let delivered = if let Some(tx) = tx {
+                tx.send(SessionCommand::Close {
+                    session_id: msg.session_id.clone(),
+                    reason: n.reason,
+                })
+                .await
+                .is_ok()
             } else {
                 false
             };
@@ -161,14 +201,15 @@ async fn handle(state: &TransportState, payload: Bytes) {
         }
         other => tracing::debug!(?other, "ignored transport notification"),
     }
+    Ok(())
 }
 
 async fn send(
-    handle: dashmap::mapref::one::Ref<'_, String, crate::SessionHandle>,
+    tx: &mpsc::Sender<SessionCommand>,
     topic: String,
     payload: Vec<u8>,
     qos: u8,
-) {
+) -> Result<(), String> {
     let packet = MqttPacket::Publish(PublishPacket {
         dup: false,
         qos,
@@ -177,12 +218,7 @@ async fn send(
         packet_id: None, // QoS 1 由会话 task 分配
         payload: Bytes::from(payload),
     });
-    if handle
-        .tx
-        .send(SessionCommand::Packet(packet))
+    tx.send(SessionCommand::Packet(packet))
         .await
-        .is_err()
-    {
-        tracing::debug!("session channel closed before downlink");
-    }
+        .map_err(|_| "session channel closed before downlink".to_string())
 }

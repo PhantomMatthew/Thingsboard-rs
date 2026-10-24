@@ -224,6 +224,19 @@ async fn telemetry_api_end_to_end() {
         json!([{"ts": 999, "value": 12345}]),
         "second full latest read should be served from Redis cache"
     );
+
+    // 带时间范围的删除必须保守失效整个 latest HASH，不能继续返回旧缓存。
+    let resp = client
+        .delete(format!(
+            "{ts_base}/timeseries?keys=temp&startTs=0&endTs=10000"
+        ))
+        .header("Authorization", bearer(&tenant_token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let exists: bool = redis_conn.exists(&cache_key).await.unwrap();
+    assert!(!exists, "range deletion must invalidate latest cache");
     let _: usize = redis_conn.del(&cache_key).await.unwrap();
 
     // 8. attributes：SERVER_SCOPE / SHARED_SCOPE 读写删

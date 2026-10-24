@@ -93,7 +93,7 @@ impl RelationDao {
     ) -> TbResult<Option<EntityRelation>> {
         sqlx::query_as::<_, EntityRelation>(
             "SELECT * FROM relation WHERE from_id=$1 AND from_type=$2 AND to_id=$3 AND \
-             to_type=$4 AND relation_type=$5",
+             to_type=$4 AND relation_type=$5 AND relation_type_group='COMMON'",
         )
         .bind(from_id)
         .bind(from_type.as_str())

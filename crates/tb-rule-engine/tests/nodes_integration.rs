@@ -2,8 +2,10 @@
 //! 纯逻辑节点（filter/math/dedup 等）也走 NodeContext，DB 只用于构造，不依赖既有数据。
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bytes::Bytes;
 use prost::Message as _;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -18,7 +20,9 @@ use tb_dao::{
 };
 use tb_proto::core as core_pb;
 use tb_proto::ruleengine::ToRuleEngineMsg;
-use tb_queue::{KafkaQueueProducer, QueueConsumer, StreamQueueConsumer, TbTopic};
+use tb_queue::{
+    KafkaQueueProducer, QueueConsumer, QueueError, QueueProducer, StreamQueueConsumer, TbTopic,
+};
 use tb_rule_engine::nodes::{
     ChangeOriginatorNode, ClearAlarmNode, CreateAlarmNode, DeduplicationNode, DelayNode,
     DeleteAttributesNode, DeleteKeysNode, GeoFilterNode, KafkaNode, KeyExistsFilterNode, MathNode,
@@ -40,6 +44,45 @@ async fn setup() -> PgPool {
 fn ctx(pool: &PgPool) -> NodeContext {
     let producer = KafkaQueueProducer::new("localhost:29092", "tb-re-nodes-test").unwrap();
     NodeContext::new(pool.clone(), producer)
+}
+
+struct RecordingProducer {
+    sent: Mutex<Vec<(String, Bytes)>>,
+}
+
+impl RecordingProducer {
+    fn drain(&self) -> Vec<(String, Bytes)> {
+        std::mem::take(&mut *self.sent.lock().unwrap())
+    }
+}
+
+#[async_trait::async_trait]
+impl QueueProducer for RecordingProducer {
+    async fn send(&self, topic: &str, _key: &str, payload: Bytes) -> Result<(), QueueError> {
+        self.sent.lock().unwrap().push((topic.to_string(), payload));
+        Ok(())
+    }
+}
+
+fn memory_ctx() -> (NodeContext, Arc<RecordingProducer>) {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://thingsboard:thingsboard@127.0.0.1:1/thingsboard")
+        .unwrap();
+    let producer = Arc::new(RecordingProducer {
+        sent: Mutex::new(Vec::new()),
+    });
+    let queue: Arc<dyn QueueProducer> = producer.clone();
+    (NodeContext::with_queue_producer(pool, queue), producer)
+}
+
+struct NotifyNode(tokio::sync::mpsc::UnboundedSender<Uuid>);
+
+#[async_trait::async_trait]
+impl Node for NotifyNode {
+    async fn on_msg(&self, _ctx: &NodeContext, msg: TbMsg) -> Vec<(String, TbMsg)> {
+        self.0.send(msg.id).unwrap();
+        Vec::new()
+    }
 }
 
 fn msg(data: Value) -> TbMsg {
@@ -630,27 +673,32 @@ async fn delete_attributes_node() {
 }
 
 #[tokio::test]
-async fn delay_node_sleeps() {
-    let pool = setup().await;
-    let ctx = ctx(&pool);
+async fn delay_node_returns_without_sleeping() {
+    let (ctx, _) = memory_ctx();
     let node = DelayNode::new(&json!({"delay_sec": 1})).unwrap();
     let start = std::time::Instant::now();
     let outs = node.on_msg(&ctx, msg(json!({}))).await;
     assert_eq!(outs[0].0, "Success");
-    assert!(start.elapsed() >= Duration::from_secs(1));
-    // 超上限配置被截断到 300（不实际等待）
+    assert!(start.elapsed() < Duration::from_millis(100));
     DelayNode::new(&json!({"delay_sec": 9999})).unwrap();
 }
 
 #[tokio::test]
 async fn deduplication_node() {
-    let pool = setup().await;
-    let ctx = ctx(&pool);
+    let (ctx, _) = memory_ctx();
     let node = DeduplicationNode::new(&json!({"window_sec": 60})).unwrap();
 
-    let m = msg(json!({"temperature": 25}));
+    let mut m = msg(json!({"temperature": 25}));
+    m.rule_chain_id = Some(Uuid::now_v7());
+    m.rule_node_id = Some(Uuid::now_v7());
     assert_eq!(node.on_msg(&ctx, m.clone()).await[0].0, "Success");
     assert_eq!(node.on_msg(&ctx, m.clone()).await[0].0, "Deduplicated");
+    let rebuilt = DeduplicationNode::new(&json!({"window_sec": 60})).unwrap();
+    assert_eq!(
+        rebuilt.on_msg(&ctx, m.clone()).await[0].0,
+        "Deduplicated",
+        "deduplication state must survive rule-chain cache rebuilds"
+    );
     // 内容不同 → Success
     let mut m2 = m.clone();
     m2.data = json!({"temperature": 26});
@@ -775,12 +823,13 @@ async fn rpc_oneway_sends_to_core_topic() {
 #[tokio::test]
 async fn rest_call_against_local_server() {
     use axum::extract::Path;
-    use axum::routing::post;
+    use axum::routing::{get, post};
 
     let pool = setup().await;
     let ctx = ctx(&pool);
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(4);
+    let followed_tx = tx.clone();
     let app = axum::Router::new()
         .route(
             "/ok/{dev}",
@@ -795,6 +844,22 @@ async fn rest_call_against_local_server() {
         .route(
             "/bad",
             post(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+        )
+        .route(
+            "/redirect",
+            post(|| async {
+                (
+                    axum::http::StatusCode::FOUND,
+                    [(axum::http::header::LOCATION, "/followed")],
+                )
+            }),
+        )
+        .route(
+            "/followed",
+            get(move || async move {
+                followed_tx.try_send("followed".into()).ok();
+                axum::http::StatusCode::OK
+            }),
         );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -817,6 +882,21 @@ async fn rest_call_against_local_server() {
         .unwrap()
         .unwrap();
     assert_eq!(got, format!("dev-42|{}", json!({"t": 25})));
+
+    let node = RestCallNode::new(&json!({
+        "url": format!("http://{addr}/redirect"),
+        "method": "POST",
+    }))
+    .unwrap();
+    let outs = node.on_msg(&ctx, msg(json!({"x": 1}))).await;
+    assert_eq!(outs[0].0, "Failure");
+    assert_eq!(outs[0].1.metadata["rest_call_status"], "302");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), rx.recv())
+            .await
+            .is_err(),
+        "rest_call followed a redirect"
+    );
 
     // 500 → Failure，状态码仍进 metadata
     let node = RestCallNode::new(&json!({
@@ -882,6 +962,164 @@ async fn external_mqtt_publishes() {
     assert_eq!(outs[0].0, "Success");
 }
 
+// ---------- delayed requeue / checkpoint loop protection ----------
+
+#[tokio::test]
+async fn delay_does_not_block_following_message() {
+    let (ctx, producer) = memory_ctx();
+    let chain_id = Uuid::now_v7();
+    let delay = make_chain_node(chain_id, "action.delay", json!({"delay_sec": 1}), false);
+    let next = make_chain_node(chain_id, "action.log", json!({}), false);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let delay_impl =
+        tb_rule_engine::registry::create_node(&delay.r#type, &json!({"delay_sec": 1})).unwrap();
+    let next_impl: Arc<dyn Node> = Arc::new(NotifyNode(tx));
+    let state = tb_rule_engine::RuleChainState {
+        chain_id,
+        nodes: [
+            (delay.id, (delay.clone(), delay_impl)),
+            (next.id, (next.clone(), next_impl)),
+        ]
+        .into_iter()
+        .collect(),
+        edges: [(delay.id, vec![("Success".to_string(), next.id)])]
+            .into_iter()
+            .collect(),
+        first_node_id: Some(delay.id),
+    };
+
+    let mut delayed = msg(json!({"value": 1}));
+    delayed.queue_name = "DelayTest".into();
+    let delayed_id = delayed.id;
+    let start = std::time::Instant::now();
+    chain::execute(&ctx, &state, delay.id, delayed)
+        .await
+        .unwrap();
+    assert!(start.elapsed() < Duration::from_millis(200));
+    assert!(producer.drain().is_empty());
+
+    let following_id = msg(json!({"value": 2})).id;
+    let following = TbMsg {
+        id: following_id,
+        ..msg(json!({"value": 2}))
+    };
+    chain::execute(&ctx, &state, next.id, following)
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .unwrap(),
+        Some(following_id)
+    );
+    assert!(producer.drain().is_empty());
+
+    let deliveries = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let deliveries = producer.drain();
+            if !deliveries.is_empty() {
+                return deliveries;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].0, TbTopic::rule_engine("DelayTest"));
+    let envelope = ToRuleEngineMsg::decode(deliveries[0].1.clone()).unwrap();
+    let requeued = envelope.tb_msg.unwrap();
+    assert_eq!(requeued.id, delayed_id.to_string());
+    assert_eq!(requeued.rule_chain_id, chain_id.to_string());
+    assert_eq!(requeued.rule_node_id, next.id.to_string());
+    assert_eq!(requeued.metadata.get("_hops"), Some(&"1".to_string()));
+}
+
+#[tokio::test]
+async fn checkpoint_loop_accumulates_hops_across_requeues_and_terminates_in_dlq() {
+    let (ctx, producer) = memory_ctx();
+    let chain_id = Uuid::now_v7();
+    let checkpoint = make_chain_node(chain_id, "flow.checkpoint", json!({}), false);
+    let implementation =
+        tb_rule_engine::registry::create_node(&checkpoint.r#type, &json!({})).unwrap();
+    let state = tb_rule_engine::RuleChainState {
+        chain_id,
+        nodes: [(checkpoint.id, (checkpoint.clone(), implementation))]
+            .into_iter()
+            .collect(),
+        edges: [(checkpoint.id, vec![("Success".to_string(), checkpoint.id)])]
+            .into_iter()
+            .collect(),
+        first_node_id: Some(checkpoint.id),
+    };
+    let mut current = msg(json!({"value": 1}));
+    current.queue_name = "CheckpointLoop".into();
+    let mut dead_letter = None;
+
+    for _ in 0..=100 {
+        chain::execute(&ctx, &state, checkpoint.id, current)
+            .await
+            .unwrap();
+        let mut deliveries = producer.drain();
+        assert_eq!(deliveries.len(), 1);
+        let (topic, payload) = deliveries.remove(0);
+        if topic == TbTopic::RULE_ENGINE_DLQ {
+            dead_letter = Some(payload);
+            break;
+        }
+        assert_eq!(topic, TbTopic::rule_engine("CheckpointLoop"));
+        let envelope = ToRuleEngineMsg::decode(payload).unwrap();
+        let requeued = envelope.tb_msg.unwrap();
+        assert_eq!(requeued.rule_chain_id, chain_id.to_string());
+        assert_eq!(requeued.rule_node_id, checkpoint.id.to_string());
+        current = tb_proto::convert::tb_msg_from_proto(&requeued).unwrap();
+    }
+
+    let envelope = ToRuleEngineMsg::decode(dead_letter.expect("loop did not reach DLQ")).unwrap();
+    let dlq = envelope.tb_msg.unwrap();
+    assert_eq!(dlq.metadata.get("_hops"), Some(&"101".to_string()));
+    assert!(
+        dlq.metadata
+            .get("error")
+            .is_some_and(|error| error.contains("maximum rule chain hops"))
+    );
+    assert_eq!(
+        dlq.metadata.get("fromNodeId"),
+        Some(&checkpoint.id.to_string())
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_without_success_edge_goes_to_dlq() {
+    let (ctx, producer) = memory_ctx();
+    let chain_id = Uuid::now_v7();
+    let checkpoint = make_chain_node(chain_id, "flow.checkpoint", json!({}), false);
+    let implementation =
+        tb_rule_engine::registry::create_node(&checkpoint.r#type, &json!({})).unwrap();
+    let state = tb_rule_engine::RuleChainState {
+        chain_id,
+        nodes: [(checkpoint.id, (checkpoint.clone(), implementation))]
+            .into_iter()
+            .collect(),
+        edges: Default::default(),
+        first_node_id: Some(checkpoint.id),
+    };
+    chain::execute(&ctx, &state, checkpoint.id, msg(json!({})))
+        .await
+        .unwrap();
+
+    let deliveries = producer.drain();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].0, TbTopic::RULE_ENGINE_DLQ);
+    let envelope = ToRuleEngineMsg::decode(deliveries[0].1.clone()).unwrap();
+    let dlq = envelope.tb_msg.unwrap();
+    assert!(
+        dlq.metadata
+            .get("error")
+            .is_some_and(|error| error.contains("relation 'Success'"))
+    );
+}
+
 // ---------- flow ----------
 
 #[tokio::test]
@@ -911,7 +1149,7 @@ async fn rule_chain_node_executes_target_chain() {
         .unwrap();
     let m = msg(json!({"ts": 1, "values": {"temperature": 33}}));
     let originator = m.originator.id;
-    chain::execute(&ctx, &state, flow.id, m).await;
+    chain::execute(&ctx, &state, flow.id, m).await.unwrap();
     let latest = ts_dao.find_latest(originator, None).await.unwrap();
     assert_eq!(latest.len(), 1, "target chain should have saved telemetry");
 
@@ -966,7 +1204,7 @@ async fn checkpoint_requeues_instead_of_local_forward() {
         &mut consumer,
         Duration::from_secs(30),
         || async {
-            chain::execute(&ctx, &state, checkpoint.id, m.clone()).await;
+            let _ = chain::execute(&ctx, &state, checkpoint.id, m.clone()).await;
         },
         |payload| {
             let Ok(to_re) = ToRuleEngineMsg::decode(payload) else {
@@ -1029,7 +1267,7 @@ async fn failure_without_edge_goes_to_dlq() {
         &mut consumer,
         Duration::from_secs(30),
         || async {
-            chain::execute(&ctx, &state, filter.id, m.clone()).await;
+            let _ = chain::execute(&ctx, &state, filter.id, m.clone()).await;
         },
         |payload| {
             let Ok(to_re) = ToRuleEngineMsg::decode(payload) else {
@@ -1064,7 +1302,7 @@ async fn debug_mode_writes_in_out_events() {
         .unwrap();
     let m = msg(json!({"temperature": 5}));
     let msg_id = m.id;
-    chain::execute(&ctx, &state, log.id, m).await;
+    chain::execute(&ctx, &state, log.id, m).await.unwrap();
 
     let page = debug_dao
         .find_by_node(log.id, None, None, &tb_dao::PageLink::new(0, 10))
