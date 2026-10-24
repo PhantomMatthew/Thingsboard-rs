@@ -1,7 +1,5 @@
 //! action.*：副作用节点（告警清除/属性删除/延迟/去重/计算/下行 RPC）。
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -170,62 +168,87 @@ impl Node for DelayNode {
     }
 }
 
-/// action.deduplication：chain+node+originator+内容 hash 窗口去重。
-/// 状态存于 NodeContext，链缓存重建不会清空；首次 "Success"，重复 "Deduplicated"。
+/// action.deduplication：按 originator 持久化窗口消息，到期后由共享扫描器输出 FIRST/LAST/ALL。
 pub struct DeduplicationNode {
-    window: Duration,
-    key_fields: Vec<String>,
+    interval: Duration,
+    strategy: tb_dao::DedupStrategy,
+    out_msg_type: Option<String>,
+    max_pending_msgs: i32,
+    max_retries: i32,
 }
 
 impl DeduplicationNode {
     pub fn new(config: &serde_json::Value) -> TbResult<Self> {
         #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
         struct Config {
-            window_sec: u64,
+            #[serde(default = "default_interval", alias = "window_sec")]
+            interval: u64,
             #[serde(default)]
-            key_fields: Vec<String>,
+            strategy: Option<tb_dao::DedupStrategy>,
+            #[serde(default)]
+            out_msg_type: Option<String>,
+            #[serde(default = "default_max_pending")]
+            max_pending_msgs: i32,
+            #[serde(default = "default_max_retries")]
+            max_retries: i32,
+        }
+        fn default_interval() -> u64 {
+            60
+        }
+        fn default_max_pending() -> i32 {
+            100
+        }
+        fn default_max_retries() -> i32 {
+            3
         }
         let c: Config = parse_config(config)?;
-        Ok(Self {
-            window: Duration::from_secs(c.window_sec.max(1)),
-            key_fields: c.key_fields,
-        })
-    }
-
-    fn content_hash(&self, msg: &TbMsg) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        if self.key_fields.is_empty() {
-            msg.data.to_string().hash(&mut hasher);
-        } else {
-            for f in &self.key_fields {
-                msg.data
-                    .get(f)
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null)
-                    .to_string()
-                    .hash(&mut hasher);
-            }
+        if c.interval == 0 || c.max_pending_msgs <= 0 || c.max_retries < 0 {
+            return Err(TbError::InvalidInput(
+                "deduplication interval, maxPendingMsgs and maxRetries are out of range".into(),
+            ));
         }
-        hasher.finish()
+        let strategy = c.strategy.unwrap_or(tb_dao::DedupStrategy::First);
+        if strategy == tb_dao::DedupStrategy::All
+            && c.out_msg_type.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(TbError::InvalidInput(
+                "outMsgType is required for ALL deduplication".into(),
+            ));
+        }
+        Ok(Self {
+            interval: Duration::from_secs(c.interval),
+            strategy,
+            out_msg_type: c.out_msg_type,
+            max_pending_msgs: c.max_pending_msgs,
+            max_retries: c.max_retries,
+        })
     }
 }
 
 #[async_trait]
 impl Node for DeduplicationNode {
     async fn on_msg(&self, ctx: &NodeContext, msg: TbMsg) -> Vec<(String, TbMsg)> {
-        let duplicate = ctx
-            .is_duplicate(
-                msg.rule_chain_id.unwrap_or_else(Uuid::nil),
-                msg.rule_node_id.unwrap_or_else(Uuid::nil),
-                msg.originator.id,
-                self.content_hash(&msg),
-                self.window,
+        match ctx
+            .dedup_dao
+            .append(
+                &msg,
+                self.interval.as_millis() as i64,
+                self.strategy,
+                self.out_msg_type.as_deref().unwrap_or(""),
+                i64::from(self.max_pending_msgs),
+                self.max_retries,
             )
-            .await;
-        if duplicate {
-            vec![("Deduplicated".into(), msg)]
-        } else {
-            vec![("Success".into(), msg)]
+            .await
+        {
+            Ok(tb_dao::AppendResult::Buffered | tb_dao::AppendResult::Duplicate) => Vec::new(),
+            Ok(tb_dao::AppendResult::LimitExceeded) => {
+                vec![("Failure".into(), msg)]
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "persist deduplication message failed");
+                vec![("Failure".into(), msg)]
+            }
         }
     }
 }

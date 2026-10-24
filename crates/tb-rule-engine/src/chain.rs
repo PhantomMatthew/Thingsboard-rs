@@ -226,6 +226,94 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+async fn route_outputs(
+    ctx: &NodeContext,
+    state: &RuleChainState,
+    rule_node: &RuleNode,
+    outs: Vec<(String, TbMsg)>,
+    queue: &mut VecDeque<(Uuid, TbMsg)>,
+) -> TbResult<()> {
+    let node_id = rule_node.id;
+    let is_checkpoint = rule_node.r#type == registry::CHECKPOINT;
+    let delay = if rule_node.r#type == registry::DELAY {
+        let config = rule_node
+            .configuration
+            .clone()
+            .unwrap_or(serde_json::json!({}));
+        DelayNode::new(&config).ok().map(|node| node.delay())
+    } else {
+        None
+    };
+    for (rel, m) in outs {
+        let matched = state
+            .edges
+            .get(&node_id)
+            .map(|edges| {
+                edges
+                    .iter()
+                    .filter(|(rel_type, _)| rel_type == &rel)
+                    .map(|(_, to)| *to)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if matched.is_empty() {
+            if rel == "Failure" || (is_checkpoint && rel == "Success") {
+                let error = format!(
+                    "no outgoing edge for relation '{rel}' at node '{}'",
+                    rule_node.name
+                );
+                send_dlq(&ctx.kafka_producer, state.chain_id, rule_node.id, m, error).await?;
+            } else {
+                tracing::debug!(
+                    node = %rule_node.name,
+                    relation = %rel,
+                    "no outgoing edge, message dropped"
+                );
+            }
+            continue;
+        }
+        for to in matched {
+            if is_checkpoint && rel == "Success" {
+                requeue(&ctx.kafka_producer, state.chain_id, to, m.clone()).await?;
+            } else if rel == "Success"
+                && let Some(delay) = delay
+            {
+                schedule_requeue(ctx, state, rule_node, to, m.clone(), delay).await?;
+            } else {
+                queue.push_back((to, m.clone()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 从已处理节点的指定关系继续路由，供持久化去重窗口恢复输出。
+pub async fn execute_from_relation(
+    ctx: &NodeContext,
+    state: &RuleChainState,
+    from_node: Uuid,
+    relation: &str,
+    msg: TbMsg,
+) -> TbResult<()> {
+    let Some((rule_node, _)) = state.nodes.get(&from_node) else {
+        tracing::debug!(%from_node, "output source node not found, dropped");
+        return Ok(());
+    };
+    let mut queue = VecDeque::new();
+    route_outputs(
+        ctx,
+        state,
+        rule_node,
+        vec![(relation.to_string(), msg)],
+        &mut queue,
+    )
+    .await?;
+    while let Some((node_id, msg)) = queue.pop_front() {
+        execute(ctx, state, node_id, msg).await?;
+    }
+    Ok(())
+}
+
 /// 从 start_node 起 BFS 执行；`_hops` 随 checkpoint/delay 重投跨消费累计。
 pub async fn execute(
     ctx: &NodeContext,
@@ -286,56 +374,7 @@ pub async fn execute(
                 vec![("Failure".to_string(), msg)]
             }
         };
-        let is_checkpoint = rule_node.r#type == registry::CHECKPOINT;
-        let delay = if rule_node.r#type == registry::DELAY {
-            let config = rule_node
-                .configuration
-                .clone()
-                .unwrap_or(serde_json::json!({}));
-            DelayNode::new(&config).ok().map(|node| node.delay())
-        } else {
-            None
-        };
-        for (rel, m) in outs {
-            let matched = state
-                .edges
-                .get(&node_id)
-                .map(|edges| {
-                    edges
-                        .iter()
-                        .filter(|(rel_type, _)| rel_type == &rel)
-                        .map(|(_, to)| *to)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            if matched.is_empty() {
-                if rel == "Failure" || (is_checkpoint && rel == "Success") {
-                    let error = format!(
-                        "no outgoing edge for relation '{rel}' at node '{}'",
-                        rule_node.name
-                    );
-                    send_dlq(&ctx.kafka_producer, state.chain_id, rule_node.id, m, error).await?;
-                } else {
-                    tracing::debug!(
-                        node = %rule_node.name,
-                        relation = %rel,
-                        "no outgoing edge, message dropped"
-                    );
-                }
-                continue;
-            }
-            for to in matched {
-                if is_checkpoint && rel == "Success" {
-                    requeue(&ctx.kafka_producer, state.chain_id, to, m.clone()).await?;
-                } else if rel == "Success"
-                    && let Some(delay) = delay
-                {
-                    schedule_requeue(ctx, state, rule_node, to, m.clone(), delay).await?;
-                } else {
-                    queue.push_back((to, m.clone()));
-                }
-            }
-        }
+        route_outputs(ctx, state, rule_node, outs, &mut queue).await?;
     }
     Ok(())
 }

@@ -1,5 +1,5 @@
 //! Phase 7 新节点集成测试：真实 PostgreSQL（localhost:5433）+ Kafka（localhost:29092）。
-//! 纯逻辑节点（filter/math/dedup 等）也走 NodeContext，DB 只用于构造，不依赖既有数据。
+//! 纯逻辑节点（filter/math 等）走轻量 NodeContext；去重使用真实 PostgreSQL 持久化状态。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -683,39 +683,17 @@ async fn delay_node_returns_without_sleeping() {
     DelayNode::new(&json!({"delay_sec": 9999})).unwrap();
 }
 
-#[tokio::test]
-async fn deduplication_node() {
-    let (ctx, _) = memory_ctx();
-    let node = DeduplicationNode::new(&json!({"window_sec": 60})).unwrap();
-
-    let mut m = msg(json!({"temperature": 25}));
-    m.rule_chain_id = Some(Uuid::now_v7());
-    m.rule_node_id = Some(Uuid::now_v7());
-    assert_eq!(node.on_msg(&ctx, m.clone()).await[0].0, "Success");
-    assert_eq!(node.on_msg(&ctx, m.clone()).await[0].0, "Deduplicated");
-    let rebuilt = DeduplicationNode::new(&json!({"window_sec": 60})).unwrap();
-    assert_eq!(
-        rebuilt.on_msg(&ctx, m.clone()).await[0].0,
-        "Deduplicated",
-        "deduplication state must survive rule-chain cache rebuilds"
-    );
-    // 内容不同 → Success
-    let mut m2 = m.clone();
-    m2.data = json!({"temperature": 26});
-    assert_eq!(node.on_msg(&ctx, m2).await[0].0, "Success");
-    // originator 不同 → Success
-    let mut m3 = m.clone();
-    m3.originator = EntityId::new(EntityType::Device);
-    assert_eq!(node.on_msg(&ctx, m3).await[0].0, "Success");
-
-    // key_fields：仅指定字段参与 hash
-    let node = DeduplicationNode::new(&json!({"window_sec": 60, "key_fields": ["id"]})).unwrap();
-    let m = msg(json!({"id": 1, "noise": "a"}));
-    assert_eq!(node.on_msg(&ctx, m.clone()).await[0].0, "Success");
-    let mut m2 = m.clone();
-    m2.originator = m.originator;
-    m2.data = json!({"id": 1, "noise": "b"});
-    assert_eq!(node.on_msg(&ctx, m2).await[0].0, "Deduplicated");
+#[test]
+fn deduplication_node_validates_java_configuration() {
+    DeduplicationNode::new(&json!({"window_sec": 60})).unwrap();
+    DeduplicationNode::new(&json!({
+        "interval": 1,
+        "strategy": "ALL",
+        "outMsgType": "DEDUP_ALL"
+    }))
+    .unwrap();
+    assert!(DeduplicationNode::new(&json!({"interval": 0})).is_err());
+    assert!(DeduplicationNode::new(&json!({"strategy": "ALL"})).is_err());
 }
 
 #[tokio::test]

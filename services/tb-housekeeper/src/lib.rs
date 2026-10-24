@@ -12,6 +12,7 @@ enum CleanupTarget {
     TsKv,
     DebugEvent,
     ClearedAlarm,
+    DedupWindow,
 }
 
 impl CleanupTarget {
@@ -22,6 +23,10 @@ impl CleanupTarget {
             Self::ClearedAlarm => (
                 "alarm",
                 "status IN ('CLEARED_UNACK','CLEARED_ACK') AND clear_ts IS NOT NULL AND clear_ts < $1",
+            ),
+            Self::DedupWindow => (
+                "rule_node_dedup_window",
+                "state = 'DONE' AND updated_at < $1",
             ),
         };
         format!(
@@ -90,6 +95,17 @@ pub async fn cleanup_cleared_alarms(pool: &PgPool, cutoff: i64) -> Result<u64, s
     .await
 }
 
+pub async fn cleanup_dedup_windows(pool: &PgPool, cutoff: i64) -> Result<u64, sqlx::Error> {
+    delete_in_batches(
+        pool,
+        CleanupTarget::DedupWindow,
+        cutoff,
+        DELETE_BATCH_SIZE,
+        BATCH_INTERVAL,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use sqlx::postgres::PgPoolOptions;
@@ -142,6 +158,25 @@ mod tests {
         .unwrap();
     }
 
+    async fn insert_dedup_window(pool: &PgPool, state: &str, updated_at: i64) {
+        sqlx::query(
+            "INSERT INTO rule_node_dedup_window \
+             (id, tenant_id, rule_chain_id, rule_node_id, originator_id, strategy, \
+             out_msg_type, queue_name, max_retries, state, expires_at, updated_at) \
+             VALUES ($1,$2,$3,$4,$5,'FIRST','','Main',3,$6,0,$7)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind(state)
+        .bind(updated_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn all_cleanup_targets_delete_multiple_batches() {
         let pool = setup_pool().await;
@@ -185,11 +220,17 @@ mod tests {
         }
         insert_alarm(&pool, "ACTIVE_UNACK", None).await;
         insert_alarm(&pool, "CLEARED_UNACK", Some(100)).await;
+        for updated_at in 1..=5 {
+            insert_dedup_window(&pool, "DONE", updated_at).await;
+        }
+        insert_dedup_window(&pool, "OPEN", 1).await;
+        insert_dedup_window(&pool, "DONE", 100).await;
 
         for target in [
             CleanupTarget::TsKv,
             CleanupTarget::DebugEvent,
             CleanupTarget::ClearedAlarm,
+            CleanupTarget::DedupWindow,
         ] {
             let deleted = delete_in_batches(&pool, target, 10, 2, Duration::ZERO)
                 .await
@@ -197,7 +238,12 @@ mod tests {
             assert_eq!(deleted, 5);
         }
 
-        for (table, expected) in [("ts_kv", 1), ("rule_node_debug_event", 1), ("alarm", 2)] {
+        for (table, expected) in [
+            ("ts_kv", 1),
+            ("rule_node_debug_event", 1),
+            ("alarm", 2),
+            ("rule_node_dedup_window", 2),
+        ] {
             let remaining: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
                 .fetch_one(&pool)
                 .await

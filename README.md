@@ -67,7 +67,7 @@ ThingsBoard IoT 平台的 Rust 重写版（微服务架构，非兼容重设计�
 | `TB_NODE_ID` | 三个 transport | 自动生成 | 节点 ID（Kafka 下行 topic 路由键） |
 | `TB_EDQS_PORT` / `TB_EDQS_GROUP` | tb-edqs | 8090 / 默认组 | 查询端口 / 消费组 |
 | `TB_HOUSEKEEPER_INTERVAL_SEC` | tb-housekeeper | 3600 | 清理周期 |
-| `TB_TS_TTL_DAYS` / `TB_DEBUG_EVENT_TTL_DAYS` / `TB_ALARM_TTL_DAYS` | tb-housekeeper | 0 / 7 / 0 | 各类数据保留天数（0=不清理） |
+| `TB_TS_TTL_DAYS` / `TB_DEBUG_EVENT_TTL_DAYS` / `TB_ALARM_TTL_DAYS` / `TB_DEDUP_WINDOW_TTL_DAYS` | tb-housekeeper | 0 / 7 / 0 / 7 | 各类数据保留天数（0=不清理；去重仅清终态窗口） |
 
 ## 快速开始（开发）
 

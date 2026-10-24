@@ -506,6 +506,110 @@ async fn checkpoint_resume_e2e() {
 }
 
 #[tokio::test]
+async fn persistent_dedup_restarts_and_flushes_without_new_input() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+    let (pool, run) = fresh_db().await;
+    let tenant = make_tenant(&pool, &run).await;
+    let device = make_device(&pool, tenant.id, &run).await;
+    let chain = seed::create_default_root_chain(&pool, tenant.id)
+        .await
+        .unwrap();
+    let switch = make_node(
+        chain.id,
+        "filter.msg_type_switch",
+        "switch",
+        json!({}),
+        false,
+    );
+    let dedup = make_node(
+        chain.id,
+        "action.deduplication",
+        "dedup",
+        json!({"interval": 1, "strategy": "LAST"}),
+        false,
+    );
+    let save = make_node(chain.id, "action.save_timeseries", "save", json!({}), false);
+    RuleChainDao::new(pool.clone())
+        .save_nodes(
+            chain.id,
+            &[switch.clone(), dedup.clone(), save.clone()],
+            &[
+                (
+                    switch.id,
+                    dedup.id,
+                    msg_type::POST_TELEMETRY_REQUEST.to_string(),
+                ),
+                (dedup.id, save.id, "Success".to_string()),
+            ],
+            Some(switch.id),
+        )
+        .await
+        .unwrap();
+
+    let queue = format!("Re7Dedup{run}");
+    let engine = start_engine(pool.clone(), &queue, &run, "dedup-restart").await;
+    let producer = KafkaQueueProducer::new(KAFKA_BROKERS, "re7-dedup-producer").unwrap();
+    poll_until(Duration::from_secs(15), || async {
+        send_telemetry(
+            &producer,
+            &queue,
+            tenant.id,
+            device.id,
+            json!({"temperature": 10}),
+        )
+        .await;
+        send_telemetry(
+            &producer,
+            &queue,
+            tenant.id,
+            device.id,
+            json!({"temperature": 20}),
+        )
+        .await;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM rule_node_dedup_msg m \
+             JOIN rule_node_dedup_window w ON w.id = m.window_id \
+             WHERE w.rule_node_id = $1",
+        )
+        .bind(dedup.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        count >= 2
+    })
+    .await;
+    engine.abort();
+    let _ = engine.await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    // 若中止发生在认领后，快进到租约到期，模拟其他实例接管崩溃窗口。
+    sqlx::query("UPDATE rule_node_dedup_window SET lease_until = 0 WHERE lease_owner IS NOT NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let ts_dao = TimeseriesDao::new(pool.clone(), KeyDictionaryDao::new(pool.clone()));
+    assert!(
+        ts_dao
+            .find_latest(device.id, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let _recovered = start_engine(pool.clone(), &queue, &run, "dedup-restart").await;
+    poll_until(Duration::from_secs(20), || async {
+        ts_dao
+            .find_latest(device.id, None)
+            .await
+            .unwrap()
+            .iter()
+            .any(|entry| entry.key == "temperature" && entry.value == tb_common::KvValue::Long(20))
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn debug_events_rest_e2e() {
     let (pool, run) = fresh_db().await;
     let queue = format!("Re7Dbg{run}");

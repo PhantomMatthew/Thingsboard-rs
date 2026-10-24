@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sqlx::PgPool;
-use tb_common::TbResult;
 use tb_common::msg::{TbMsg, msg_type};
+use tb_common::{TbError, TbResult};
 use tb_dao::RuleChainDao;
 use tb_queue::KafkaQueueProducer;
 use uuid::Uuid;
@@ -48,6 +48,15 @@ impl RuleEngineService {
         redis_manager: redis::aio::ConnectionManager,
     ) -> Self {
         let ctx = NodeContext::new(pool.clone(), kafka_producer).with_redis_manager(redis_manager);
+        Self::build(pool, ctx, cache_ttl)
+    }
+
+    pub fn with_queue_producer(
+        pool: PgPool,
+        producer: Arc<dyn tb_queue::QueueProducer>,
+        cache_ttl: Duration,
+    ) -> Self {
+        let ctx = NodeContext::with_queue_producer(pool.clone(), producer);
         Self::build(pool, ctx, cache_ttl)
     }
 
@@ -96,6 +105,74 @@ impl RuleEngineService {
         Ok(())
     }
 
+    /// 扫描并处理一批到期或需要恢复的去重窗口。
+    pub async fn process_due_windows(&self, owner: &str, limit: i64) -> TbResult<()> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let lease_until = now + 30_000;
+        let windows = self
+            .ctx
+            .dedup_dao
+            .claim_due(owner, lease_until, now, limit)
+            .await?;
+        for window in windows {
+            if let Err(e) = self.process_dedup_window(window, owner).await {
+                tracing::warn!(error = %e, owner, "process deduplication window failed");
+            }
+        }
+        Ok(())
+    }
+
+    async fn process_dedup_window(&self, window: tb_dao::DedupWindow, owner: &str) -> TbResult<()> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let window = if window.output_msg.is_some() {
+            window
+        } else {
+            let messages = self.ctx.dedup_dao.find_messages(window.id).await?;
+            let output = build_dedup_output(&window, messages, now)?;
+            self.ctx
+                .dedup_dao
+                .prepare_output(window.id, owner, &output, now)
+                .await?
+                .ok_or_else(|| {
+                    TbError::Conflict("deduplication window lease lost before output".into())
+                })?
+        };
+        let Some(output) = window.output_msg.clone() else {
+            return Err(TbError::Internal(
+                "deduplication output was not persisted".into(),
+            ));
+        };
+        let Some(state) = self.chain_by_id(window.rule_chain_id).await? else {
+            tracing::warn!(window_id = %window.id, chain_id = %window.rule_chain_id, "deduplication rule chain deleted; closing window");
+            self.ctx.dedup_dao.mark_done(window.id, owner, now).await?;
+            return Ok(());
+        };
+        let exhausted = window.retry_count > window.max_retries;
+        let relation = if exhausted { "Failure" } else { "Success" };
+        match chain::execute_from_relation(&self.ctx, &state, window.rule_node_id, relation, output)
+            .await
+        {
+            Ok(()) => {
+                self.ctx.dedup_dao.mark_done(window.id, owner, now).await?;
+            }
+            Err(e) if !exhausted => {
+                self.ctx
+                    .dedup_dao
+                    .record_retry(window.id, owner, now, now + 10_000)
+                    .await?;
+                tracing::warn!(window_id = %window.id, error = %e, "deduplication output failed; retry scheduled");
+            }
+            Err(e) => {
+                self.ctx
+                    .dedup_dao
+                    .record_retry(window.id, owner, now, now + 10_000)
+                    .await?;
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
     async fn chain_by_id(&self, chain_id: Uuid) -> TbResult<Option<Arc<RuleChainState>>> {
         if let Some(cached) = self.chain_by_id.get(&chain_id).await {
             return Ok(cached);
@@ -129,6 +206,74 @@ impl RuleEngineService {
             other => {
                 tracing::debug!(msg_type = other, "default chain: message dropped");
             }
+        }
+    }
+}
+
+fn build_dedup_output(
+    window: &tb_dao::DedupWindow,
+    messages: Vec<TbMsg>,
+    now: i64,
+) -> TbResult<TbMsg> {
+    if messages.is_empty() {
+        return Err(TbError::Internal(format!(
+            "deduplication window {} has no messages",
+            window.id
+        )));
+    }
+    match window.strategy {
+        tb_dao::DedupStrategy::First | tb_dao::DedupStrategy::Last => {
+            let mut messages = messages.into_iter();
+            let mut selected = messages
+                .next()
+                .ok_or_else(|| TbError::Internal("empty FIRST/LAST window".into()))?;
+            for msg in messages {
+                let replace = match window.strategy {
+                    tb_dao::DedupStrategy::First => msg.ts < selected.ts,
+                    tb_dao::DedupStrategy::Last => msg.ts > selected.ts,
+                    tb_dao::DedupStrategy::All => unreachable!(),
+                };
+                if replace {
+                    selected = msg;
+                }
+            }
+            selected.id = Uuid::now_v7();
+            Ok(selected)
+        }
+        tb_dao::DedupStrategy::All => {
+            let first = &messages[0];
+            let data = serde_json::Value::Array(
+                messages
+                    .iter()
+                    .map(|msg| {
+                        serde_json::json!({
+                            "msg": msg.data,
+                            "metadata": msg.metadata,
+                        })
+                    })
+                    .collect(),
+            );
+            let mut metadata = std::collections::HashMap::new();
+            metadata.insert("ts".into(), now.to_string());
+            Ok(TbMsg {
+                id: Uuid::now_v7(),
+                queue_name: window.queue_name.clone(),
+                msg_type: if window.out_msg_type.is_empty() {
+                    return Err(TbError::Internal(
+                        "ALL deduplication window has no out_msg_type".into(),
+                    ));
+                } else {
+                    window.out_msg_type.clone()
+                },
+                originator: first.originator,
+                tenant_id: window.tenant_id,
+                customer_id: first.customer_id,
+                rule_chain_id: Some(window.rule_chain_id),
+                rule_node_id: Some(window.rule_node_id),
+                data,
+                metadata,
+                ts: now,
+            })
         }
     }
 }

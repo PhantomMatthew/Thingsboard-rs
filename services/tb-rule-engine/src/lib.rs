@@ -73,41 +73,52 @@ async fn start_rule_engine_inner(
     let group_id = group_id.to_string();
     Ok(tokio::spawn(async move {
         tracing::info!(topic = %topic, group = %group_id, "rule engine started");
+        let scanner_owner = format!("{group_id}-{}", uuid::Uuid::now_v7().simple());
+        let mut scan_interval = tokio::time::interval(Duration::from_millis(250));
         loop {
-            match consumer.recv().await {
-                Ok(msg) => {
-                    tracing::debug!(topic = %msg.topic, offset = msg.offset, "rule engine message received");
-                    let key = msg
-                        .key
-                        .as_ref()
-                        .map(|key| String::from_utf8_lossy(key).into_owned())
-                        .unwrap_or_else(|| "rule-engine-dlq".into());
-                    loop {
-                        match process_payload(&engine, &producer, msg.payload.clone(), &key).await {
-                            Ok(()) => break,
-                            Err(e) => {
-                                tracing::error!(
-                                    topic = %msg.topic,
-                                    offset = msg.offset,
-                                    "DLQ send failed; offset not committed: {e}"
-                                );
-                                tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::select! {
+                received = consumer.recv() => {
+                    match received {
+                        Ok(msg) => {
+                            tracing::debug!(topic = %msg.topic, offset = msg.offset, "rule engine message received");
+                            let key = msg
+                                .key
+                                .as_ref()
+                                .map(|key| String::from_utf8_lossy(key).into_owned())
+                                .unwrap_or_else(|| "rule-engine-dlq".into());
+                            loop {
+                                match process_payload(&engine, &producer, msg.payload.clone(), &key).await {
+                                    Ok(()) => break,
+                                    Err(e) => {
+                                        tracing::error!(
+                                            topic = %msg.topic,
+                                            offset = msg.offset,
+                                            "DLQ send failed; offset not committed: {e}"
+                                        );
+                                        tokio::time::sleep(Duration::from_secs(1)).await;
+                                    }
+                                }
+                            }
+                            loop {
+                                match consumer.commit(&msg).await {
+                                    Ok(()) => break,
+                                    Err(e) => {
+                                        tracing::error!("rule engine commit failed: {e}");
+                                        tokio::time::sleep(Duration::from_secs(1)).await;
+                                    }
+                                }
                             }
                         }
-                    }
-                    loop {
-                        match consumer.commit(&msg).await {
-                            Ok(()) => break,
-                            Err(e) => {
-                                tracing::error!("rule engine commit failed: {e}");
-                                tokio::time::sleep(Duration::from_secs(1)).await;
-                            }
+                        Err(e) => {
+                            tracing::error!("rule engine consumer error: {e}");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     }
                 }
-                Err(e) => {
-                    tracing::error!("rule engine consumer error: {e}");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                _ = scan_interval.tick() => {
+                    if let Err(e) = engine.process_due_windows(&scanner_owner, 100).await {
+                        tracing::warn!("deduplication window scan failed: {e}");
+                    }
                 }
             }
         }
