@@ -1,0 +1,31 @@
+[package]
+name = "tb-transport-snmp"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+uuid.workspace = true
+bytes.workspace = true
+prost.workspace = true
+tb-queue = { path = "../../crates/tb-queue" }
+snmp2 = { version = "0.4.14", default-features = false, features = ["tokio", "heap_buffers"] }
+tb-common = { path = "../../crates/tb-common" }
+tb-proto = { path = "../../crates/tb-proto" }
+tb-transport-api = { path = "../../crates/tb-transport-api" }
+
+[dev-dependencies]
+tb-dao = { path = "../../crates/tb-dao" }
+tb-core = { path = "../tb-core" }
+tb-auth = { path = "../tb-auth" }
+sqlx.workspace = true
+axum.workspace = true
+reqwest = { version = "0.12", features = ["json"] }

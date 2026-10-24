@@ -17,6 +17,8 @@ members = [
     "services/tb-transport-coap",
     "services/tb-transport-http",
     "services/tb-transport-mqtt",
+    "services/tb-transport-snmp",
+    "services/tb-transport-lwm2m",
     "tools/bench",
 ]
 
