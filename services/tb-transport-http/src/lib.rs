@@ -32,6 +32,14 @@ const LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 /// 长轮询会话：session_id → to_device_rpc 投递通道。
 pub type RpcSessions = Arc<DashMap<String, mpsc::Sender<core_pb::ToDeviceRpcRequestMsg>>>;
 
+pub struct RpcReplyRoute {
+    pub session_id: String,
+    pub reply_node_id: String,
+    pub expiration_ts: i64,
+}
+
+pub type RpcReplyRoutes = Arc<DashMap<(String, i32), RpcReplyRoute>>;
+
 #[derive(Clone)]
 pub struct TransportState {
     pub transport_api: TransportApiClient,
@@ -39,6 +47,7 @@ pub struct TransportState {
     pub node_id: String,
     pub brokers: String,
     pub rpc_sessions: RpcSessions,
+    pub rpc_reply_routes: RpcReplyRoutes,
     /// GET rpc 长轮询时长（测试可调小）。
     pub long_poll_timeout: Duration,
 }
@@ -51,6 +60,7 @@ impl TransportState {
             node_id: node_id.to_string(),
             brokers: brokers.to_string(),
             rpc_sessions: Arc::new(DashMap::new()),
+            rpc_reply_routes: Arc::new(DashMap::new()),
             long_poll_timeout: LONG_POLL_TIMEOUT,
         })
     }
@@ -333,6 +343,17 @@ async fn get_rpc(
     .await?;
     let result = match tokio::time::timeout(state.long_poll_timeout, rx.recv()).await {
         Ok(Some(rpc)) => {
+            state
+                .rpc_reply_routes
+                .retain(|_, route| route.expiration_ts == 0 || route.expiration_ts >= now_ms());
+            state.rpc_reply_routes.insert(
+                (device.device_id.clone(), rpc.request_id),
+                RpcReplyRoute {
+                    session_id: session_id.clone(),
+                    reply_node_id: rpc.reply_node_id.clone(),
+                    expiration_ts: rpc.expiration_ts,
+                },
+            );
             let params: Value = serde_json::from_str(&rpc.params_json).unwrap_or(Value::Null);
             json!({"id": rpc.request_id, "method": rpc.method, "params": params})
         }
@@ -358,7 +379,15 @@ async fn post_rpc_response(
     Json(payload): Json<Value>,
 ) -> Result<StatusCode, ApiError> {
     let device = validate(&state, &token).await?;
-    let info = session_info(&state, &device, "");
+    let route = state
+        .rpc_reply_routes
+        .remove(&(device.device_id.clone(), request_id))
+        .map(|(_, route)| route);
+    let session_id = route
+        .as_ref()
+        .map(|route| route.session_id.as_str())
+        .unwrap_or("");
+    let info = session_info(&state, &device, session_id);
     send_core(
         &state,
         &device,
@@ -367,6 +396,7 @@ async fn post_rpc_response(
             request_id,
             payload_json: payload.to_string(),
             error: String::new(),
+            reply_node_id: route.map(|route| route.reply_node_id).unwrap_or_default(),
         }),
     )
     .await?;

@@ -234,7 +234,7 @@ async fn notify_ota_update(
     ota_type: OtaPackageType,
     package: Option<&OtaPackage>,
 ) -> TbResult<()> {
-    let sessions = state.device_sessions.any_sessions(device_id);
+    let sessions = state.device_sessions.any_sessions(device_id).await?;
     if sessions.is_empty() {
         return Ok(());
     }

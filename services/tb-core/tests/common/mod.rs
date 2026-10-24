@@ -43,7 +43,9 @@ pub async fn start_server_with_pool() -> (String, PgPool) {
     tb_dao::migrate(&pool).await.expect("migrate test db");
 
     let factory = Arc::new(JwtTokenFactory::new("test-secret", 900, 604800));
-    let state = AppState::new(pool.clone(), factory);
+    let state = AppState::new(pool.clone(), factory)
+        .await
+        .expect("app state");
     tb_core::seed::seed(&state).await.expect("seed");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -141,7 +143,9 @@ pub async fn start_servers_with_rule_engine() -> (String, String) {
         .await
         .expect("connect test db");
     let factory = Arc::new(JwtTokenFactory::new("test-secret", 900, 604800));
-    let state = AppState::new(pool.clone(), factory);
+    let state = AppState::new(pool.clone(), factory)
+        .await
+        .expect("app state");
     let _transport_api = tb_core::transport_api::start_transport_api_for_group(
         state.clone(),
         &format!("tb-core-transport-api-{run_id}"),
@@ -208,7 +212,7 @@ pub async fn start_servers_with_transport() -> (String, String) {
         .await
         .expect("connect test db");
     let factory = Arc::new(JwtTokenFactory::new("test-secret", 900, 604800));
-    let state = AppState::new(pool, factory);
+    let state = AppState::new(pool, factory).await.expect("app state");
     let _transport_api = tb_core::transport_api::start_transport_api_for_group(
         state.clone(),
         &format!("tb-core-transport-api-{run_id}"),

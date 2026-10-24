@@ -511,7 +511,7 @@ async fn debug_events_rest_e2e() {
 
     // tb-core REST（同库）
     let factory = Arc::new(tb_auth::JwtTokenFactory::new("test-secret", 900, 604800));
-    let state = tb_core::AppState::new(pool.clone(), factory);
+    let state = tb_core::AppState::new(pool.clone(), factory).await.unwrap();
     tb_core::seed::seed(&state).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

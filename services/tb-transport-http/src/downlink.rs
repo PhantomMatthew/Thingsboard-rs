@@ -55,6 +55,9 @@ async fn handle(state: &TransportState, payload: bytes::Bytes) {
                 "kick session"
             );
             state.rpc_sessions.remove(&msg.session_id);
+            state
+                .rpc_reply_routes
+                .retain(|_, route| route.session_id != msg.session_id);
         }
         other => tracing::debug!(?other, "ignored transport notification"),
     }

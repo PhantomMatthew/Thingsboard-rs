@@ -29,26 +29,33 @@ pub async fn start_telemetry_ingest_for_group(
     }
     let group_id = group_id.to_string();
     tokio::spawn(async move {
-        let mut consumer = match StreamQueueConsumer::new(&brokers, &group_id, &[&topic]) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("ingest consumer init failed: {e}");
-                return;
-            }
-        };
+        let mut consumer =
+            match StreamQueueConsumer::new_manual_commit(&brokers, &group_id, &[&topic]) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("ingest consumer init failed: {e}");
+                    return;
+                }
+            };
         tracing::info!("telemetry ingest started");
         loop {
             match consumer.recv().await {
                 Ok(msg) => {
-                    let Ok(to_re) = ToRuleEngineMsg::decode(msg.payload) else {
+                    let Ok(to_re) = ToRuleEngineMsg::decode(msg.payload.clone()) else {
                         tracing::warn!("undecodable ToRuleEngineMsg");
                         continue;
                     };
-                    let Some(tb_msg) = to_re.tb_msg else {
-                        continue;
+                    let result = match to_re.tb_msg {
+                        Some(tb_msg) => handle_msg(&state, &tb_msg).await,
+                        None => Ok(()),
                     };
-                    if let Err(e) = handle_msg(&state, &tb_msg).await {
-                        tracing::error!(msg_type = tb_msg.r#type, "ingest failed: {e}");
+                    match result {
+                        Ok(()) => {
+                            if let Err(e) = consumer.commit(&msg).await {
+                                tracing::error!("ingest commit failed: {e}");
+                            }
+                        }
+                        Err(e) => tracing::error!("ingest failed, offset not committed: {e}"),
                     }
                 }
                 Err(e) => {

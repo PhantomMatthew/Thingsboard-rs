@@ -55,7 +55,7 @@ pub async fn start_servers_with_rate_limit(rate_limit: u32) -> (String, String) 
     tb_dao::migrate(&pool).await.expect("migrate test db");
 
     let factory = Arc::new(JwtTokenFactory::new("test-secret", 900, 604800));
-    let state = AppState::new(pool, factory);
+    let state = AppState::new(pool, factory).await.expect("app state");
     tb_core::seed::seed(&state).await.expect("seed");
 
     // 每次起服用独立 consumer group：避免上一轮测试残留的幽灵成员拖慢 rebalance。

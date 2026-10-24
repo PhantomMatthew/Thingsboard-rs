@@ -55,6 +55,8 @@ pub struct Observer {
     pub kind: ObserverKind,
     pub observe_seq: AtomicU32,
     pub last_activity_ms: AtomicI64,
+    /// request_id → (reply_node_id, expiration_ts)。
+    pub rpc_reply_nodes: DashMap<i32, (String, i64)>,
 }
 
 #[derive(Clone)]
@@ -139,7 +141,7 @@ fn touch_observers(state: &TransportState, addr: SocketAddr) {
     }
 }
 
-/// 周期清理超时 observer：移除注册 + session_close。
+/// 周期清理超时 observer，并为剩余 observer 发送会话租约心跳。
 async fn sweep_observers(state: TransportState) {
     loop {
         tokio::time::sleep(OBSERVE_SWEEP_INTERVAL).await;
@@ -166,6 +168,22 @@ async fn sweep_observers(state: TransportState) {
                 )
                 .await;
             }
+        }
+        let active: Vec<_> = state
+            .observers
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+        for observer in active {
+            send_core(
+                &state,
+                &observer.device,
+                core_pb::to_core_msg::Msg::DeviceActivity(core_pb::DeviceActivityMsg {
+                    session: Some(observer.info.clone()),
+                    last_activity_ts: now_ms(),
+                }),
+            )
+            .await;
         }
     }
 }
@@ -307,7 +325,15 @@ async fn dispatch(
             let Ok(request_id) = request_id.parse::<i32>() else {
                 return reply(request, ResponseType::BadRequest, Vec::new());
             };
-            let info = session_info(state, &device, "");
+            let route = state.observers.iter().find_map(|observer| {
+                if observer.device.device_id != device.device_id {
+                    return None;
+                }
+                let (_, (reply_node_id, _)) = observer.rpc_reply_nodes.remove(&request_id)?;
+                Some((observer.info.clone(), reply_node_id))
+            });
+            let (info, reply_node_id) =
+                route.unwrap_or_else(|| (session_info(state, &device, ""), String::new()));
             send_core(
                 state,
                 &device,
@@ -316,6 +342,7 @@ async fn dispatch(
                     request_id,
                     payload_json: String::from_utf8_lossy(&request.message.payload).into_owned(),
                     error: String::new(),
+                    reply_node_id,
                 }),
             )
             .await;
@@ -420,6 +447,7 @@ async fn observe_register(
             kind,
             observe_seq: AtomicU32::new(0),
             last_activity_ms: AtomicI64::new(now_ms()),
+            rpc_reply_nodes: DashMap::new(),
         }),
     );
     tracing::info!(session_id, %addr, ?kind, "observe registered");

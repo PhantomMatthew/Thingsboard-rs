@@ -11,7 +11,7 @@ use tb_proto::core as core_pb;
 use tb_queue::{QueueConsumer as _, StreamQueueConsumer, TbTopic};
 
 use crate::codec::{MqttPacket, PublishPacket};
-use crate::{TransportState, UNSUBSCRIBED, session};
+use crate::{SessionCommand, TransportState, UNSUBSCRIBED, session};
 
 pub async fn run(state: TransportState) {
     let topic = TbTopic::transport_notifications(&state.node_id);
@@ -90,6 +90,13 @@ async fn handle(state: &TransportState, payload: Bytes) {
             if qos == UNSUBSCRIBED {
                 return;
             }
+            state
+                .rpc_reply_nodes
+                .insert(
+                    (msg.session_id.clone(), rpc.request_id),
+                    rpc.reply_node_id.clone(),
+                )
+                .await;
             let params: serde_json::Value =
                 serde_json::from_str(&rpc.params_json).unwrap_or(serde_json::Value::Null);
             // 网关子设备会话：包装成 v1/gateway/rpc {"device","data":{"id","method","params"}}。
@@ -131,13 +138,26 @@ async fn handle(state: &TransportState, payload: Bytes) {
             .await;
         }
         core_pb::to_transport_msg::Msg::SessionCloseNotification(n) => {
-            // 移除注册表项使会话侧 channel 关闭，会话 task 自行清理退出。
             tracing::info!(
                 session_id = msg.session_id,
                 reason = n.reason,
                 "kick session"
             );
-            registry.remove(&msg.session_id);
+            let delivered = if let Some(handle) = registry.get(&msg.session_id) {
+                handle
+                    .tx
+                    .send(SessionCommand::Close {
+                        session_id: msg.session_id.clone(),
+                        reason: n.reason,
+                    })
+                    .await
+                    .is_ok()
+            } else {
+                false
+            };
+            if !delivered {
+                registry.remove(&msg.session_id);
+            }
         }
         other => tracing::debug!(?other, "ignored transport notification"),
     }
@@ -157,7 +177,12 @@ async fn send(
         packet_id: None, // QoS 1 由会话 task 分配
         payload: Bytes::from(payload),
     });
-    if handle.tx.send(packet).await.is_err() {
+    if handle
+        .tx
+        .send(SessionCommand::Packet(packet))
+        .await
+        .is_err()
+    {
         tracing::debug!("session channel closed before downlink");
     }
 }

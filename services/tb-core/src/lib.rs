@@ -7,6 +7,7 @@ pub mod core_consumer;
 pub mod device_session;
 pub mod edqs;
 pub mod routes;
+pub mod rule_engine_events;
 pub mod seed;
 pub mod state;
 pub mod telemetry_cache;

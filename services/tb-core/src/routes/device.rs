@@ -4,12 +4,16 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use bytes::Bytes;
+use prost::Message as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tb_auth::{ApiError, AuthUser};
 use tb_common::{EntityType, TbError, TbResult};
 use tb_dao::models::{Authority, CredentialsType, Device, DeviceCredentials, DeviceProfile};
 use tb_dao::{PageData, PageLink};
+use tb_proto::core as core_pb;
+use tb_queue::{QueueProducer as _, TbTopic};
 use uuid::Uuid;
 
 use crate::AppState;
@@ -17,6 +21,35 @@ use crate::audit::audit;
 use crate::auth_middleware::{check_tenant_scope, require_authority};
 use crate::routes::PageQuery;
 use crate::routes::customer::load_customer;
+
+async fn close_device_sessions(state: &AppState, device: &Device, reason: &str) -> TbResult<()> {
+    let sessions = state.device_sessions.any_sessions(device.id).await?;
+    if sessions.is_empty() {
+        return Ok(());
+    }
+    let producer = state.queue_producer().await?;
+    for session in &sessions {
+        let msg = core_pb::ToTransportMsg {
+            session_id: session.session_id.clone(),
+            entity_id: device.id.to_string(),
+            msg: Some(core_pb::to_transport_msg::Msg::SessionCloseNotification(
+                core_pb::SessionCloseNotification {
+                    reason: reason.into(),
+                },
+            )),
+        };
+        producer
+            .send(
+                &TbTopic::transport_notifications(&session.node_id),
+                &session.session_id,
+                Bytes::from(msg.encode_to_vec()),
+            )
+            .await
+            .map_err(TbError::internal)?;
+    }
+    state.device_sessions.take_sessions(device.id).await?;
+    Ok(())
+}
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -132,6 +165,9 @@ async fn save_device(
         saved.label.as_deref(),
         saved.created_time,
     );
+    if !is_new && rotate_credentials {
+        close_device_sessions(&state, &saved, "device credentials updated").await?;
+    }
     Ok(Json(saved))
 }
 
@@ -154,6 +190,7 @@ async fn delete_device(
     let device = load_device(&state, id).await?;
     check_tenant_scope(&user, device.tenant_id)?;
     state.device_dao.delete_by_id(id).await?;
+    close_device_sessions(&state, &device, "device deleted").await?;
     audit(
         &state,
         &user,
@@ -283,7 +320,9 @@ async fn save_device_credentials(
     if credentials.id.is_nil() {
         credentials.id = Uuid::now_v7();
     }
-    Ok(Json(state.device_credentials_dao.save(&credentials).await?))
+    let saved = state.device_credentials_dao.save(&credentials).await?;
+    close_device_sessions(&state, &device, "device credentials updated").await?;
+    Ok(Json(saved))
 }
 
 async fn device_types(

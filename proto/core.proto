@@ -73,6 +73,7 @@ message RpcResponseMsg {
   int32 request_id = 2;
   string payload_json = 3;
   string error = 4; // 空表示成功
+  string reply_node_id = 5; // 原样回带发起 RPC 的 core 实例
 }
 
 message ClaimDeviceMsg {
@@ -137,6 +138,7 @@ message ToDeviceRpcRequestMsg {
   string params_json = 3;
   int64 expiration_ts = 4; // 超时未响应作废
   bool persisted = 5;
+  string reply_node_id = 6; // 发起 RPC 的 core 实例
 }
 
 message ToServerRpcResponseMsg {

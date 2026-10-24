@@ -327,6 +327,13 @@ async fn on_rpc(state: &TransportState, session: &Session, payload: &[u8]) {
         (None, Some(error)) => (String::new(), error),
         (None, None) => (String::new(), "empty rpc response".into()),
     };
+    let route_key = (sub.info.session_id.clone(), rpc.data.id);
+    let reply_node_id = state
+        .rpc_reply_nodes
+        .get(&route_key)
+        .await
+        .unwrap_or_default();
+    state.rpc_reply_nodes.invalidate(&route_key).await;
     session::send_core(
         state,
         &sub.device,
@@ -335,6 +342,7 @@ async fn on_rpc(state: &TransportState, session: &Session, payload: &[u8]) {
             request_id: rpc.data.id,
             payload_json,
             error,
+            reply_node_id,
         }),
     )
     .await;

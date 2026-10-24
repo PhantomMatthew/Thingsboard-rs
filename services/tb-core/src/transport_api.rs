@@ -50,15 +50,17 @@ pub async fn start_transport_api_for_group(
                 return;
             }
         };
-        let mut consumer =
-            match StreamQueueConsumer::new(&brokers, &group_id, &[TbTopic::TRANSPORT_API_REQUESTS])
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!("transport-api consumer init failed: {e}");
-                    return;
-                }
-            };
+        let mut consumer = match StreamQueueConsumer::new_manual_commit(
+            &brokers,
+            &group_id,
+            &[TbTopic::TRANSPORT_API_REQUESTS],
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("transport-api consumer init failed: {e}");
+                return;
+            }
+        };
         tracing::info!("transport-api server started");
         loop {
             match consumer.recv().await {
@@ -72,7 +74,7 @@ pub async fn start_transport_api_for_group(
                         tracing::warn!("transport-api request without node_id key, dropped");
                         continue;
                     }
-                    let Ok(req) = pb::TransportApiRequestMsg::decode(msg.payload) else {
+                    let Ok(req) = pb::TransportApiRequestMsg::decode(msg.payload.clone()) else {
                         tracing::warn!("undecodable transport-api request");
                         continue;
                     };
@@ -82,11 +84,18 @@ pub async fn start_transport_api_for_group(
                         response: Some(response),
                     };
                     let topic = TbTopic::transport_api_responses(&node_id);
-                    if let Err(e) = producer
+                    match producer
                         .send(&topic, &node_id, Bytes::from(out.encode_to_vec()))
                         .await
                     {
-                        tracing::error!("transport-api response send failed: {e}");
+                        Ok(()) => {
+                            if let Err(e) = consumer.commit(&msg).await {
+                                tracing::error!("transport-api commit failed: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("transport-api response send failed: {e}");
+                        }
                     }
                 }
                 Err(e) => {

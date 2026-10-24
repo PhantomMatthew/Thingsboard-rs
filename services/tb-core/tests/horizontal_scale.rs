@@ -72,10 +72,22 @@ async fn two_core_two_rule_engine_horizontal_scale() {
 
     // 两个 core 实例：同库、同 JWT secret（token 互通）、不同 HTTP 端口
     let factory = Arc::new(JwtTokenFactory::new("test-secret", 900, 604800));
-    let state1 = AppState::new(pool1.clone(), factory.clone());
+    let state1 = AppState::new_with_node_id(
+        pool1.clone(),
+        factory.clone(),
+        format!("scale-core-1-{run_id}"),
+    )
+    .await
+    .expect("app state 1");
     tb_core::seed::seed(&state1).await.expect("seed");
     let base1 = serve_core(state1.clone()).await;
-    let state2 = AppState::new(pool2.clone(), factory.clone());
+    let state2 = AppState::new_with_node_id(
+        pool2.clone(),
+        factory.clone(),
+        format!("scale-core-2-{run_id}"),
+    )
+    .await
+    .expect("app state 2");
     let base2 = serve_core(state2.clone()).await;
     assert_ne!(base1, base2);
 

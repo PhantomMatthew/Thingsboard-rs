@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tb_dao::migrate(&pool).await?;
     tracing::info!("migrations applied");
 
-    let state = AppState::new(pool, Arc::new(JwtTokenFactory::from_env()));
+    let state = AppState::new(pool, Arc::new(JwtTokenFactory::from_env())).await?;
     tb_core::seed::seed(&state).await?;
 
     let brokers = std::env::var("TB_KAFKA_BROKERS").unwrap_or_else(|_| "localhost:29092".into());

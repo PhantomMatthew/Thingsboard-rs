@@ -85,6 +85,7 @@ async fn send_rpc(
                 params_json: body.params.to_string(),
                 expiration_ts: chrono::Utc::now().timestamp_millis() + timeout.as_millis() as i64,
                 persisted: false,
+                reply_node_id: state.node_id.clone(),
             },
         )),
     };
@@ -113,12 +114,18 @@ async fn rpc_twoway(
     let session = state
         .device_sessions
         .rpc_session(device_id)
+        .await?
         .ok_or_else(|| TbError::NotFound("device is offline or not subscribed to RPC".into()))?;
     let request_id = state.device_sessions.next_rpc_request_id();
     let rx = state
         .device_sessions
         .register_pending_rpc(device_id, request_id);
-    send_rpc(&state, device_id, &session, request_id, &body, timeout).await?;
+    if let Err(e) = send_rpc(&state, device_id, &session, request_id, &body, timeout).await {
+        state
+            .device_sessions
+            .drop_pending_rpc(device_id, request_id);
+        return Err(e.into());
+    }
     // 等设备响应；超时作废 pending 槽位。
     match tokio::time::timeout(timeout + Duration::from_millis(500), rx).await {
         Ok(Ok(Ok(payload))) => {
@@ -160,6 +167,7 @@ async fn rpc_oneway(
     let session = state
         .device_sessions
         .rpc_session(device_id)
+        .await?
         .ok_or_else(|| TbError::NotFound("device is offline or not subscribed to RPC".into()))?;
     let request_id = state.device_sessions.next_rpc_request_id();
     send_rpc(&state, device_id, &session, request_id, &body, timeout).await?;

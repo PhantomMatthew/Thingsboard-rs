@@ -16,6 +16,10 @@ impl TbTopic {
         format!("tb_transport.notifications.{node_id}")
     }
 
+    pub fn core_rpc_responses(node_id: &str) -> String {
+        format!("tb_core.rpc.responses.{node_id}")
+    }
+
     pub fn rule_engine(queue_name: &str) -> String {
         format!("tb_rule_engine.{queue_name}")
     }

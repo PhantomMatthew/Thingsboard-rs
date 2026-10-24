@@ -23,10 +23,11 @@ use uuid::Uuid;
 use crate::codec::{
     ConnectPacket, LEVEL_3_1_1, MqttCodec, MqttPacket, PublishPacket, connack_code,
 };
-use crate::{SessionHandle, TransportState, UNSUBSCRIBED};
+use crate::{SessionCommand, SessionHandle, TransportState, UNSUBSCRIBED};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DOWNLINK_CHANNEL_SIZE: usize = 32;
+const ACTIVITY_HEARTBEAT: Duration = Duration::from_secs(60);
 const NO_KEEPALIVE: Duration = Duration::from_secs(24 * 3600);
 
 pub const TOPIC_TELEMETRY: &str = "v1/devices/me/telemetry";
@@ -241,8 +242,8 @@ pub struct Session {
     pub device: pb::DeviceInfoProto,
     keep_alive: u16,
     /// 下行 channel 发送端：子设备会话复用同一物理连接。
-    pub tx: mpsc::Sender<MqttPacket>,
-    rx: mpsc::Receiver<MqttPacket>,
+    pub tx: mpsc::Sender<SessionCommand>,
+    rx: mpsc::Receiver<SessionCommand>,
     /// additional_info.gateway=true：允许 v1/gateway/* topic。
     pub is_gateway: bool,
     /// 子设备名 → 逻辑会话。
@@ -303,11 +304,34 @@ async fn serve(
     } else {
         NO_KEEPALIVE
     };
+    let mut heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + ACTIVITY_HEARTBEAT,
+        ACTIVITY_HEARTBEAT,
+    );
     loop {
         tokio::select! {
             cmd = session.rx.recv() => {
-                let Some(mut packet) = cmd else {
-                    return "kicked by core".into();
+                let Some(command) = cmd else {
+                    return "downlink channel closed".into();
+                };
+                let mut packet = match command {
+                    SessionCommand::Packet(packet) => packet,
+                    SessionCommand::Close { session_id, reason } => {
+                        if session_id == session.info.session_id {
+                            return reason;
+                        }
+                        let sub_device = session
+                            .sub_devices
+                            .iter()
+                            .find(|(_, sub)| sub.info.session_id == session_id)
+                            .map(|(name, _)| name.clone());
+                        if let Some(name) = sub_device {
+                            crate::gateway::close_sub_device(state, session, &name, &reason).await;
+                        } else {
+                            state.sessions.remove(&session_id);
+                        }
+                        continue;
+                    }
                 };
                 if let MqttPacket::Publish(p) = &mut packet
                     && p.qos == 1 && p.packet_id.is_none()
@@ -318,6 +342,17 @@ async fn serve(
                 }
                 if let Err(e) = framed.send(packet).await {
                     return format!("downlink send failed: {e}");
+                }
+            }
+            _ = heartbeat.tick() => {
+                report_activity(state, session).await;
+                let sub_devices: Vec<_> = session
+                    .sub_devices
+                    .values()
+                    .map(|sub| (sub.device.clone(), sub.info.clone()))
+                    .collect();
+                for (device, info) in sub_devices {
+                    report_device_activity(state, &device, &info).await;
                 }
             }
             pkt = tokio::time::timeout(keep_alive, framed.next()) => {
@@ -529,6 +564,13 @@ async fn handle_publish(
         // 服务端 RPC 的设备响应：回流 tb_core 完成 pending。
         match request_id.parse::<i32>() {
             Ok(request_id) => {
+                let route_key = (session.info.session_id.clone(), request_id);
+                let reply_node_id = state
+                    .rpc_reply_nodes
+                    .get(&route_key)
+                    .await
+                    .unwrap_or_default();
+                state.rpc_reply_nodes.invalidate(&route_key).await;
                 send_core(
                     state,
                     &session.device,
@@ -537,6 +579,7 @@ async fn handle_publish(
                         request_id,
                         payload_json: String::from_utf8_lossy(&p.payload).into_owned(),
                         error: String::new(),
+                        reply_node_id,
                     }),
                 )
                 .await;
@@ -558,11 +601,19 @@ async fn handle_publish(
 }
 
 async fn report_activity(state: &TransportState, session: &Session) {
+    report_device_activity(state, &session.device, &session.info).await;
+}
+
+async fn report_device_activity(
+    state: &TransportState,
+    device: &pb::DeviceInfoProto,
+    info: &core_pb::SessionInfoProto,
+) {
     send_core(
         state,
-        &session.device,
+        device,
         core_pb::to_core_msg::Msg::DeviceActivity(core_pb::DeviceActivityMsg {
-            session: Some(session.info.clone()),
+            session: Some(info.clone()),
             last_activity_ts: chrono::Utc::now().timestamp_millis(),
         }),
     )

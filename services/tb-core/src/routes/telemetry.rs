@@ -10,6 +10,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tb_auth::{ApiError, AuthUser};
+use tb_common::msg::msg_type;
 use tb_common::{AttributeScope, EntityType, KvEntry, KvValue, TbError, TbResult, TsKvEntry};
 use tb_dao::Aggregation;
 use tb_dao::models::Authority;
@@ -133,7 +134,13 @@ async fn notify_shared_attribute_update(
     if entity_type != EntityType::Device || attributes.is_empty() {
         return;
     }
-    let sessions = state.device_sessions.attribute_sessions(entity_id);
+    let sessions = match state.device_sessions.attribute_sessions(entity_id).await {
+        Ok(sessions) => sessions,
+        Err(e) => {
+            tracing::warn!("read attribute sessions failed: {e}");
+            return;
+        }
+    };
     if sessions.is_empty() {
         return;
     }
@@ -408,6 +415,25 @@ async fn save_attributes(
         &entries,
         vec![],
     );
+    let kv: serde_json::Map<String, Value> = entries
+        .iter()
+        .map(|e| {
+            (
+                e.key.clone(),
+                serde_json::to_value(&e.value).unwrap_or_default(),
+            )
+        })
+        .collect();
+    crate::rule_engine_events::publish_event(
+        state.queue_producer().await?,
+        user.0.tenant_id,
+        entity_type,
+        entity_id,
+        msg_type::ATTRIBUTES_UPDATED,
+        json!({"scope": scope, "kv": kv}),
+        HashMap::new(),
+    )
+    .await?;
     if scope == AttributeScope::SharedScope {
         let mut kvs = Vec::with_capacity(entries.len());
         for e in &entries {
@@ -487,6 +513,18 @@ async fn delete_attributes(
             &[],
             keys.clone(),
         );
+        let kv: serde_json::Map<String, Value> =
+            keys.iter().map(|key| (key.clone(), Value::Null)).collect();
+        crate::rule_engine_events::publish_event(
+            state.queue_producer().await?,
+            user.0.tenant_id,
+            entity_type,
+            entity_id,
+            msg_type::ATTRIBUTES_DELETED,
+            json!({"scope": scope, "kv": kv}),
+            HashMap::new(),
+        )
+        .await?;
     }
     if deleted > 0 && scope == AttributeScope::SharedScope {
         let mut kvs = Vec::with_capacity(keys.len());

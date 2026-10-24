@@ -51,6 +51,7 @@ pub struct AppStateInner {
     /// login 审计事件通道（tb-auth 侧 try_send，receiver 已在 new() 启动）。
     pub audit_tx: mpsc::Sender<tb_dao::AuditLog>,
     pub device_sessions: SharedDeviceSessionRegistry,
+    pub node_id: String,
     pub redis: redis::Client,
     redis_conn: tokio::sync::OnceCell<redis::aio::ConnectionManager>,
     kafka_producer: tokio::sync::OnceCell<KafkaQueueProducer>,
@@ -75,12 +76,54 @@ impl Deref for AppState {
     }
 }
 
+fn default_node_id() -> String {
+    let hostname = std::env::var("HOSTNAME")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            let output = std::process::Command::new("hostname").output().ok()?;
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        })
+        .unwrap_or_else(|| "tb-core".into());
+    let suffix = uuid::Uuid::now_v7().simple().to_string();
+    format!("{hostname}-{}", &suffix[..8])
+}
+
 impl AppState {
-    pub fn new(pool: PgPool, jwt_factory: Arc<JwtTokenFactory>) -> Self {
+    pub async fn new(pool: PgPool, jwt_factory: Arc<JwtTokenFactory>) -> tb_common::TbResult<Self> {
+        let node_id = std::env::var("TB_CORE_NODE_ID")
+            .ok()
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or_else(default_node_id);
+        Self::new_with_node_id(pool, jwt_factory, node_id).await
+    }
+
+    pub async fn new_with_node_id(
+        pool: PgPool,
+        jwt_factory: Arc<JwtTokenFactory>,
+        node_id: impl Into<String>,
+    ) -> tb_common::TbResult<Self> {
+        let node_id = node_id.into();
         let key_dictionary_dao = KeyDictionaryDao::new(pool.clone());
         let redis_url = std::env::var("TB_REDIS_URL").unwrap_or_else(|_| DEFAULT_REDIS_URL.into());
-        let redis = redis::Client::open(redis_url.as_str())
-            .unwrap_or_else(|_| redis::Client::open(DEFAULT_REDIS_URL).unwrap());
+        let redis =
+            redis::Client::open(redis_url.as_str()).map_err(tb_common::TbError::internal)?;
+        let mut redis_manager = redis::aio::ConnectionManager::new(redis.clone())
+            .await
+            .map_err(tb_common::TbError::internal)?;
+        let _: String = redis::cmd("PING")
+            .query_async(&mut redis_manager)
+            .await
+            .map_err(tb_common::TbError::internal)?;
+        let redis_conn = tokio::sync::OnceCell::new();
+        let _ = redis_conn.set(redis_manager.clone());
+        let device_sessions = crate::device_session::DeviceSessionRegistry::new_shared(
+            redis_manager,
+            node_id.clone(),
+        );
         let kafka_brokers =
             std::env::var("TB_KAFKA_BROKERS").unwrap_or_else(|_| DEFAULT_KAFKA_BROKERS.into());
         let edqs_url =
@@ -123,10 +166,11 @@ impl AppState {
                 calculated_field_dao: CalculatedFieldDao::new(pool.clone()),
                 usage: usage.clone(),
                 audit_tx,
-                device_sessions: crate::device_session::DeviceSessionRegistry::new_shared(),
+                device_sessions,
+                node_id,
                 key_dictionary_dao,
                 redis,
-                redis_conn: tokio::sync::OnceCell::new(),
+                redis_conn,
                 kafka_producer: tokio::sync::OnceCell::new(),
                 kafka_brokers,
                 edqs_url,
@@ -140,10 +184,10 @@ impl AppState {
             }),
         };
         usage.start_flush(state.clone());
-        state
+        Ok(state)
     }
 
-    /// 惰性建立并复用 Redis 连接（自动重连）；首次失败不影响后续重试。
+    /// 复用启动时已验证的 Redis 连接；断线后由 ConnectionManager 自动重连。
     pub async fn redis_manager(&self) -> redis::RedisResult<redis::aio::ConnectionManager> {
         self.redis_conn
             .get_or_try_init(|| redis::aio::ConnectionManager::new(self.redis.clone()))

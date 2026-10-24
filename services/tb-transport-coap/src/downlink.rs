@@ -84,6 +84,13 @@ async fn handle(state: &TransportState, socket: &Arc<UdpSocket>, payload: Bytes)
             if observer.kind != ObserverKind::Rpc {
                 return;
             }
+            observer
+                .rpc_reply_nodes
+                .retain(|_, (_, expiration_ts)| *expiration_ts == 0 || *expiration_ts >= now_ms());
+            observer.rpc_reply_nodes.insert(
+                rpc.request_id,
+                (rpc.reply_node_id.clone(), rpc.expiration_ts),
+            );
             let params: serde_json::Value =
                 serde_json::from_str(&rpc.params_json).unwrap_or(serde_json::Value::Null);
             let body = serde_json::json!({
