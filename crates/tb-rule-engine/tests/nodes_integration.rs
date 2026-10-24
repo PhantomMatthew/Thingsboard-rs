@@ -943,8 +943,15 @@ async fn external_mqtt_publishes() {
 // ---------- delayed requeue / checkpoint loop protection ----------
 
 #[tokio::test]
-async fn delay_does_not_block_following_message() {
-    let (ctx, producer) = memory_ctx();
+async fn delay_persists_and_recovers_without_blocking_following_message() {
+    let pool = setup().await;
+    let producer = Arc::new(RecordingProducer {
+        sent: Mutex::new(Vec::new()),
+    });
+    let queue: Arc<dyn QueueProducer> = producer.clone();
+    let ctx = NodeContext::with_queue_producer(pool.clone(), queue.clone());
+    let engine =
+        tb_rule_engine::RuleEngineService::with_queue_producer(pool.clone(), queue, Duration::ZERO);
     let chain_id = Uuid::now_v7();
     let delay = make_chain_node(chain_id, "action.delay", json!({"delay_sec": 1}), false);
     let next = make_chain_node(chain_id, "action.log", json!({}), false);
@@ -968,12 +975,15 @@ async fn delay_does_not_block_following_message() {
 
     let mut delayed = msg(json!({"value": 1}));
     delayed.queue_name = "DelayTest".into();
+    delayed.ts = 1;
     let delayed_id = delayed.id;
     let start = std::time::Instant::now();
     chain::execute(&ctx, &state, delay.id, delayed)
         .await
         .unwrap();
     assert!(start.elapsed() < Duration::from_millis(200));
+    assert!(producer.drain().is_empty());
+    engine.process_due_delays("before-due", 10).await.unwrap();
     assert!(producer.drain().is_empty());
 
     let following_id = msg(json!({"value": 2})).id;
@@ -992,8 +1002,15 @@ async fn delay_does_not_block_following_message() {
     );
     assert!(producer.drain().is_empty());
 
+    drop(engine);
+    let recovered = tb_rule_engine::RuleEngineService::with_queue_producer(
+        pool,
+        producer.clone(),
+        Duration::ZERO,
+    );
     let deliveries = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
+            recovered.process_due_delays("recovered", 10).await.unwrap();
             let deliveries = producer.drain();
             if !deliveries.is_empty() {
                 return deliveries;

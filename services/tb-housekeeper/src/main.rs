@@ -1,4 +1,4 @@
-//! tb-housekeeper：周期清理过期数据（ts_kv / 调试事件 / 已清除告警 / 终态去重窗口）。
+//! tb-housekeeper：周期清理过期遥测、调试事件、告警及终态规则任务。
 //!
 //! 环境变量：
 //! - TB_DATABASE_URL（默认 postgres://thingsboard:thingsboard@localhost:5433/thingsboard）
@@ -6,7 +6,7 @@
 //! - TB_TS_TTL_DAYS（默认 0=不清理 ts_kv）
 //! - TB_DEBUG_EVENT_TTL_DAYS（默认 7）
 //! - TB_ALARM_TTL_DAYS（默认 0=不清理；仅清 CLEARED_* 且 clear_ts 早于阈值的告警）
-//! - TB_DEDUP_WINDOW_TTL_DAYS（默认 7；仅清 DONE 窗口）
+//! - TB_DEDUP_WINDOW_TTL_DAYS / TB_DELAY_TASK_TTL_DAYS（默认 7；仅清终态任务）
 
 use std::time::Duration;
 
@@ -23,6 +23,7 @@ struct Config {
     debug_event_ttl_days: i64,
     alarm_ttl_days: i64,
     dedup_window_ttl_days: i64,
+    delay_task_ttl_days: i64,
 }
 
 impl Config {
@@ -43,6 +44,7 @@ impl Config {
             debug_event_ttl_days: env_i64("TB_DEBUG_EVENT_TTL_DAYS", 7),
             alarm_ttl_days: env_i64("TB_ALARM_TTL_DAYS", 0),
             dedup_window_ttl_days: env_i64("TB_DEDUP_WINDOW_TTL_DAYS", 7),
+            delay_task_ttl_days: env_i64("TB_DELAY_TASK_TTL_DAYS", 7),
         }
     }
 }
@@ -59,7 +61,7 @@ fn cutoff(now: i64, ttl_days: i64) -> i64 {
 }
 
 /// 跑一轮清理，返回各类删除行数。
-async fn cleanup_round(config: &Config, pool: &PgPool) -> (u64, u64, u64, u64) {
+async fn cleanup_round(config: &Config, pool: &PgPool) -> (u64, u64, u64, u64, u64) {
     let now = now_ms();
     let mut ts_deleted = 0;
     if config.ts_ttl_days > 0 {
@@ -94,14 +96,30 @@ async fn cleanup_round(config: &Config, pool: &PgPool) -> (u64, u64, u64, u64) {
             Err(e) => tracing::error!("deduplication window cleanup failed: {e}"),
         }
     }
+    let mut delay_deleted = 0;
+    if config.delay_task_ttl_days > 0 {
+        match tb_housekeeper::cleanup_delay_tasks(pool, cutoff(now, config.delay_task_ttl_days))
+            .await
+        {
+            Ok(n) => delay_deleted = n,
+            Err(e) => tracing::error!("delayed task cleanup failed: {e}"),
+        }
+    }
     tracing::info!(
         ts_kv_deleted = ts_deleted,
         debug_event_deleted = debug_deleted,
         alarm_deleted = alarm_deleted,
         dedup_window_deleted = dedup_deleted,
+        delay_task_deleted = delay_deleted,
         "housekeeper round done"
     );
-    (ts_deleted, debug_deleted, alarm_deleted, dedup_deleted)
+    (
+        ts_deleted,
+        debug_deleted,
+        alarm_deleted,
+        dedup_deleted,
+        delay_deleted,
+    )
 }
 
 async fn run(config: Config, pool: PgPool) {
@@ -132,6 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         debug_event_ttl_days = config.debug_event_ttl_days,
         alarm_ttl_days = config.alarm_ttl_days,
         dedup_window_ttl_days = config.dedup_window_ttl_days,
+        delay_task_ttl_days = config.delay_task_ttl_days,
         "tb-housekeeper started"
     );
     run(config, pool).await;

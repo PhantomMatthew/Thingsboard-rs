@@ -105,6 +105,84 @@ impl RuleEngineService {
         Ok(())
     }
 
+    /// 扫描并处理一批到期或需要恢复的延迟任务。
+    pub async fn process_due_delays(&self, owner: &str, limit: i64) -> TbResult<()> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let tasks = self
+            .ctx
+            .delay_dao
+            .claim_due(owner, now + 30_000, now, limit)
+            .await?;
+        for task in tasks {
+            if let Err(e) = self.process_delay_task(task, owner).await {
+                tracing::warn!(error = %e, owner, "process delayed message failed");
+            }
+        }
+        Ok(())
+    }
+
+    async fn process_delay_task(&self, task: tb_dao::DelayTask, owner: &str) -> TbResult<()> {
+        let now = chrono::Utc::now().timestamp_millis();
+        if !self
+            .ctx
+            .delay_dao
+            .renew_lease(task.id, owner, now, now + 30_000)
+            .await?
+        {
+            return Ok(());
+        }
+        match chain::requeue(
+            &self.ctx.kafka_producer,
+            task.rule_chain_id,
+            task.next_node_id,
+            task.msg.clone(),
+        )
+        .await
+        {
+            Ok(()) => {
+                self.ctx.delay_dao.mark_done(task.id, owner, now).await?;
+            }
+            Err(error) if task.retry_count < task.max_retries => {
+                self.ctx
+                    .delay_dao
+                    .record_retry(task.id, owner, now, now + 10_000, &error.to_string())
+                    .await?;
+            }
+            Err(error) => {
+                let error = format!("delayed requeue failed: {error}");
+                match chain::send_dlq(
+                    &self.ctx.kafka_producer,
+                    task.rule_chain_id,
+                    task.rule_node_id,
+                    task.msg.clone(),
+                    error.clone(),
+                )
+                .await
+                {
+                    Ok(()) => {
+                        self.ctx
+                            .delay_dao
+                            .mark_dead(task.id, owner, now, &error)
+                            .await?;
+                    }
+                    Err(dlq_error) => {
+                        self.ctx
+                            .delay_dao
+                            .record_retry(
+                                task.id,
+                                owner,
+                                now,
+                                now + 10_000,
+                                &format!("{error}; DLQ failed: {dlq_error}"),
+                            )
+                            .await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// 扫描并处理一批到期或需要恢复的去重窗口。
     pub async fn process_due_windows(&self, owner: &str, limit: i64) -> TbResult<()> {
         let now = chrono::Utc::now().timestamp_millis();

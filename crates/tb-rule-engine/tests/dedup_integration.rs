@@ -339,3 +339,33 @@ async fn exhausted_output_uses_failure_path_and_closes_window() {
     engine.process_due_windows("done", 10).await.unwrap();
     assert!(test.producer.sent.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn exhausted_delay_writes_dlq_before_dead() {
+    let test = setup(json!({"interval": 1})).await;
+    let engine = engine(&test);
+    let mut delayed = msg(&test, 9, 1);
+    delayed.rule_chain_id = Some(test.chain_id);
+    delayed.rule_node_id = Some(test.dedup_node_id);
+    delayed.metadata.insert("_hops".into(), "1".into());
+    tb_dao::RuleNodeDelayDao::new(test.pool.clone())
+        .enqueue(&delayed, Uuid::now_v7(), Duration::from_secs(1), 0)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    test.producer.failures.store(1, Ordering::SeqCst);
+    engine
+        .process_due_delays("delay-initial", 10)
+        .await
+        .unwrap();
+    let dlq = test.producer.drain();
+    assert_eq!(dlq.len(), 2);
+    assert!(dlq[1].metadata["error"].contains("delayed requeue failed"));
+    let state: String = sqlx::query_scalar("SELECT state FROM rule_node_delay")
+        .fetch_one(&test.pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "DEAD");
+    engine.process_due_delays("delay-done", 10).await.unwrap();
+    assert!(test.producer.sent.lock().unwrap().is_empty());
+}

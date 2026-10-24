@@ -125,7 +125,7 @@ async fn save_debug_event(
     }
 }
 
-async fn send_dlq(
+pub(crate) async fn send_dlq(
     producer: &Arc<dyn QueueProducer>,
     chain_id: Uuid,
     from_node_id: Uuid,
@@ -155,7 +155,7 @@ async fn send_dlq(
 }
 
 /// 经 TbMsg 自身的 checkpoint 字段重投到原规则队列。
-async fn requeue(
+pub(crate) async fn requeue(
     producer: &Arc<dyn QueueProducer>,
     chain_id: Uuid,
     next_node: Uuid,
@@ -180,39 +180,11 @@ async fn requeue(
 
 async fn schedule_requeue(
     ctx: &NodeContext,
-    state: &RuleChainState,
-    rule_node: &RuleNode,
     next_node: Uuid,
     msg: TbMsg,
     delay: Duration,
 ) -> TbResult<()> {
-    let permit = match ctx.delay_semaphore.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            let error = "delayed task limit (10000) exceeded".to_string();
-            return send_dlq(
-                &ctx.kafka_producer,
-                state.chain_id,
-                rule_node.id,
-                msg,
-                error,
-            )
-            .await;
-        }
-    };
-    let producer = ctx.kafka_producer.clone();
-    let chain_id = state.chain_id;
-    let from_node_id = rule_node.id;
-    tokio::spawn(async move {
-        let _permit = permit;
-        tokio::time::sleep(delay).await;
-        if let Err(e) = requeue(&producer, chain_id, next_node, msg.clone()).await {
-            let error = format!("delayed requeue failed: {e}");
-            if let Err(dlq_error) = send_dlq(&producer, chain_id, from_node_id, msg, error).await {
-                tracing::error!("delayed requeue DLQ failed: {dlq_error}");
-            }
-        }
-    });
+    ctx.delay_dao.enqueue(&msg, next_node, delay, 3).await?;
     Ok(())
 }
 
@@ -278,7 +250,7 @@ async fn route_outputs(
             } else if rel == "Success"
                 && let Some(delay) = delay
             {
-                schedule_requeue(ctx, state, rule_node, to, m.clone(), delay).await?;
+                schedule_requeue(ctx, to, m.clone(), delay).await?;
             } else {
                 queue.push_back((to, m.clone()));
             }

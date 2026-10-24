@@ -13,6 +13,7 @@ enum CleanupTarget {
     DebugEvent,
     ClearedAlarm,
     DedupWindow,
+    DelayTask,
 }
 
 impl CleanupTarget {
@@ -27,6 +28,10 @@ impl CleanupTarget {
             Self::DedupWindow => (
                 "rule_node_dedup_window",
                 "state = 'DONE' AND updated_at < $1",
+            ),
+            Self::DelayTask => (
+                "rule_node_delay",
+                "state IN ('DONE','DEAD') AND updated_at < $1",
             ),
         };
         format!(
@@ -106,6 +111,17 @@ pub async fn cleanup_dedup_windows(pool: &PgPool, cutoff: i64) -> Result<u64, sq
     .await
 }
 
+pub async fn cleanup_delay_tasks(pool: &PgPool, cutoff: i64) -> Result<u64, sqlx::Error> {
+    delete_in_batches(
+        pool,
+        CleanupTarget::DelayTask,
+        cutoff,
+        DELETE_BATCH_SIZE,
+        BATCH_INTERVAL,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use sqlx::postgres::PgPoolOptions;
@@ -177,6 +193,26 @@ mod tests {
         .unwrap();
     }
 
+    async fn insert_delay_task(pool: &PgPool, state: &str, updated_at: i64) {
+        sqlx::query(
+            "INSERT INTO rule_node_delay \
+             (id, tenant_id, rule_chain_id, rule_node_id, next_node_id, msg_id, hop_count, msg, \
+             execute_at, state, updated_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,0,'{}'::jsonb,0,$7,$8)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind(state)
+        .bind(updated_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn all_cleanup_targets_delete_multiple_batches() {
         let pool = setup_pool().await;
@@ -225,12 +261,18 @@ mod tests {
         }
         insert_dedup_window(&pool, "OPEN", 1).await;
         insert_dedup_window(&pool, "DONE", 100).await;
+        for updated_at in 1..=5 {
+            insert_delay_task(&pool, "DEAD", updated_at).await;
+        }
+        insert_delay_task(&pool, "PENDING", 1).await;
+        insert_delay_task(&pool, "DONE", 100).await;
 
         for target in [
             CleanupTarget::TsKv,
             CleanupTarget::DebugEvent,
             CleanupTarget::ClearedAlarm,
             CleanupTarget::DedupWindow,
+            CleanupTarget::DelayTask,
         ] {
             let deleted = delete_in_batches(&pool, target, 10, 2, Duration::ZERO)
                 .await
@@ -243,6 +285,7 @@ mod tests {
             ("rule_node_debug_event", 1),
             ("alarm", 2),
             ("rule_node_dedup_window", 2),
+            ("rule_node_delay", 2),
         ] {
             let remaining: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
                 .fetch_one(&pool)

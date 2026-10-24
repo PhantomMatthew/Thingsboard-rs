@@ -22,6 +22,7 @@ pub mod relation;
 pub mod rule_chain;
 pub mod rule_node_debug_event;
 pub mod rule_node_dedup;
+pub mod rule_node_delay;
 pub mod tenant;
 pub mod timeseries;
 pub mod user;
@@ -49,6 +50,7 @@ pub use rule_node_debug_event::{RuleNodeDebugEvent, RuleNodeDebugEventDao};
 pub use rule_node_dedup::{
     AppendResult, DedupStrategy, DedupWindow, DedupWindowState, RuleNodeDedupDao,
 };
+pub use rule_node_delay::{DelayEnqueueResult, DelayTask, DelayTaskState, RuleNodeDelayDao};
 pub use sqlx::PgPool;
 pub use tenant::{TenantDao, TenantProfileDao};
 pub use timeseries::{Aggregation, TimeseriesDao};

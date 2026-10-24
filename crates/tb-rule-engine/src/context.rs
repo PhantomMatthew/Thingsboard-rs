@@ -5,12 +5,10 @@ use std::sync::Arc;
 use sqlx::PgPool;
 use tb_dao::{
     AlarmDao, AssetDao, AttributesDao, CustomerDao, DeviceDao, KeyDictionaryDao, RelationDao,
-    RuleNodeDebugEventDao, RuleNodeDedupDao, TenantDao, TimeseriesDao,
+    RuleNodeDebugEventDao, RuleNodeDedupDao, RuleNodeDelayDao, TenantDao, TimeseriesDao,
 };
 use tb_queue::{KafkaQueueProducer, QueueProducer};
 use tb_script::ScriptEngine;
-
-const MAX_DELAY_TASKS: usize = 10_000;
 
 pub struct NodeContext {
     pub pool: PgPool,
@@ -24,12 +22,12 @@ pub struct NodeContext {
     pub tenant_dao: TenantDao,
     pub debug_event_dao: RuleNodeDebugEventDao,
     pub dedup_dao: RuleNodeDedupDao,
+    pub delay_dao: RuleNodeDelayDao,
     pub script_engine: Arc<ScriptEngine>,
     pub kafka_producer: Arc<dyn QueueProducer>,
     /// EDQS 读模型事件发布（复用 kafka_producer）；失败仅 warn，不阻塞规则链。
     pub edqs_producer: Option<KafkaQueueProducer>,
     pub redis_manager: Option<redis::aio::ConnectionManager>,
-    pub(crate) delay_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl NodeContext {
@@ -59,11 +57,11 @@ impl NodeContext {
             tenant_dao: TenantDao::new(pool.clone()),
             debug_event_dao: RuleNodeDebugEventDao::new(pool.clone()),
             dedup_dao: RuleNodeDedupDao::new(pool.clone()),
+            delay_dao: RuleNodeDelayDao::new(pool.clone()),
             script_engine: Arc::new(ScriptEngine::new()),
             kafka_producer: producer,
             edqs_producer,
             redis_manager: None,
-            delay_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_DELAY_TASKS)),
             pool,
         }
     }

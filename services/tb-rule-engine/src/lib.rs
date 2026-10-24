@@ -116,6 +116,9 @@ async fn start_rule_engine_inner(
                     }
                 }
                 _ = scan_interval.tick() => {
+                    if let Err(e) = engine.process_due_delays(&scanner_owner, 100).await {
+                        tracing::warn!("delayed message scan failed: {e}");
+                    }
                     if let Err(e) = engine.process_due_windows(&scanner_owner, 100).await {
                         tracing::warn!("deduplication window scan failed: {e}");
                     }
