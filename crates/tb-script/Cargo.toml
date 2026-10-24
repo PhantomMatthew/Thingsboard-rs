@@ -8,5 +8,6 @@ license.workspace = true
 rhai = { workspace = true, features = ["sync"] }
 serde_json.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 moka = { workspace = true, features = ["sync"] }
 tb-common = { path = "../tb-common" }

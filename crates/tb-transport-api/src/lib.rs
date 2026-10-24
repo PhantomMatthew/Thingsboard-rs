@@ -32,6 +32,28 @@ const CACHE_TTL: Duration = Duration::from_secs(60);
 
 type PendingMap = Arc<Mutex<HashMap<String, oneshot::Sender<pb::TransportApiResponseMsg>>>>;
 
+fn mutex_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn remove_pending(pending: &PendingMap, request_id: &str) {
+    let _ = mutex_lock(pending).remove(request_id);
+}
+
+fn handle_send_result(
+    pending: &PendingMap,
+    request_id: &str,
+    result: Result<(), tb_queue::QueueError>,
+) -> TbResult<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            remove_pending(pending, request_id);
+            Err(TbError::internal(e))
+        }
+    }
+}
+
 struct Inner {
     node_id: String,
     producer: KafkaQueueProducer,
@@ -75,7 +97,7 @@ impl TransportApiClient {
                                 tracing::warn!("undecodable transport-api response");
                                 continue;
                             };
-                            let tx = pending.lock().unwrap().remove(&resp.request_id);
+                            let tx = mutex_lock(&pending).remove(&resp.request_id);
                             if let Some(tx) = tx {
                                 let _ = tx.send(resp);
                             } else {
@@ -91,6 +113,7 @@ impl TransportApiClient {
             })
         };
         let cache = moka::future::Cache::builder()
+            .max_capacity(100_000)
             .time_to_live(CACHE_TTL)
             .build();
         let rate_limiter = std::env::var("TB_TRANSPORT_RATE_LIMIT_PER_TENANT")
@@ -114,13 +137,13 @@ impl TransportApiClient {
     pub fn set_rate_limit(&self, max_msgs_per_sec_per_tenant: u32) {
         let limiter = (max_msgs_per_sec_per_tenant > 0)
             .then(|| RateLimiter::new(max_msgs_per_sec_per_tenant));
-        *self.inner.rate_limiter.lock().unwrap() = limiter;
+        *mutex_lock(&self.inner.rate_limiter) = limiter;
     }
 
-    /// 租户令牌桶取一枚；未配置限流时恒 true。
-    fn rate_limit_check(&self, tenant_id: &str) -> bool {
-        match &*self.inner.rate_limiter.lock().unwrap() {
-            Some(limiter) => limiter.check(tenant_id),
+    /// 租户令牌桶取 msg_count 枚；未配置限流时恒 true。
+    fn rate_limit_check(&self, tenant_id: &str, msg_count: u32) -> bool {
+        match &*mutex_lock(&self.inner.rate_limiter) {
+            Some(limiter) => limiter.check_n(tenant_id, msg_count),
             None => true,
         }
     }
@@ -140,25 +163,22 @@ impl TransportApiClient {
             request: Some(request),
         };
         let (tx, rx) = oneshot::channel();
-        self.inner
-            .pending
-            .lock()
-            .unwrap()
-            .insert(request_id.clone(), tx);
-        self.inner
+        let _ = mutex_lock(&self.inner.pending).insert(request_id.clone(), tx);
+        let send_result = self
+            .inner
             .producer
             .send(
                 TbTopic::TRANSPORT_API_REQUESTS,
                 &self.inner.node_id,
                 Bytes::from(msg.encode_to_vec()),
             )
-            .await
-            .map_err(TbError::internal)?;
+            .await;
+        handle_send_result(&self.inner.pending, &request_id, send_result)?;
         match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
             Ok(Ok(resp)) => Ok(resp),
             Ok(Err(_)) => Err(TbError::Internal("response channel closed".into())),
             Err(_) => {
-                self.inner.pending.lock().unwrap().remove(&request_id);
+                remove_pending(&self.inner.pending, &request_id);
                 Err(TbError::Internal("transport-api request timeout".into()))
             }
         }
@@ -264,17 +284,12 @@ impl TransportApiClient {
     }
 
     /// 遥测上行：每个 ts 分组一条消息，data_json 为 {"ts":ms,"values":{...}}。
+    /// 限流按分组后的 Kafka 消息数一次预扣。
     pub async fn publish_telemetry(
         &self,
         device: &pb::DeviceInfoProto,
         entries: Vec<TsKvEntry>,
     ) -> TbResult<()> {
-        if !self.rate_limit_check(&device.tenant_id) {
-            return Err(TbError::RateLimitExceeded(format!(
-                "tenant {} telemetry rate limit exceeded",
-                device.tenant_id
-            )));
-        }
         let mut by_ts: HashMap<i64, serde_json::Map<String, serde_json::Value>> = HashMap::new();
         let mut order: Vec<i64> = Vec::new();
         for e in entries {
@@ -283,6 +298,13 @@ impl TransportApiClient {
                 serde_json::Map::new()
             });
             group.insert(e.key, serde_json::to_value(&e.value).unwrap_or_default());
+        }
+        let msg_count = u32::try_from(order.len()).unwrap_or(u32::MAX);
+        if !self.rate_limit_check(&device.tenant_id, msg_count) {
+            return Err(TbError::RateLimitExceeded(format!(
+                "tenant {} telemetry rate limit exceeded",
+                device.tenant_id
+            )));
         }
         for ts in order {
             let data = serde_json::json!({"ts": ts, "values": by_ts[&ts]});
@@ -298,7 +320,7 @@ impl TransportApiClient {
         device: &pb::DeviceInfoProto,
         entries: Vec<KvEntry>,
     ) -> TbResult<()> {
-        if !self.rate_limit_check(&device.tenant_id) {
+        if !self.rate_limit_check(&device.tenant_id, 1) {
             return Err(TbError::RateLimitExceeded(format!(
                 "tenant {} attributes rate limit exceeded",
                 device.tenant_id
@@ -321,6 +343,12 @@ impl TransportApiClient {
         params: serde_json::Value,
         timeout_ms: i64,
     ) -> TbResult<()> {
+        if !self.rate_limit_check(&device.tenant_id, 1) {
+            return Err(TbError::RateLimitExceeded(format!(
+                "tenant {} to-server RPC rate limit exceeded",
+                device.tenant_id
+            )));
+        }
         let data = serde_json::json!({
             "method": method,
             "params": params,
@@ -504,5 +532,84 @@ impl TransportApiClient {
 impl Drop for Inner {
     fn drop(&mut self) {
         self.router_task.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tb_common::KvValue;
+
+    fn test_client(rate: u32) -> TransportApiClient {
+        TransportApiClient {
+            inner: Arc::new(Inner {
+                node_id: "test-node".into(),
+                producer: KafkaQueueProducer::new("localhost:1", "transport-api-test").unwrap(),
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                cache: moka::future::Cache::builder()
+                    .max_capacity(100_000)
+                    .time_to_live(CACHE_TTL)
+                    .build(),
+                rate_limiter: Mutex::new((rate > 0).then(|| RateLimiter::new(rate))),
+                router_task: tokio::spawn(async {}),
+            }),
+        }
+    }
+
+    fn device() -> pb::DeviceInfoProto {
+        pb::DeviceInfoProto {
+            tenant_id: "tenant-1".into(),
+            ..Default::default()
+        }
+    }
+
+    fn telemetry(ts: i64, key: &str) -> TsKvEntry {
+        TsKvEntry {
+            ts,
+            key: key.into(),
+            value: KvValue::Long(1),
+        }
+    }
+
+    #[test]
+    fn send_failure_removes_pending_slot() {
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = oneshot::channel();
+        let _ = mutex_lock(&pending).insert("request-1".into(), tx);
+
+        let result = handle_send_result(
+            &pending,
+            "request-1",
+            Err(tb_queue::QueueError::Serialization("send failed".into())),
+        );
+
+        assert!(matches!(result, Err(TbError::Internal(_))));
+        assert!(!mutex_lock(&pending).contains_key("request-1"));
+    }
+
+    #[tokio::test]
+    async fn telemetry_fanout_uses_message_count_for_rate_limit() {
+        let client = test_client(1);
+        let result = client
+            .publish_telemetry(
+                &device(),
+                vec![telemetry(1, "a"), telemetry(1, "b"), telemetry(2, "c")],
+            )
+            .await;
+
+        assert!(matches!(result, Err(TbError::RateLimitExceeded(_))));
+    }
+
+    #[tokio::test]
+    async fn to_server_rpc_is_rate_limited() {
+        let client = test_client(1);
+        let device = device();
+        assert!(client.rate_limit_check(&device.tenant_id, 1));
+
+        let result = client
+            .publish_to_server_rpc(&device, "ping", serde_json::json!({}), 1_000)
+            .await;
+
+        assert!(matches!(result, Err(TbError::RateLimitExceeded(_))));
     }
 }

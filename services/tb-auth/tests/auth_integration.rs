@@ -1,0 +1,175 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use sqlx::PgPool;
+use tb_auth::oauth2::Oauth2LoginRequest;
+use tb_auth::{AuthService, JwtTokenFactory, TokenType};
+use tb_common::{TbError, TbResult};
+use tb_dao::models::{Authority, Oauth2Client, Tenant, User, UserCredentials};
+use tb_dao::{Oauth2ClientDao, TenantDao, UserCredentialsDao, UserDao, migrate};
+use uuid::Uuid;
+
+const OLD_PASSWORD: &str = "old-password";
+const NEW_PASSWORD: &str = "new-password";
+
+fn db_url() -> String {
+    std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://thingsboard:thingsboard@localhost:5433/thingsboard".into())
+}
+
+async fn setup() -> PgPool {
+    let pool = PgPool::connect(&db_url()).await.unwrap();
+    migrate(&pool).await.unwrap();
+    pool
+}
+
+fn auth_service(pool: &PgPool) -> Arc<AuthService> {
+    AuthService::new(
+        pool.clone(),
+        Arc::new(JwtTokenFactory::new(
+            "auth-integration-test-secret",
+            900,
+            604800,
+        )),
+    )
+}
+
+async fn create_user(pool: &PgPool, enabled: bool) -> TbResult<(User, UserCredentials)> {
+    let tenant = TenantDao::new(pool.clone())
+        .save(&Tenant {
+            id: Uuid::now_v7(),
+            created_time: 0,
+            title: format!("auth-test-{}", Uuid::now_v7().simple()),
+            region: None,
+            country: None,
+            state: None,
+            city: None,
+            address: None,
+            address2: None,
+            zip: None,
+            phone: None,
+            email: None,
+            additional_info: None,
+            tenant_profile_id: None,
+        })
+        .await?;
+    let user = UserDao::new(pool.clone())
+        .save(&User {
+            id: Uuid::now_v7(),
+            created_time: 0,
+            tenant_id: tenant.id,
+            customer_id: None,
+            authority: Authority::TenantAdmin,
+            email: format!("{}@auth-test.local", Uuid::now_v7().simple()),
+            first_name: None,
+            last_name: None,
+            phone: None,
+            additional_info: None,
+        })
+        .await?;
+    let credentials = UserCredentialsDao::new(pool.clone())
+        .save(&UserCredentials {
+            id: Uuid::now_v7(),
+            created_time: 0,
+            user_id: user.id,
+            enabled,
+            password: Some(tb_auth::password::hash_password(OLD_PASSWORD)?),
+            activate_token: None,
+            reset_token: None,
+            failed_login_attempts: 0,
+            last_login_ts: None,
+            password_changed_ts: None,
+        })
+        .await?;
+    Ok((user, credentials))
+}
+
+async fn delete_user_tenant(pool: &PgPool, user: &User) -> TbResult<()> {
+    TenantDao::new(pool.clone())
+        .delete_by_id(user.tenant_id)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn disabled_credentials_reject_refresh_and_access_tokens() -> TbResult<()> {
+    let pool = setup().await;
+    let auth = auth_service(&pool);
+    let (user, mut credentials) = create_user(&pool, true).await?;
+    let pair = auth.issue_tokens(&user)?;
+
+    credentials.enabled = false;
+    UserCredentialsDao::new(pool.clone())
+        .save(&credentials)
+        .await?;
+
+    let err = auth.refresh(&pair.refresh_token).await.unwrap_err();
+    assert!(matches!(err, TbError::PermissionDenied(_)), "{err:?}");
+    let err = auth.get_user_from_token(&pair.token).await.unwrap_err();
+    assert!(matches!(err, TbError::PermissionDenied(_)), "{err:?}");
+
+    delete_user_tenant(&pool, &user).await
+}
+
+#[tokio::test]
+async fn password_change_rejects_old_refresh_and_accepts_new_login() -> TbResult<()> {
+    let pool = setup().await;
+    let auth = auth_service(&pool);
+    let (user, _) = create_user(&pool, true).await?;
+    let old_pair = auth.issue_tokens(&user)?;
+
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    auth.change_password(user.id, OLD_PASSWORD, NEW_PASSWORD)
+        .await?;
+    let credentials = UserCredentialsDao::new(pool.clone())
+        .find_by_user_id(user.id)
+        .await?
+        .expect("credentials after password change");
+    assert!(credentials.password_changed_ts.is_some());
+
+    let err = auth.refresh(&old_pair.refresh_token).await.unwrap_err();
+    assert!(matches!(err, TbError::Unauthenticated(_)), "{err:?}");
+
+    let new_pair = auth.login(&user.email, NEW_PASSWORD).await?;
+    auth.factory()
+        .parse_typed(&new_pair.token, TokenType::Access)?;
+    assert!(auth.login(&user.email, OLD_PASSWORD).await.is_err());
+
+    delete_user_tenant(&pool, &user).await
+}
+
+#[tokio::test]
+async fn oauth2_rejects_mismatched_redirect_uri_before_code_exchange() -> TbResult<()> {
+    let pool = setup().await;
+    let auth = auth_service(&pool);
+    let client_dao = Oauth2ClientDao::new(pool.clone());
+    let client = client_dao
+        .save(&Oauth2Client {
+            id: Uuid::now_v7(),
+            created_time: 0,
+            tenant_id: None,
+            title: "auth integration test".into(),
+            client_id: format!("client-{}", Uuid::now_v7().simple()),
+            client_secret: None,
+            authorization_uri: "https://idp.example/authorize".into(),
+            token_uri: "http://127.0.0.1:1/token".into(),
+            user_info_uri: "http://127.0.0.1:1/userinfo".into(),
+            redirect_uri_template: Some("https://app.example/callback".into()),
+            scope: None,
+            enabled: true,
+        })
+        .await?;
+
+    let err = auth
+        .oauth2_login(&Oauth2LoginRequest {
+            client_id: client.client_id.clone(),
+            code: "unused".into(),
+            redirect_uri: "https://evil.example/callback".into(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TbError::InvalidInput(_)), "{err:?}");
+
+    client_dao.delete_by_id(client.id).await?;
+    Ok(())
+}

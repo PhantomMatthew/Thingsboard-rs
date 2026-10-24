@@ -23,7 +23,8 @@ impl KafkaQueueProducer {
             .set("bootstrap.servers", brokers)
             .set("client.id", client_id)
             .set("message.timeout.ms", "10000")
-            .set("acks", "1")
+            // 遥测需由全部同步副本确认，避免 leader 故障时丢失已确认写入。
+            .set("acks", "all")
             .create()?;
         Ok(Self { inner })
     }

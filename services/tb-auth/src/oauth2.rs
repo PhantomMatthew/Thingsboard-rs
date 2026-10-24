@@ -52,6 +52,13 @@ impl AuthService {
             .await?
             .filter(|c| c.enabled)
             .ok_or_else(|| TbError::Unauthenticated("unknown or disabled oauth2 client".into()))?;
+        if let Some(expected) = client.redirect_uri_template.as_deref()
+            && req.redirect_uri != expected
+        {
+            return Err(TbError::InvalidInput(
+                "redirect_uri does not match the registered value".into(),
+            ));
+        }
         let access_token = self.exchange_code(&client, req).await?;
         let email = self.fetch_user_email(&client, &access_token).await?;
         let user = match self.user_dao.find_by_email(&email).await? {
@@ -99,7 +106,11 @@ impl AuthService {
             .ok_or_else(|| TbError::Internal("oauth2 token response missing access_token".into()))
     }
 
-    async fn fetch_user_email(&self, client: &Oauth2Client, access_token: &str) -> TbResult<String> {
+    async fn fetch_user_email(
+        &self,
+        client: &Oauth2Client,
+        access_token: &str,
+    ) -> TbResult<String> {
         let resp = self
             .http
             .get(&client.user_info_uri)
@@ -151,6 +162,7 @@ impl AuthService {
             reset_token: None,
             failed_login_attempts: 0,
             last_login_ts: None,
+            password_changed_ts: None,
         };
         self.creds_dao.save(&credentials).await?;
         tracing::info!(email, tenant_id = %tenant_id, "provisioned oauth2 user");

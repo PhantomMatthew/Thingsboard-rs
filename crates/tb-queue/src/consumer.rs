@@ -1,8 +1,10 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
+use rdkafka::Offset;
+use rdkafka::TopicPartitionList;
 use rdkafka::config::ClientConfig;
-use rdkafka::consumer::{Consumer, StreamConsumer};
+use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::Message;
 
 use crate::QueueError;
@@ -18,6 +20,8 @@ pub struct ConsumedMessage {
 #[async_trait]
 pub trait QueueConsumer: Send + Sync {
     async fn recv(&mut self) -> Result<ConsumedMessage, QueueError>;
+
+    async fn commit(&mut self, msg: &ConsumedMessage) -> Result<(), QueueError>;
 }
 
 pub struct StreamQueueConsumer {
@@ -26,7 +30,7 @@ pub struct StreamQueueConsumer {
 
 impl StreamQueueConsumer {
     pub fn new(brokers: &str, group_id: &str, topics: &[&str]) -> Result<Self, QueueError> {
-        Self::with_offset_reset(brokers, group_id, topics, "latest")
+        Self::with_offset_reset(brokers, group_id, topics, "latest", true)
     }
 
     /// 从头消费：新 group 启动时重放历史消息（EDQS 快照加载期间的事件靠它兜底）。
@@ -35,7 +39,23 @@ impl StreamQueueConsumer {
         group_id: &str,
         topics: &[&str],
     ) -> Result<Self, QueueError> {
-        Self::with_offset_reset(brokers, group_id, topics, "earliest")
+        Self::with_offset_reset(brokers, group_id, topics, "earliest", true)
+    }
+
+    pub fn new_manual_commit(
+        brokers: &str,
+        group_id: &str,
+        topics: &[&str],
+    ) -> Result<Self, QueueError> {
+        Self::with_offset_reset(brokers, group_id, topics, "latest", false)
+    }
+
+    pub fn new_from_beginning_manual(
+        brokers: &str,
+        group_id: &str,
+        topics: &[&str],
+    ) -> Result<Self, QueueError> {
+        Self::with_offset_reset(brokers, group_id, topics, "earliest", false)
     }
 
     fn with_offset_reset(
@@ -43,15 +63,22 @@ impl StreamQueueConsumer {
         group_id: &str,
         topics: &[&str],
         offset_reset: &str,
+        enable_auto_commit: bool,
     ) -> Result<Self, QueueError> {
-        let inner: StreamConsumer = ClientConfig::new()
+        let mut config = ClientConfig::new();
+        config
             .set("bootstrap.servers", brokers)
             .set("group.id", group_id)
-            .set("enable.auto.commit", "true")
-            .set("auto.commit.interval.ms", "1000")
+            .set(
+                "enable.auto.commit",
+                if enable_auto_commit { "true" } else { "false" },
+            )
             .set("auto.offset.reset", offset_reset)
-            .set("session.timeout.ms", "30000")
-            .create()?;
+            .set("session.timeout.ms", "30000");
+        if enable_auto_commit {
+            config.set("auto.commit.interval.ms", "1000");
+        }
+        let inner: StreamConsumer = config.create()?;
         inner.subscribe(topics)?;
         Ok(Self { inner })
     }
@@ -73,5 +100,12 @@ impl QueueConsumer for StreamQueueConsumer {
             key: msg.key().map(Bytes::copy_from_slice),
             payload: Bytes::copy_from_slice(msg.payload().unwrap_or(&[])),
         })
+    }
+
+    async fn commit(&mut self, msg: &ConsumedMessage) -> Result<(), QueueError> {
+        let mut offsets = TopicPartitionList::new();
+        offsets.add_partition_offset(&msg.topic, msg.partition, Offset::Offset(msg.offset + 1))?;
+        self.inner.commit(&offsets, CommitMode::Async)?;
+        Ok(())
     }
 }

@@ -179,12 +179,13 @@ impl UserCredentialsDao {
         if c.created_time == 0 {
             c.created_time = now_ms();
         }
-        sqlx::query(
+        sqlx::query_as::<_, UserCredentials>(
             "INSERT INTO user_credentials (id, created_time, user_id, enabled, password, \
-             activate_token, reset_token, failed_login_attempts, last_login_ts) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) \
+             activate_token, reset_token, failed_login_attempts, last_login_ts, password_changed_ts) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) \
              ON CONFLICT (user_id) DO UPDATE SET enabled=$4, password=$5, activate_token=$6, \
-             reset_token=$7, failed_login_attempts=$8, last_login_ts=$9",
+             reset_token=$7, failed_login_attempts=$8, last_login_ts=$9, password_changed_ts=$10 \
+             RETURNING *",
         )
         .bind(c.id)
         .bind(c.created_time)
@@ -195,10 +196,10 @@ impl UserCredentialsDao {
         .bind(&c.reset_token)
         .bind(c.failed_login_attempts)
         .bind(c.last_login_ts)
-        .execute(&self.pool)
+        .bind(c.password_changed_ts)
+        .fetch_one(&self.pool)
         .await
-        .map_err(TbError::db)?;
-        Ok(c)
+        .map_err(TbError::db)
     }
 
     pub async fn find_by_user_id(&self, user_id: Uuid) -> TbResult<Option<UserCredentials>> {

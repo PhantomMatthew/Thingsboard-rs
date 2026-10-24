@@ -3194,6 +3194,7 @@ dependencies = [
  "serde_json",
  "tb-common",
  "thiserror 2.0.21",
+ "tracing",
 ]
 
 [[package]]

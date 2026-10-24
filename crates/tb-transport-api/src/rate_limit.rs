@@ -24,7 +24,16 @@ impl RateLimiter {
 
     /// 取一个令牌；桶空返回 false（超限）。
     pub fn check(&self, key: &str) -> bool {
+        self.check_n(key, 1)
+    }
+
+    /// 取 count 枚令牌；不足时不扣减并返回 false。
+    pub fn check_n(&self, key: &str, count: u32) -> bool {
+        if count == 0 {
+            return true;
+        }
         let cap = self.max_per_sec as f64;
+        let count = f64::from(count);
         let mut bucket = self
             .buckets
             .entry(key.to_string())
@@ -36,8 +45,8 @@ impl RateLimiter {
         let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
         bucket.tokens = (bucket.tokens + elapsed * cap).min(cap);
         bucket.last_refill = now;
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
+        if bucket.tokens >= count {
+            bucket.tokens -= count;
             true
         } else {
             false
@@ -75,5 +84,14 @@ mod tests {
         assert!(!limiter.check("t1"));
         std::thread::sleep(std::time::Duration::from_millis(120));
         assert!(limiter.check("t1"), "0.12s 应 refill ~2 个令牌");
+    }
+
+    #[test]
+    fn batch_charge_is_all_or_nothing() {
+        let limiter = RateLimiter::new(3);
+        assert!(limiter.check_n("t1", 2));
+        assert!(!limiter.check_n("t1", 2));
+        assert!(limiter.check("t1"), "批量扣费失败不应消耗剩余令牌");
+        assert!(!limiter.check("t1"));
     }
 }

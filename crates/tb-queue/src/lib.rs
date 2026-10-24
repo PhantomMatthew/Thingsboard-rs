@@ -6,11 +6,15 @@
 //! - `tb_rule_engine.<queue_name>`（默认 Main）/ `tb_rule_engine.notifications`
 //! - `tb_transport.notifications.<node_id>`
 //! - `tb_housekeeper`
+//!
+//! 消费提交过渡设计：`StreamQueueConsumer::new` 与 `new_from_beginning`
+//! 暂时保留自动提交，避免既有消费循环在改为显式提交前重放消息。
+//! 新消费循环应使用 `new_manual_commit` 或 `new_from_beginning_manual`，
+//! 并在消息处理成功后调用 `QueueConsumer::commit`；后续各服务将逐个切换。
 
 pub mod admin;
 pub mod consumer;
 pub mod edqs;
-pub mod partition;
 pub mod producer;
 pub mod topics;
 

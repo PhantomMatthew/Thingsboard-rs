@@ -40,25 +40,6 @@ impl EntityType {
             Self::Edge => "EDGE",
         }
     }
-
-    /// 对应的数据库表名。
-    pub fn table_name(&self) -> &'static str {
-        match self {
-            Self::Tenant => "tenant",
-            Self::Customer => "customer",
-            Self::User => "tb_user",
-            Self::Device => "device",
-            Self::DeviceProfile => "device_profile",
-            Self::Asset => "asset",
-            Self::AssetProfile => "asset_profile",
-            Self::Dashboard => "dashboard",
-            Self::RuleChain => "rule_chain",
-            Self::RuleNode => "rule_node",
-            Self::OtaPackage => "ota_package",
-            Self::Alarm => "alarm",
-            Self::Edge => "edge",
-        }
-    }
 }
 
 impl fmt::Display for EntityType {

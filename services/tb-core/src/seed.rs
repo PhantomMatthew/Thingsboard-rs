@@ -72,6 +72,7 @@ pub async fn seed(state: &AppState) -> TbResult<()> {
             reset_token: None,
             failed_login_attempts: 0,
             last_login_ts: None,
+            password_changed_ts: None,
         };
         state.user_credentials_dao.save(&credentials).await?;
         tracing::info!(email = SYSADMIN_EMAIL, "seeded system tenant and sysadmin");

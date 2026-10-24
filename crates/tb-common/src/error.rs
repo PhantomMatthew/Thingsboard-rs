@@ -64,6 +64,19 @@ impl TbError {
         Self::Database(sqlx_like::DbErr(Box::new(err)))
     }
 
+    /// 可安全返回给客户端的错误信息。
+    pub fn client_message(&self) -> String {
+        match self {
+            Self::Database(_) | Self::Internal(_) => "internal server error".into(),
+            Self::NotFound(message)
+            | Self::InvalidInput(message)
+            | Self::Unauthenticated(message)
+            | Self::PermissionDenied(message)
+            | Self::Conflict(message)
+            | Self::RateLimitExceeded(message) => message.clone(),
+        }
+    }
+
     /// HTTP 状态码映射（REST 层使用）。
     pub fn http_status(&self) -> u16 {
         match self {
@@ -75,5 +88,29 @@ impl TbError {
             Self::RateLimitExceeded(_) => 429,
             Self::Database(_) | Self::Internal(_) => 500,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_message_hides_internal_details() {
+        let errors = [
+            TbError::Internal("sensitive internal detail".into()),
+            TbError::db(std::io::Error::other("sensitive database detail")),
+        ];
+        for err in errors {
+            assert_eq!(err.client_message(), "internal server error");
+            assert_eq!(err.http_status(), 500);
+        }
+    }
+
+    #[test]
+    fn client_message_preserves_public_detail() {
+        let err = TbError::InvalidInput("bad request field".into());
+        assert_eq!(err.client_message(), "bad request field");
+        assert_eq!(err.http_status(), 400);
     }
 }

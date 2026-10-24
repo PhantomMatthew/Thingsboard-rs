@@ -189,6 +189,7 @@ pub struct UserCredentials {
     pub reset_token: Option<String>,
     pub failed_login_attempts: i32,
     pub last_login_ts: Option<i64>,
+    pub password_changed_ts: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

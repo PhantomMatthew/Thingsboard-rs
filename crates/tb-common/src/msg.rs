@@ -27,6 +27,10 @@ pub struct TbMsg {
     pub originator: EntityId,
     pub tenant_id: Uuid,
     pub customer_id: Option<Uuid>,
+    #[serde(default)]
+    pub rule_chain_id: Option<Uuid>,
+    #[serde(default)]
+    pub rule_node_id: Option<Uuid>,
     pub data: serde_json::Value,
     pub metadata: HashMap<String, String>,
     pub ts: i64,
@@ -47,9 +51,39 @@ impl TbMsg {
             originator,
             tenant_id,
             customer_id: None,
+            rule_chain_id: None,
+            rule_node_id: None,
             data,
             metadata,
             ts: chrono::Utc::now().timestamp_millis(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn old_json_without_checkpoint_ids_is_supported() {
+        let id = Uuid::now_v7();
+        let tenant_id = Uuid::now_v7();
+        let originator_id = Uuid::now_v7();
+        let msg: TbMsg = serde_json::from_value(json!({
+            "id": id,
+            "queue_name": "Main",
+            "msg_type": "POST_TELEMETRY_REQUEST",
+            "originator": {"entity_type": "DEVICE", "id": originator_id},
+            "tenant_id": tenant_id,
+            "customer_id": null,
+            "data": {"temperature": 20},
+            "metadata": {},
+            "ts": 1
+        }))
+        .unwrap();
+
+        assert_eq!(msg.rule_chain_id, None);
+        assert_eq!(msg.rule_node_id, None);
     }
 }

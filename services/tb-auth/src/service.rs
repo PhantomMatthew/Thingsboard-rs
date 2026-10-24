@@ -106,7 +106,17 @@ impl AuthService {
         let claims = self
             .factory
             .parse_typed(refresh_token, TokenType::Refresh)?;
-        let user = self.load_user(claims.user_id()?).await?;
+        let user_id = claims.user_id()?;
+        let user = self.load_user(user_id).await?;
+        let creds = self.load_enabled_credentials(user_id).await?;
+        if creds
+            .password_changed_ts
+            .is_some_and(|changed_ts| claims.iat.saturating_mul(1000) < changed_ts)
+        {
+            return Err(TbError::Unauthenticated(
+                "refresh token predates password change".into(),
+            ));
+        }
         self.issue_tokens(&user)
     }
 
@@ -131,6 +141,7 @@ impl AuthService {
         creds.password = Some(hash_password(new)?);
         creds.activate_token = None;
         creds.reset_token = None;
+        creds.password_changed_ts = Some(chrono::Utc::now().timestamp_millis());
         self.creds_dao.save(&creds).await?;
         Ok(())
     }
@@ -139,6 +150,7 @@ impl AuthService {
     pub async fn get_user_from_token(&self, token: &str) -> TbResult<SecurityUser> {
         let claims = self.factory.parse_typed(token, TokenType::Access)?;
         let user = self.load_user(claims.user_id()?).await?;
+        self.load_enabled_credentials(user.id).await?;
         Ok(security_user(&user))
     }
 
@@ -151,6 +163,20 @@ impl AuthService {
             .find_by_id(user_id)
             .await?
             .ok_or_else(|| TbError::NotFound(format!("user {user_id}")))
+    }
+
+    async fn load_enabled_credentials(&self, user_id: Uuid) -> TbResult<UserCredentials> {
+        let creds = self
+            .creds_dao
+            .find_by_user_id(user_id)
+            .await?
+            .ok_or_else(|| TbError::Unauthenticated("user credentials not found".into()))?;
+        if !creds.enabled {
+            return Err(TbError::PermissionDenied(
+                "user credentials are disabled".into(),
+            ));
+        }
+        Ok(creds)
     }
 
     pub fn issue_tokens(&self, user: &User) -> TbResult<TokenPair> {

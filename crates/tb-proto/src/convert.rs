@@ -111,7 +111,15 @@ fn parse_uuid(field: &str, s: &str) -> tb_common::TbResult<uuid::Uuid> {
         .map_err(|_| tb_common::TbError::InvalidInput(format!("bad {field}: {s}")))
 }
 
-/// proto → tb-common 消息；空 customer_id 视为 None。
+fn parse_optional_uuid(field: &str, s: &str) -> tb_common::TbResult<Option<uuid::Uuid>> {
+    if s.is_empty() {
+        Ok(None)
+    } else {
+        parse_uuid(field, s).map(Some)
+    }
+}
+
+/// proto → tb-common 消息；空 UUID 字符串视为 None。
 pub fn tb_msg_from_proto(
     p: &crate::ruleengine::TbMsgProto,
 ) -> tb_common::TbResult<tb_common::msg::TbMsg> {
@@ -120,11 +128,6 @@ pub fn tb_msg_from_proto(
             tb_common::TbError::InvalidInput(format!("bad originator_type: {}", p.originator_type))
         })?
         .try_into()?;
-    let customer_id = if p.customer_id.is_empty() {
-        None
-    } else {
-        Some(parse_uuid("customer_id", &p.customer_id)?)
-    };
     Ok(tb_common::msg::TbMsg {
         id: parse_uuid("msg id", &p.id)?,
         queue_name: p.queue_name.clone(),
@@ -134,7 +137,9 @@ pub fn tb_msg_from_proto(
             id: parse_uuid("originator_id", &p.originator_id)?,
         },
         tenant_id: parse_uuid("tenant_id", &p.tenant_id)?,
-        customer_id,
+        customer_id: parse_optional_uuid("customer_id", &p.customer_id)?,
+        rule_chain_id: parse_optional_uuid("rule_chain_id", &p.rule_chain_id)?,
+        rule_node_id: parse_optional_uuid("rule_node_id", &p.rule_node_id)?,
         data: serde_json::from_str(&p.data_json)
             .map_err(|e| tb_common::TbError::InvalidInput(format!("bad data_json: {e}")))?,
         metadata: p.metadata.clone(),
@@ -153,8 +158,57 @@ pub fn tb_msg_to_proto(msg: &tb_common::msg::TbMsg) -> crate::ruleengine::TbMsgP
         customer_id: msg.customer_id.map(|c| c.to_string()).unwrap_or_default(),
         data_json: msg.data.to_string(),
         metadata: msg.metadata.clone(),
-        rule_chain_id: String::new(),
-        rule_node_id: String::new(),
+        rule_chain_id: msg
+            .rule_chain_id
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
+        rule_node_id: msg
+            .rule_node_id
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
         ts: msg.ts,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use tb_common::{EntityId, msg::TbMsg};
+
+    fn msg() -> TbMsg {
+        TbMsg::new(
+            "POST_TELEMETRY_REQUEST",
+            EntityId::new(tb_common::EntityType::Device),
+            uuid::Uuid::now_v7(),
+            serde_json::json!({"temperature": 20}),
+            HashMap::new(),
+        )
+    }
+
+    #[test]
+    fn checkpoint_ids_roundtrip() {
+        let mut msg = msg();
+        msg.rule_chain_id = Some(uuid::Uuid::now_v7());
+        msg.rule_node_id = Some(uuid::Uuid::now_v7());
+
+        let proto = tb_msg_to_proto(&msg);
+        assert_eq!(proto.rule_chain_id, msg.rule_chain_id.unwrap().to_string());
+        assert_eq!(proto.rule_node_id, msg.rule_node_id.unwrap().to_string());
+        let decoded = tb_msg_from_proto(&proto).unwrap();
+        assert_eq!(decoded.rule_chain_id, msg.rule_chain_id);
+        assert_eq!(decoded.rule_node_id, msg.rule_node_id);
+    }
+
+    #[test]
+    fn empty_checkpoint_ids_map_to_none() {
+        let msg = msg();
+        let proto = tb_msg_to_proto(&msg);
+        assert!(proto.rule_chain_id.is_empty());
+        assert!(proto.rule_node_id.is_empty());
+
+        let decoded = tb_msg_from_proto(&proto).unwrap();
+        assert_eq!(decoded.rule_chain_id, None);
+        assert_eq!(decoded.rule_node_id, None);
     }
 }

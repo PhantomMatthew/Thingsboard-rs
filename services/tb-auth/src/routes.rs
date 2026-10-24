@@ -57,11 +57,12 @@ impl axum::extract::FromRef<AuthState> for Arc<JwtTokenFactory> {
 
 /// 统一错误响应：{status, message} + TbError::http_status()。
 pub fn error_response(err: &TbError) -> Response {
+    tracing::error!(error = %err, "request failed");
     let code = err.http_status();
     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (
         status,
-        Json(json!({ "status": code, "message": err.to_string() })),
+        Json(json!({ "status": code, "message": err.client_message() })),
     )
         .into_response()
 }

@@ -1,9 +1,8 @@
 //! tb-script：Rhai 脚本沙箱（规则引擎 filter/transform 节点用）。
-//! 编译结果按脚本内容 hash 缓存（容量 1000）；执行限制 max_operations=100_000。
+//! 编译结果按脚本内容缓存（容量 1000）；执行限制 max_operations=100_000。
 //! Rhai 默认不带文件/系统 IO，本 crate 也不注册任何危险 API。
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use rhai::{Dynamic, Engine, Scope};
@@ -20,6 +19,9 @@ pub enum ScriptError {
 
     #[error("script returned invalid value: {0}")]
     InvalidReturn(String),
+
+    #[error("script value exceeds maximum nesting depth of 64")]
+    NestingTooDeep,
 }
 
 pub struct TransformOutput {
@@ -29,11 +31,15 @@ pub struct TransformOutput {
 }
 
 const MAX_OPERATIONS: u64 = 100_000;
+const MAX_STRING_SIZE: usize = 1024 * 1024;
+const MAX_ARRAY_SIZE: usize = 10_000;
+const MAX_MAP_SIZE: usize = 10_000;
+const MAX_NESTING_DEPTH: usize = 64;
 const CACHE_CAPACITY: u64 = 1000;
 
 pub struct ScriptEngine {
     engine: Engine,
-    cache: moka::sync::Cache<u64, Arc<rhai::AST>>,
+    cache: moka::sync::Cache<String, Arc<rhai::AST>>,
 }
 
 impl Default for ScriptEngine {
@@ -46,6 +52,18 @@ impl ScriptEngine {
     pub fn new() -> Self {
         let mut engine = Engine::new();
         engine.set_max_operations(MAX_OPERATIONS);
+        engine.set_max_string_size(MAX_STRING_SIZE);
+        engine.set_max_array_size(MAX_ARRAY_SIZE);
+        engine.set_max_map_size(MAX_MAP_SIZE);
+        engine.on_print(|s| tracing::info!(target: "rhai", "{s}"));
+        engine.on_debug(|s, source, position| {
+            tracing::debug!(
+                target: "rhai",
+                source = source.unwrap_or("unknown"),
+                %position,
+                "{s}"
+            );
+        });
         Self {
             engine,
             cache: moka::sync::Cache::new(CACHE_CAPACITY),
@@ -53,9 +71,7 @@ impl ScriptEngine {
     }
 
     fn compile(&self, script: &str) -> Result<Arc<rhai::AST>, ScriptError> {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        script.hash(&mut hasher);
-        let key = hasher.finish();
+        let key = script.to_string();
         if let Some(ast) = self.cache.get(&key) {
             return Ok(ast);
         }
@@ -77,7 +93,7 @@ impl ScriptEngine {
     ) -> Result<Dynamic, ScriptError> {
         let ast = self.compile(script)?;
         let mut scope = Scope::new();
-        scope.push_dynamic("msg", json_to_dynamic(msg));
+        scope.push_dynamic("msg", json_to_dynamic(msg)?);
         scope.push_dynamic("metadata", metadata_to_dynamic(metadata));
         scope.push_dynamic("msgType", Dynamic::from(msg_type.to_string()));
         self.engine
@@ -172,7 +188,7 @@ impl ScriptEngine {
         let ast = self.compile(script)?;
         let mut scope = Scope::new();
         for (k, v) in vars {
-            scope.push_dynamic(k.clone(), json_to_dynamic(v));
+            scope.push_dynamic(k.clone(), json_to_dynamic(v)?);
         }
         let result = self
             .engine
@@ -205,8 +221,12 @@ fn metadata_to_dynamic(metadata: &HashMap<String, String>) -> Dynamic {
     map.into()
 }
 
-fn json_to_dynamic(v: &Value) -> Dynamic {
-    match v {
+fn json_to_dynamic(v: &Value) -> Result<Dynamic, ScriptError> {
+    json_to_dynamic_at_depth(v, 0)
+}
+
+fn json_to_dynamic_at_depth(v: &Value, depth: usize) -> Result<Dynamic, ScriptError> {
+    Ok(match v {
         Value::Null => ().into(),
         Value::Bool(b) => (*b).into(),
         Value::Number(n) => {
@@ -217,40 +237,59 @@ fn json_to_dynamic(v: &Value) -> Dynamic {
             }
         }
         Value::String(s) => s.clone().into(),
-        Value::Array(a) => a
-            .iter()
-            .map(json_to_dynamic)
-            .collect::<rhai::Array>()
-            .into(),
+        Value::Array(a) => {
+            if depth >= MAX_NESTING_DEPTH {
+                return Err(ScriptError::NestingTooDeep);
+            }
+            a.iter()
+                .map(|v| json_to_dynamic_at_depth(v, depth + 1))
+                .collect::<Result<rhai::Array, _>>()?
+                .into()
+        }
         Value::Object(o) => {
+            if depth >= MAX_NESTING_DEPTH {
+                return Err(ScriptError::NestingTooDeep);
+            }
             let mut map = rhai::Map::new();
             for (k, v) in o {
-                map.insert(k.as_str().into(), json_to_dynamic(v));
+                map.insert(k.as_str().into(), json_to_dynamic_at_depth(v, depth + 1)?);
             }
             map.into()
         }
-    }
+    })
 }
 
 fn dynamic_to_json(d: &Dynamic) -> Result<Value, ScriptError> {
+    dynamic_to_json_at_depth(d, 0)
+}
+
+fn dynamic_to_json_at_depth(d: &Dynamic, depth: usize) -> Result<Value, ScriptError> {
     if d.is_unit() {
         Ok(Value::Null)
-    } else if let Some(b) = d.clone().try_cast::<bool>() {
+    } else if let Ok(b) = d.as_bool() {
         Ok(Value::Bool(b))
-    } else if let Some(i) = d.clone().try_cast::<rhai::INT>() {
+    } else if let Ok(i) = d.as_int() {
         Ok(Value::Number(i.into()))
-    } else if let Some(f) = d.clone().try_cast::<rhai::FLOAT>() {
+    } else if let Ok(f) = d.as_float() {
         Ok(serde_json::Number::from_f64(f)
             .map(Value::Number)
             .unwrap_or(Value::Null))
-    } else if let Some(s) = d.clone().try_cast::<String>() {
-        Ok(Value::String(s))
-    } else if let Some(a) = d.clone().try_cast::<rhai::Array>() {
-        a.iter().map(dynamic_to_json).collect()
-    } else if let Some(m) = d.clone().try_cast::<rhai::Map>() {
+    } else if let Ok(s) = d.as_immutable_string_ref() {
+        Ok(Value::String(s.as_str().to_string()))
+    } else if let Ok(a) = d.as_array_ref() {
+        if depth >= MAX_NESTING_DEPTH {
+            return Err(ScriptError::NestingTooDeep);
+        }
+        a.iter()
+            .map(|v| dynamic_to_json_at_depth(v, depth + 1))
+            .collect()
+    } else if let Ok(m) = d.as_map_ref() {
+        if depth >= MAX_NESTING_DEPTH {
+            return Err(ScriptError::NestingTooDeep);
+        }
         let mut obj = serde_json::Map::new();
-        for (k, v) in &m {
-            obj.insert(k.to_string(), dynamic_to_json(v)?);
+        for (k, v) in m.iter() {
+            obj.insert(k.to_string(), dynamic_to_json_at_depth(v, depth + 1)?);
         }
         Ok(Value::Object(obj))
     } else {
@@ -387,9 +426,7 @@ mod tests {
         let vars: HashMap<String, Value> = [("tempC".to_string(), json!(25))].into_iter().collect();
         let v = e.eval_value("tempC * 9 / 5 + 32", &vars).unwrap();
         assert_eq!(v, json!(77));
-        let v = e
-            .eval_value("tempC * 9.0 / 5.0 + 32.0", &vars)
-            .unwrap();
+        let v = e.eval_value("tempC * 9.0 / 5.0 + 32.0", &vars).unwrap();
         assert_eq!(v, json!(77.0));
         assert!(e.eval_value("tempC +", &vars).is_err());
         assert!(e.eval_value("unknown_var + 1", &vars).is_err());
@@ -408,5 +445,64 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v, json!({"value": 80, "note": "hot"}));
+    }
+
+    #[test]
+    fn string_allocation_limit_is_enforced() {
+        let e = engine();
+        let err = e
+            .eval_value("\"x\" * 10000000000", &HashMap::new())
+            .unwrap_err();
+        assert!(matches!(err, ScriptError::Eval(_)), "{err:?}");
+    }
+
+    #[test]
+    fn nesting_limit_returns_errors_in_both_directions() {
+        let mut value = json!(0);
+        for _ in 0..MAX_NESTING_DEPTH {
+            value = json!([value]);
+        }
+        assert!(json_to_dynamic(&value).is_ok());
+
+        value = json!([value]);
+        assert!(matches!(
+            json_to_dynamic(&value),
+            Err(ScriptError::NestingTooDeep)
+        ));
+        let vars = HashMap::from([("value".to_string(), value)]);
+        assert!(matches!(
+            engine().eval_value("value", &vars),
+            Err(ScriptError::NestingTooDeep)
+        ));
+
+        let mut dynamic = Dynamic::from(0 as rhai::INT);
+        for _ in 0..=MAX_NESTING_DEPTH {
+            dynamic = rhai::Array::from([dynamic]).into();
+        }
+        assert!(matches!(
+            dynamic_to_json(&dynamic),
+            Err(ScriptError::NestingTooDeep)
+        ));
+    }
+
+    #[test]
+    fn compile_cache_is_isolated_by_script_content() {
+        let e = engine();
+        assert!(
+            e.eval_filter("true", &json!({}), &HashMap::new(), "T")
+                .unwrap()
+        );
+        assert!(
+            !e.eval_filter("false", &json!({}), &HashMap::new(), "T")
+                .unwrap()
+        );
+        assert!(
+            e.eval_filter("true", &json!({}), &HashMap::new(), "T")
+                .unwrap()
+        );
+        assert!(
+            !e.eval_filter("false", &json!({}), &HashMap::new(), "T")
+                .unwrap()
+        );
     }
 }

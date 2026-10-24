@@ -6,10 +6,19 @@ use crate::QueueError;
 
 /// 创建 topic（幂等，已存在则忽略）。
 pub async fn ensure_topic(brokers: &str, topic: &str, partitions: i32) -> Result<(), QueueError> {
+    ensure_topic_with_replication(brokers, topic, partitions, 1).await
+}
+
+pub async fn ensure_topic_with_replication(
+    brokers: &str,
+    topic: &str,
+    partitions: i32,
+    replication: i32,
+) -> Result<(), QueueError> {
     let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
         .set("bootstrap.servers", brokers)
         .create()?;
-    let new_topic = NewTopic::new(topic, partitions, TopicReplication::Fixed(1));
+    let new_topic = NewTopic::new(topic, partitions, TopicReplication::Fixed(replication));
     let results = admin
         .create_topics([new_topic].iter(), &AdminOptions::new())
         .await?;

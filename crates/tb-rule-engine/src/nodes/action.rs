@@ -82,6 +82,8 @@ impl Node for ClearAlarmNode {
                     },
                     tenant_id: msg.tenant_id,
                     customer_id: msg.customer_id,
+                    rule_chain_id: None,
+                    rule_node_id: None,
                     data,
                     metadata: msg.metadata.clone(),
                     ts: chrono::Utc::now().timestamp_millis(),

@@ -110,6 +110,7 @@ async fn save_user(
                 reset_token: None,
                 failed_login_attempts: 0,
                 last_login_ts: None,
+                password_changed_ts: None,
             };
             state.user_credentials_dao.save(&creds).await?;
         }
@@ -125,6 +126,7 @@ async fn save_user(
                 reset_token: None,
                 failed_login_attempts: 0,
                 last_login_ts: None,
+                password_changed_ts: None,
             };
             state.user_credentials_dao.save(&creds).await?;
         }
