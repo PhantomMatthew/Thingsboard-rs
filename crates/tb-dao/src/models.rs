@@ -90,6 +90,7 @@ str_enum! {
         AccessToken => "ACCESS_TOKEN",
         X509Certificate => "X509_CERTIFICATE",
         MqttBasic => "MQTT_BASIC",
+        Lwm2m => "LWM2M",
     }
 }
 

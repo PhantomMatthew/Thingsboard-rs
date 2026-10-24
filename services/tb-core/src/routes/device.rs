@@ -152,6 +152,7 @@ pub struct SaveDeviceRequest {
     /// 可选：同时创建 ACCESS_TOKEN 类型凭证。
     pub access_token: Option<String>,
     pub additional_info: Option<Value>,
+    pub device_data: Option<Value>,
 }
 
 async fn save_device(
@@ -217,6 +218,9 @@ async fn save_device(
     }
     if req.additional_info.is_some() {
         device.additional_info = req.additional_info;
+    }
+    if req.device_data.is_some() {
+        device.device_data = req.device_data.unwrap_or_else(|| json!({}));
     }
 
     // 新设备总是带凭证；更新仅在显式给 accessToken 时轮换。

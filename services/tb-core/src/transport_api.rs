@@ -135,6 +135,39 @@ async fn handle_request(
                 validate_or_create_x509(state, &r).await,
             )
         }
+        Some(Request::ValidateLwm2m(r)) => {
+            pb::transport_api_response_msg::Response::ValidateCredentials(
+                validate_lwm2m(state, &r.endpoint).await,
+            )
+        }
+        Some(Request::GetDeviceProfile(r)) => match get_device_profile(state, &r).await {
+            Ok(Some(profile)) => pb::transport_api_response_msg::Response::DeviceProfile(profile),
+            Ok(None) => pb::transport_api_response_msg::Response::Error(pb::TransportApiError {
+                code: 404,
+                message: "device profile not found".into(),
+            }),
+            Err(e) => {
+                tracing::warn!("get_device_profile failed: {e}");
+                pb::transport_api_response_msg::Response::Error(pb::TransportApiError {
+                    code: 500,
+                    message: e.to_string(),
+                })
+            }
+        },
+        Some(Request::GetDevicesByTransport(r)) => {
+            match get_devices_by_transport(state, &r).await {
+                Ok(devices) => {
+                    pb::transport_api_response_msg::Response::GetDevicesByTransportResponse(devices)
+                }
+                Err(e) => {
+                    tracing::warn!("get_devices_by_transport failed: {e}");
+                    pb::transport_api_response_msg::Response::Error(pb::TransportApiError {
+                        code: 500,
+                        message: e.to_string(),
+                    })
+                }
+            }
+        }
         Some(Request::GetAttributes(r)) => {
             pb::transport_api_response_msg::Response::GetAttributesResponse(
                 get_attributes(state, &r).await,
@@ -279,6 +312,7 @@ fn device_proto(d: &Device) -> pb::DeviceInfoProto {
             .as_ref()
             .map(|v| v.to_string())
             .unwrap_or_default(),
+        device_data_json: d.device_data.to_string(),
     }
 }
 
@@ -291,6 +325,63 @@ fn profile_proto(p: &DeviceProfile) -> pb::DeviceProfileProto {
         provision_enabled: p.provision_type != "DISABLED",
         profile_data_json: p.profile_data.to_string(),
     }
+}
+
+pub async fn get_device_profile(
+    state: &AppState,
+    request: &pb::GetDeviceProfileRequest,
+) -> TbResult<Option<pb::DeviceProfileProto>> {
+    let profile_id = Uuid::parse_str(&request.device_profile_id)
+        .map_err(|_| TbError::InvalidInput("bad device_profile_id".into()))?;
+    Ok(state
+        .device_profile_dao
+        .find_by_id(profile_id)
+        .await?
+        .as_ref()
+        .map(profile_proto))
+}
+
+pub async fn get_devices_by_transport(
+    state: &AppState,
+    request: &pb::GetDevicesByTransportRequest,
+) -> TbResult<pb::GetDevicesByTransportResponse> {
+    let tenant_id = if request.tenant_id.is_empty() {
+        None
+    } else {
+        Some(
+            Uuid::parse_str(&request.tenant_id)
+                .map_err(|_| TbError::InvalidInput("bad tenant_id".into()))?,
+        )
+    };
+    let page_link = tb_dao::PageLink::new(i64::from(request.page), i64::from(request.page_size));
+    let page = state
+        .device_dao
+        .find_by_transport_type(tenant_id, &request.transport_type, &page_link)
+        .await?;
+    Ok(pb::GetDevicesByTransportResponse {
+        devices: page.data.iter().map(device_proto).collect(),
+        total_elements: page.total_elements,
+        total_pages: i32::try_from(page.total_pages).unwrap_or(i32::MAX),
+        has_next: page.has_next,
+    })
+}
+
+pub async fn validate_lwm2m(state: &AppState, endpoint: &str) -> pb::ValidateCredentialsResponse {
+    let Some(credentials) = find_credentials(state, endpoint).await else {
+        return invalid_credentials();
+    };
+    if credentials.credentials_type != CredentialsType::Lwm2m {
+        return invalid_credentials();
+    }
+    let endpoint_matches = credentials
+        .credentials_value
+        .as_deref()
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+        .is_some_and(|body| body["endpoint"].as_str() == Some(endpoint));
+    if !endpoint_matches {
+        return invalid_credentials();
+    }
+    build_valid_response(state, &credentials).await
 }
 
 async fn find_credentials(state: &AppState, credentials_id: &str) -> Option<DeviceCredentials> {

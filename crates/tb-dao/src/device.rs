@@ -169,6 +169,43 @@ impl DeviceDao {
         ))
     }
 
+    pub async fn find_by_transport_type(
+        &self,
+        tenant_id: Option<Uuid>,
+        transport_type: &str,
+        page_link: &PageLink,
+    ) -> TbResult<PageData<Device>> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM device d \
+             JOIN device_profile p ON p.id = d.device_profile_id \
+             WHERE p.transport_type = $1 AND ($2::uuid IS NULL OR d.tenant_id = $2)",
+        )
+        .bind(transport_type)
+        .bind(tenant_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(TbError::db)?;
+        let data = sqlx::query_as::<_, Device>(
+            "SELECT d.* FROM device d \
+             JOIN device_profile p ON p.id = d.device_profile_id \
+             WHERE p.transport_type = $1 AND ($2::uuid IS NULL OR d.tenant_id = $2) \
+             ORDER BY d.created_time DESC, d.id DESC LIMIT $3 OFFSET $4",
+        )
+        .bind(transport_type)
+        .bind(tenant_id)
+        .bind(page_link.limit())
+        .bind(page_link.offset())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(TbError::db)?;
+        Ok(PageData::new(
+            data,
+            total,
+            page_link.page,
+            page_link.page_size,
+        ))
+    }
+
     pub async fn find_by_customer_id(
         &self,
         tenant_id: Uuid,

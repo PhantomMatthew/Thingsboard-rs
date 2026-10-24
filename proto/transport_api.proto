@@ -19,6 +19,8 @@ message TransportApiRequestMsg {
     GetAttributesRequest get_attributes = 8;
     ProvisionDeviceRequest provision_device = 9;
     GetOtaChunkRequest get_ota_chunk = 10;
+    GetDevicesByTransportRequest get_devices_by_transport = 12;
+    ValidateLwm2mRequest validate_lwm2m = 13;
   }
 }
 
@@ -33,6 +35,7 @@ message TransportApiResponseMsg {
     GetAttributesResponse get_attributes_response = 7;
     ProvisionDeviceResponse provision_response = 8;
     GetOtaChunkResponse ota_chunk = 9;
+    GetDevicesByTransportResponse get_devices_by_transport_response = 10;
   }
 }
 
@@ -67,6 +70,24 @@ message ValidateOrCreateX509Request {
 
 message GetDeviceProfileRequest {
   string device_profile_id = 1;
+}
+
+message GetDevicesByTransportRequest {
+  string tenant_id = 1; // 可空：空则跨租户查询
+  string transport_type = 2;
+  int32 page = 3;
+  int32 page_size = 4; // 服务端限制在 1..1000
+}
+
+message GetDevicesByTransportResponse {
+  repeated DeviceInfoProto devices = 1;
+  int64 total_elements = 2;
+  int32 total_pages = 3;
+  bool has_next = 4;
+}
+
+message ValidateLwm2mRequest {
+  string endpoint = 1;
 }
 
 message GetOrCreateGatewayDeviceRequest {
@@ -125,6 +146,7 @@ message DeviceInfoProto {
   string device_name = 5;
   string device_type = 6;
   string additional_info_json = 7; // 设备 additional_info（网关标记等）
+  string device_data_json = 8;     // transport 配置等设备数据
 }
 
 message DeviceProfileProto {

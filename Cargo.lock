@@ -3438,6 +3438,7 @@ dependencies = [
  "coap-lite",
  "dashmap",
  "futures",
+ "prost",
  "reqwest",
  "serde",
  "serde_json",
@@ -3494,12 +3495,15 @@ name = "tb-transport-snmp"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "chrono",
+ "prost",
  "serde",
  "serde_json",
  "snmp2",
  "tb-common",
  "tb-proto",
+ "tb-queue",
  "tb-transport-api",
  "thiserror 2.0.21",
  "tokio",

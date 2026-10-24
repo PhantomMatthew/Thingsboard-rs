@@ -306,6 +306,91 @@ impl TransportApiClient {
         }
     }
 
+    pub async fn validate_lwm2m(
+        &self,
+        endpoint: &str,
+    ) -> TbResult<pb::ValidateCredentialsResponse> {
+        let resp = self
+            .request(pb::transport_api_request_msg::Request::ValidateLwm2m(
+                pb::ValidateLwm2mRequest {
+                    endpoint: endpoint.to_string(),
+                },
+            ))
+            .await?;
+        match resp.response {
+            Some(pb::transport_api_response_msg::Response::ValidateCredentials(v)) => Ok(v),
+            Some(pb::transport_api_response_msg::Response::Error(e)) => Err(TbError::Internal(
+                format!("transport-api error {}: {}", e.code, e.message),
+            )),
+            other => {
+                tracing::warn!(?other, "unexpected transport-api response");
+                Err(TbError::Internal(
+                    "unexpected transport-api response".into(),
+                ))
+            }
+        }
+    }
+
+    pub async fn get_device_profile(
+        &self,
+        device_profile_id: &str,
+    ) -> TbResult<pb::DeviceProfileProto> {
+        let resp = self
+            .request(pb::transport_api_request_msg::Request::GetDeviceProfile(
+                pb::GetDeviceProfileRequest {
+                    device_profile_id: device_profile_id.to_string(),
+                },
+            ))
+            .await?;
+        match resp.response {
+            Some(pb::transport_api_response_msg::Response::DeviceProfile(profile)) => Ok(profile),
+            Some(pb::transport_api_response_msg::Response::Error(e)) => Err(TbError::Internal(
+                format!("transport-api error {}: {}", e.code, e.message),
+            )),
+            other => {
+                tracing::warn!(?other, "unexpected transport-api response");
+                Err(TbError::Internal(
+                    "unexpected transport-api response".into(),
+                ))
+            }
+        }
+    }
+
+    pub async fn get_devices_by_transport(
+        &self,
+        tenant_id: Option<&str>,
+        transport_type: &str,
+        page: i32,
+        page_size: i32,
+    ) -> TbResult<pb::GetDevicesByTransportResponse> {
+        let resp = self
+            .request(
+                pb::transport_api_request_msg::Request::GetDevicesByTransport(
+                    pb::GetDevicesByTransportRequest {
+                        tenant_id: tenant_id.unwrap_or_default().to_string(),
+                        transport_type: transport_type.to_string(),
+                        page,
+                        page_size,
+                    },
+                ),
+            )
+            .await?;
+        match resp.response {
+            Some(pb::transport_api_response_msg::Response::GetDevicesByTransportResponse(
+                devices,
+            )) => Ok(devices),
+            Some(pb::transport_api_response_msg::Response::Error(e)) => Err(TbError::Internal(
+                format!("transport-api error {}: {}", e.code, e.message),
+            )),
+            other => {
+                tracing::warn!(?other, "unexpected transport-api response");
+                Err(TbError::Internal(
+                    "unexpected transport-api response".into(),
+                ))
+            }
+        }
+    }
+
     /// 设备属性同步查询（HTTP GET attributes 用）。
     pub async fn get_attributes(
         &self,
