@@ -5,3 +5,7 @@
 .vscode/
 *.iml
 .DS_Store
+services/tb-transport-lwm2m/tests/leshan/.m2/
+services/tb-transport-lwm2m/tests/leshan/target/
+services/tb-transport-lwm2m/tests/leshan/lib/
+services/tb-transport-lwm2m/tests/leshan/classpath.txt

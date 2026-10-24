@@ -89,7 +89,15 @@ async fn calculated_field_end_to_end() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.json::<Value>().await.unwrap().as_array().unwrap().len(), 1);
+    assert_eq!(
+        resp.json::<Value>()
+            .await
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
 
     // 2. REST 遥测触发：temperature=25 → tempF=77（latest 读回）
     let resp = client
@@ -221,8 +229,7 @@ async fn calculated_field_end_to_end() {
             .await
             .unwrap();
         resp.status() == StatusCode::OK
-            && resp.json::<Value>().await.unwrap()
-                == json!([{"key": "overheated", "value": true}])
+            && resp.json::<Value>().await.unwrap() == json!([{"key": "overheated", "value": true}])
     })
     .await;
 

@@ -3432,6 +3432,7 @@ dependencies = [
 name = "tb-transport-lwm2m"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "base64 0.22.1",
  "bytes",
  "chrono",
@@ -3443,7 +3444,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "tb-auth",
  "tb-common",
+ "tb-core",
  "tb-dao",
  "tb-proto",
  "tb-queue",

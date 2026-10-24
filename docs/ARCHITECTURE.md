@@ -14,6 +14,8 @@ PostgreSQL 持久化 + Redis 缓存。协议层复用 ThingsBoard 设备接入�
 | tb-transport-mqtt | 设备 MQTT 接入：凭证校验、遥测/属性上行、RPC/属性订阅下行、网关模式、OTA 分发、设备 provision | Kafka（经 transport-api 到 core） |
 | tb-transport-http | 设备 HTTP 接入（同上语义的 HTTP 形态） | Kafka |
 | tb-transport-coap | 设备 CoAP 接入（UDP） | Kafka |
+| tb-transport-snmp | SNMP v2c 周期轮询、设备发现、遥测/属性上行 | Kafka |
+| tb-transport-lwm2m | LwM2M NoSec 注册/更新/注销、Read、SINGLE Observe、TLV 上行 | Kafka |
 | tb-edqs | 实体数据查询服务：启动时全量快照 + Kafka 增量事件维护内存读模型，供 tb-core 代理查询 | PG（快照）、Kafka |
 | tb-housekeeper | 周期清理过期 ts_kv、规则节点调试事件、已清除告警 | PG |
 
@@ -39,7 +41,7 @@ EDQS 事件按 tenant_id 分区，保证同租户读模型更新有序。
 ### 上行（设备 → 存储）
 
 ```
-设备 ──MQTT/HTTP/CoAP──▶ tb-transport-*
+设备 ──MQTT/HTTP/CoAP/SNMP/LwM2M──▶ tb-transport-*
                             │ 1) ValidateToken/... ──▶ tb_transport.api.requests ──▶ tb-core ──▶ responses.{node}
                             │ 2) ToCoreMsg(telemetry/attributes/session) ──▶ tb_core
                             ▼
@@ -80,7 +82,7 @@ tb-core（实体 CRUD / latest 写入）──▶ tb_edqs.events ──▶ tb-ed
 - `attribute_kv`：`(entity_id, attribute_type, key)`，scope = SERVER/SHARED/CLIENT。
 - `relation`：`(from_id, from_type, relation_type, to_id, to_type)` 实体关系边（Contains/Manages 等）。
 - `alarm`：`(originator, type)` 唯一活跃告警；状态机 ACTIVE_* → CLEARED_*/ACK。
-- `device` / `device_credentials`：凭证类型 ACCESS_TOKEN / X509 / MQTT_BASIC，transport 经 transport-api 校验。
+- `device` / `device_credentials`：凭证类型 ACCESS_TOKEN / X509 / MQTT_BASIC / LWM2M / SNMP，transport 经 transport-api 校验。
 - `rule_chain` / `rule_node`：规则链元数据 + 节点配置（JSONB），脚本节点内嵌 Rhai 源码。
 - `api_usage_state`：按租户聚合的消息/遥测点数用量计数。
 - `audit_log`：实体写操作审计（谁、何时、对什么、做了什么）。

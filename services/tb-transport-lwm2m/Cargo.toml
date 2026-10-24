@@ -1,0 +1,32 @@
+[package]
+name = "tb-transport-lwm2m"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+futures.workspace = true
+bytes.workspace = true
+prost.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dashmap.workspace = true
+coap-lite.workspace = true
+base64 = "0.22"
+tb-common = { path = "../../crates/tb-common" }
+tb-proto = { path = "../../crates/tb-proto" }
+tb-queue = { path = "../../crates/tb-queue" }
+tb-transport-api = { path = "../../crates/tb-transport-api" }
+
+[dev-dependencies]
+tb-dao = { path = "../../crates/tb-dao" }
+tb-core = { path = "../tb-core" }
+tb-auth = { path = "../tb-auth" }
+sqlx.workspace = true
+axum.workspace = true
+reqwest = { version = "0.12", features = ["json"] }

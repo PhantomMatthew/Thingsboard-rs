@@ -377,7 +377,10 @@ pub async fn validate_lwm2m(state: &AppState, endpoint: &str) -> pb::ValidateCre
         .credentials_value
         .as_deref()
         .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
-        .is_some_and(|body| body["endpoint"].as_str() == Some(endpoint));
+        .is_some_and(|body| {
+            body["endpoint"].as_str() == Some(endpoint)
+                && body["securityConfigClientMode"].as_str() == Some("NO_SEC")
+        });
     if !endpoint_matches {
         return invalid_credentials();
     }

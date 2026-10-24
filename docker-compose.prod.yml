@@ -150,6 +150,33 @@ services:
       tb-core: { condition: service_started }
     restart: unless-stopped
 
+  tb-transport-snmp:
+    image: ${APP_IMAGE:-thingsboard-rs:latest}
+    entrypoint: ["tb-transport-snmp"]
+    environment:
+      TB_KAFKA_BROKERS: kafka:9092
+      TB_NODE_ID: snmp-1
+      RUST_LOG: ${RUST_LOG:-info}
+    depends_on:
+      kafka: { condition: service_healthy }
+      tb-core: { condition: service_started }
+    restart: unless-stopped
+
+  tb-transport-lwm2m:
+    image: ${APP_IMAGE:-thingsboard-rs:latest}
+    entrypoint: ["tb-transport-lwm2m"]
+    environment:
+      TB_KAFKA_BROKERS: kafka:9092
+      TB_LWM2M_BIND: 0.0.0.0:5685
+      TB_NODE_ID: lwm2m-1
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "5685:5685/udp"
+    depends_on:
+      kafka: { condition: service_healthy }
+      tb-core: { condition: service_started }
+    restart: unless-stopped
+
   tb-edqs:
     image: ${APP_IMAGE:-thingsboard-rs:latest}
     entrypoint: ["tb-edqs"]

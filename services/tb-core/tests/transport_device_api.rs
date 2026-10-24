@@ -172,7 +172,9 @@ async fn shared_device_configuration_and_transport_queries() {
         device_id: device_uuid,
         credentials_type: CredentialsType::Lwm2m,
         credentials_id: Some(endpoint.into()),
-        credentials_value: Some(json!({"endpoint": endpoint}).to_string()),
+        credentials_value: Some(
+            json!({"endpoint": endpoint, "securityConfigClientMode": "NO_SEC"}).to_string(),
+        ),
     };
     state
         .device_credentials_dao
@@ -187,6 +189,43 @@ async fn shared_device_configuration_and_transport_queries() {
 
     let invalid = tb_core::transport_api::validate_lwm2m(&state, "unknown-endpoint").await;
     assert!(!invalid.valid);
+
+    let mut psk = credentials.clone();
+    psk.credentials_value =
+        Some(json!({"endpoint": endpoint, "securityConfigClientMode": "PSK"}).to_string());
+    state.device_credentials_dao.save(&psk).await.unwrap();
+    assert!(
+        !tb_core::transport_api::validate_lwm2m(&state, endpoint)
+            .await
+            .valid,
+        "PSK credentials must be rejected by the NO_SEC-only transport API"
+    );
+
+    let mut missing_mode = credentials.clone();
+    missing_mode.credentials_value = Some(json!({"endpoint": endpoint}).to_string());
+    state
+        .device_credentials_dao
+        .save(&missing_mode)
+        .await
+        .unwrap();
+    assert!(
+        !tb_core::transport_api::validate_lwm2m(&state, endpoint)
+            .await
+            .valid,
+        "credentials without securityConfigClientMode must be rejected"
+    );
+
+    state
+        .device_credentials_dao
+        .save(&credentials)
+        .await
+        .unwrap();
+    assert!(
+        tb_core::transport_api::validate_lwm2m(&state, endpoint)
+            .await
+            .valid,
+        "restoring the matching NO_SEC endpoint and mode must restore validity"
+    );
 
     let mut mismatched = credentials.clone();
     mismatched.credentials_value = Some(json!({"endpoint": "different-endpoint"}).to_string());

@@ -41,6 +41,8 @@ COPY services/tb-rule-engine/Cargo.toml services/tb-rule-engine/
 COPY services/tb-transport-coap/Cargo.toml services/tb-transport-coap/
 COPY services/tb-transport-http/Cargo.toml services/tb-transport-http/
 COPY services/tb-transport-mqtt/Cargo.toml services/tb-transport-mqtt/
+COPY services/tb-transport-snmp/Cargo.toml services/tb-transport-snmp/
+COPY services/tb-transport-lwm2m/Cargo.toml services/tb-transport-lwm2m/
 COPY tools/bench/Cargo.toml tools/bench/
 
 RUN set -e; \
@@ -48,7 +50,8 @@ RUN set -e; \
              crates/tb-queue crates/tb-rule-engine crates/tb-script crates/tb-transport-api \
              services/tb-auth services/tb-core services/tb-housekeeper services/tb-edqs \
              services/tb-rule-engine services/tb-transport-coap services/tb-transport-http \
-             services/tb-transport-mqtt tools/bench; do \
+             services/tb-transport-mqtt services/tb-transport-snmp services/tb-transport-lwm2m \
+             tools/bench; do \
         mkdir -p "$d/src"; \
         echo "" > "$d/src/lib.rs"; \
         echo "fn main() {}" > "$d/src/main.rs"; \
@@ -84,6 +87,8 @@ COPY --from=builder /app/target/release/tb-rule-engine /usr/local/bin/
 COPY --from=builder /app/target/release/tb-transport-mqtt /usr/local/bin/
 COPY --from=builder /app/target/release/tb-transport-http /usr/local/bin/
 COPY --from=builder /app/target/release/tb-transport-coap /usr/local/bin/
+COPY --from=builder /app/target/release/tb-transport-snmp /usr/local/bin/
+COPY --from=builder /app/target/release/tb-transport-lwm2m /usr/local/bin/
 COPY --from=builder /app/target/release/tb-edqs /usr/local/bin/
 COPY --from=builder /app/target/release/tb-housekeeper /usr/local/bin/
 COPY --from=builder /app/target/release/tb-bench /usr/local/bin/
