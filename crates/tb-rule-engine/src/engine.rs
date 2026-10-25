@@ -12,8 +12,7 @@ use uuid::Uuid;
 
 use crate::chain::{self, ChainLoader, RuleChainState};
 use crate::context::NodeContext;
-use crate::node::Node;
-use crate::nodes::{SaveAttributesNode, SaveTimeseriesNode};
+use crate::nodes::SaveAttributesNode;
 
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(30);
 
@@ -83,7 +82,7 @@ impl RuleEngineService {
                     tracing::debug!(tenant_id = %msg.tenant_id, "root chain has no first node, dropped");
                 }
             }
-            None => self.default_chain(msg).await,
+            None => self.default_chain(msg).await?,
         }
         Ok(())
     }
@@ -273,18 +272,20 @@ impl RuleEngineService {
     }
 
     /// 内置默认链（租户无根链时）：对齐 msg_type_switch 语义。
-    async fn default_chain(&self, msg: TbMsg) {
+    /// 默认链没有 Failure 出边，保存失败作为处理错误返回，由消费端决定重试或进入 DLQ。
+    async fn default_chain(&self, msg: TbMsg) -> TbResult<()> {
         match msg.msg_type.as_str() {
             msg_type::POST_TELEMETRY_REQUEST => {
                 chain::report_execution(&self.ctx, &msg).await;
-                SaveTimeseriesNode::default().on_msg(&self.ctx, msg).await;
+                crate::nodes::save_timeseries(&self.ctx, &msg).await
             }
             msg_type::POST_ATTRIBUTES_REQUEST => {
                 chain::report_execution(&self.ctx, &msg).await;
-                SaveAttributesNode::default().on_msg(&self.ctx, msg).await;
+                SaveAttributesNode::default().save(&self.ctx, &msg).await
             }
             other => {
                 tracing::debug!(msg_type = other, "default chain: message dropped");
+                Ok(())
             }
         }
     }

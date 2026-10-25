@@ -2,10 +2,14 @@
 //! topic `tb_core`（key=device_id 保证同设备有序），group `tb-core-main`。
 //! 独立消费 `tb_usage_stats`，由 core 的 UsageTracker 聚合租户遥测与规则引擎消息用量。
 
+use std::future::Future;
+use std::time::Duration;
+
 use prost::Message as _;
 use tb_common::msg::msg_type;
 use tb_common::{AttributeScope, KvEntry, KvValue, TbError, TbResult};
 use tb_proto::core as pb;
+use tb_queue::consumer::ConsumedMessage;
 use tb_queue::{KafkaQueueProducer, QueueConsumer, QueueProducer, StreamQueueConsumer, TbTopic};
 use uuid::Uuid;
 
@@ -13,6 +17,172 @@ use crate::AppState;
 use crate::device_session::{SESSION_SWEEP_INTERVAL, SessionEntry};
 
 const CORE_PARTITIONS: i32 = 10;
+
+/// 暂时性失败的有界重试：耗尽后进入 DLQ 并提交，避免单条消息长期堵住分区。
+#[derive(Clone, Copy)]
+struct RetryPolicy {
+    max_attempts: u32,
+    base_delay: Duration,
+    max_delay: Duration,
+}
+
+const RETRY_POLICY: RetryPolicy = RetryPolicy {
+    max_attempts: 8,
+    base_delay: Duration::from_millis(200),
+    max_delay: Duration::from_secs(5),
+};
+
+impl RetryPolicy {
+    fn delay(&self, attempt: u32) -> Duration {
+        self.base_delay
+            .saturating_mul(1 << attempt.saturating_sub(1).min(16))
+            .min(self.max_delay)
+    }
+}
+
+/// 数据库连接类故障，以及映射为 Internal 的 Redis/Kafka 故障可以重试；
+/// 输入错误、未找到、权限与约束冲突重试也不会成功。
+fn is_retryable(err: &TbError) -> bool {
+    tb_dao::is_transient_error(err) || matches!(err, TbError::Internal(_))
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeadLetter<'a> {
+    source_topic: &'a str,
+    partition: i32,
+    offset: i64,
+    key: Option<String>,
+    node_id: &'a str,
+    error: &'a str,
+    attempts: u32,
+    ts: i64,
+    /// 已脱敏时为重新编码后的消息，否则为原始字节。
+    payload_hex: String,
+    redacted: bool,
+}
+
+/// 写入 DLQ 直到成功：只有死信落盘后才允许提交原 offset。
+async fn dead_letter<P: QueueProducer>(
+    producer: &P,
+    node_id: &str,
+    msg: &ConsumedMessage,
+    payload: &[u8],
+    redacted: bool,
+    error: &str,
+    attempts: u32,
+) {
+    let key = msg
+        .key
+        .as_ref()
+        .map(|key| String::from_utf8_lossy(key).into_owned());
+    let letter = DeadLetter {
+        source_topic: &msg.topic,
+        partition: msg.partition,
+        offset: msg.offset,
+        key: key.clone(),
+        node_id,
+        error,
+        attempts,
+        ts: chrono::Utc::now().timestamp_millis(),
+        payload_hex: hex::encode(payload),
+        redacted,
+    };
+    let body = bytes::Bytes::from(serde_json::to_vec(&letter).unwrap_or_default());
+    let dlq_key = key.unwrap_or_else(|| format!("{}-{}", msg.topic, msg.partition));
+    loop {
+        match producer
+            .send(TbTopic::CORE_DLQ, &dlq_key, body.clone())
+            .await
+        {
+            Ok(()) => {
+                tracing::warn!(
+                    topic = %msg.topic,
+                    partition = msg.partition,
+                    offset = msg.offset,
+                    attempts,
+                    "message sent to {}: {error}",
+                    TbTopic::CORE_DLQ
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::error!(
+                    topic = %msg.topic,
+                    offset = msg.offset,
+                    "core DLQ send failed; offset not committed: {e}"
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
+/// 认领密钥不得进入死信。
+fn redact(mut msg: pb::ToCoreMsg) -> pb::ToCoreMsg {
+    if let Some(pb::to_core_msg::Msg::ClaimDevice(claim)) = &mut msg.msg
+        && !claim.secret_key.is_empty()
+    {
+        claim.secret_key = "<redacted>".into();
+    }
+    msg
+}
+
+/// 返回时消息已处理成功或已写入 DLQ，调用方可以提交 offset。
+async fn process_record<P, F, Fut>(
+    dlq: &P,
+    node_id: &str,
+    msg: &ConsumedMessage,
+    policy: RetryPolicy,
+    handler: F,
+) where
+    P: QueueProducer,
+    F: Fn(pb::ToCoreMsg) -> Fut,
+    Fut: Future<Output = TbResult<()>>,
+{
+    let decoded = match pb::ToCoreMsg::decode(msg.payload.clone()) {
+        Ok(decoded) => decoded,
+        Err(e) => {
+            let error = format!("undecodable ToCoreMsg: {e}");
+            dead_letter(dlq, node_id, msg, &msg.payload, false, &error, 1).await;
+            return;
+        }
+    };
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let err = match handler(decoded.clone()).await {
+            Ok(()) => return,
+            Err(err) => err,
+        };
+        if is_retryable(&err) && attempt < policy.max_attempts {
+            tracing::warn!(
+                topic = %msg.topic,
+                offset = msg.offset,
+                attempt,
+                "core message processing failed, retrying: {err}"
+            );
+            tokio::time::sleep(policy.delay(attempt)).await;
+            continue;
+        }
+        let payload = redact(decoded).encode_to_vec();
+        let error = format!("processing failed: {err}");
+        dead_letter(dlq, node_id, msg, &payload, true, &error, attempt).await;
+        return;
+    }
+}
+
+async fn commit_until_ok<C: QueueConsumer>(consumer: &mut C, msg: &ConsumedMessage) {
+    loop {
+        match consumer.commit(msg).await {
+            Ok(()) => return,
+            Err(e) => {
+                tracing::error!(topic = %msg.topic, offset = msg.offset, "commit failed: {e}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
 
 pub async fn start_core_consumer(state: AppState) -> tokio::task::JoinHandle<()> {
     start_core_consumer_for_group(state, "tb-core-main").await
@@ -36,6 +206,11 @@ pub async fn start_core_consumer_for_group(
     {
         tracing::warn!("ensure usage stats topic failed: {e}");
     }
+    if let Err(e) =
+        tb_queue::admin::ensure_topic(&brokers, TbTopic::CORE_DLQ, CORE_PARTITIONS).await
+    {
+        tracing::warn!("ensure core DLQ topic failed: {e}");
+    }
     let group_id = group_id.to_string();
     let usage_group = format!("{group_id}-usage-stats");
     tokio::spawn(async move {
@@ -56,6 +231,13 @@ pub async fn start_core_consumer_for_group(
 }
 
 async fn run_usage_stats(state: AppState, brokers: String, group_id: String) {
+    let producer = match KafkaQueueProducer::new(&brokers, &group_id) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!("usage stats DLQ producer init failed: {e}");
+            return;
+        }
+    };
     let mut consumer = match StreamQueueConsumer::new_manual_commit(
         &brokers,
         &group_id,
@@ -71,23 +253,32 @@ async fn run_usage_stats(state: AppState, brokers: String, group_id: String) {
     loop {
         match consumer.recv().await {
             Ok(msg) => {
-                match pb::UsageStatsMsg::decode(msg.payload.clone()) {
+                let error = match pb::UsageStatsMsg::decode(msg.payload.clone()) {
                     Ok(usage) => match Uuid::parse_str(&usage.tenant_id) {
                         Ok(tenant_id) => {
                             state
                                 .usage
                                 .inc_transport_msgs(tenant_id, usage.transport_msgs);
                             state.usage.inc_re_msgs(tenant_id, usage.re_msgs);
+                            None
                         }
-                        Err(e) => {
-                            tracing::warn!(tenant_id = %usage.tenant_id, "usage stats has bad tenant_id: {e}");
-                        }
+                        Err(e) => Some(format!("usage stats has bad tenant_id: {e}")),
                     },
-                    Err(e) => tracing::warn!("undecodable UsageStatsMsg: {e}"),
+                    Err(e) => Some(format!("undecodable UsageStatsMsg: {e}")),
+                };
+                if let Some(error) = error {
+                    dead_letter(
+                        &producer,
+                        &state.node_id,
+                        &msg,
+                        &msg.payload,
+                        false,
+                        &error,
+                        1,
+                    )
+                    .await;
                 }
-                if let Err(e) = consumer.commit(&msg).await {
-                    tracing::error!("usage stats commit failed: {e}");
-                }
+                commit_until_ok(&mut consumer, &msg).await;
             }
             Err(e) => {
                 tracing::error!("usage stats consumer error: {e}");
@@ -117,18 +308,11 @@ async fn run_main(state: AppState, brokers: String, group_id: String) {
     loop {
         match consumer.recv().await {
             Ok(msg) => {
-                let Ok(m) = pb::ToCoreMsg::decode(msg.payload.clone()) else {
-                    tracing::warn!("undecodable ToCoreMsg");
-                    continue;
-                };
-                match handle(&state, &producer, m).await {
-                    Ok(()) => {
-                        if let Err(e) = consumer.commit(&msg).await {
-                            tracing::error!("tb_core commit failed: {e}");
-                        }
-                    }
-                    Err(e) => tracing::error!("tb_core message processing failed: {e}"),
-                }
+                process_record(&producer, &state.node_id, &msg, RETRY_POLICY, |m| {
+                    handle(&state, &producer, m)
+                })
+                .await;
+                commit_until_ok(&mut consumer, &msg).await;
             }
             Err(e) => {
                 tracing::error!("tb_core consumer error: {e}");
@@ -141,6 +325,13 @@ async fn run_main(state: AppState, brokers: String, group_id: String) {
 async fn run_rpc_responses(state: AppState, brokers: String) {
     let topic = TbTopic::core_rpc_responses(&state.node_id);
     let group_id = format!("tb-core-rpc-{}", state.node_id);
+    let producer = match KafkaQueueProducer::new(&brokers, &group_id) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!("core rpc response DLQ producer init failed: {e}");
+            return;
+        }
+    };
     let mut consumer =
         match StreamQueueConsumer::new_from_beginning_manual(&brokers, &group_id, &[&topic]) {
             Ok(c) => c,
@@ -152,27 +343,19 @@ async fn run_rpc_responses(state: AppState, brokers: String) {
     loop {
         match consumer.recv().await {
             Ok(msg) => {
-                let Ok(m) = pb::ToCoreMsg::decode(msg.payload.clone()) else {
-                    tracing::warn!("undecodable routed rpc response");
-                    continue;
-                };
-                let result = match m.msg {
-                    Some(pb::to_core_msg::Msg::RpcResponse(response)) => {
-                        complete_rpc_response(&state, response)
-                    }
-                    _ => {
-                        tracing::warn!("non-rpc message on core rpc response topic");
-                        Ok(())
-                    }
-                };
-                match result {
-                    Ok(()) => {
-                        if let Err(e) = consumer.commit(&msg).await {
-                            tracing::error!("core rpc response commit failed: {e}");
+                process_record(&producer, &state.node_id, &msg, RETRY_POLICY, |m| {
+                    let result = match m.msg {
+                        Some(pb::to_core_msg::Msg::RpcResponse(response)) => {
+                            complete_rpc_response(&state, response)
                         }
-                    }
-                    Err(e) => tracing::error!("routed rpc response processing failed: {e}"),
-                }
+                        _ => Err(TbError::InvalidInput(
+                            "non-rpc message on core rpc response topic".into(),
+                        )),
+                    };
+                    std::future::ready(result)
+                })
+                .await;
+                commit_until_ok(&mut consumer, &msg).await;
             }
             Err(e) => {
                 tracing::error!("core rpc response consumer error: {e}");
@@ -442,4 +625,190 @@ async fn handle(
         other => tracing::debug!(?other, "ignored ToCoreMsg"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use bytes::Bytes;
+    use tb_queue::QueueError;
+
+    use super::*;
+
+    const FAST: RetryPolicy = RetryPolicy {
+        max_attempts: 3,
+        base_delay: Duration::ZERO,
+        max_delay: Duration::ZERO,
+    };
+
+    #[derive(Default)]
+    struct RecordingProducer {
+        sent: Mutex<Vec<(String, String, Bytes)>>,
+        failures_left: AtomicU32,
+    }
+
+    #[async_trait::async_trait]
+    impl QueueProducer for RecordingProducer {
+        async fn send(&self, topic: &str, key: &str, payload: Bytes) -> Result<(), QueueError> {
+            if self
+                .failures_left
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(QueueError::Serialization("injected".into()));
+            }
+            self.sent
+                .lock()
+                .unwrap()
+                .push((topic.into(), key.into(), payload));
+            Ok(())
+        }
+    }
+
+    impl RecordingProducer {
+        fn letters(&self) -> Vec<serde_json::Value> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(topic, _, payload)| {
+                    assert_eq!(topic, TbTopic::CORE_DLQ);
+                    serde_json::from_slice(payload).unwrap()
+                })
+                .collect()
+        }
+    }
+
+    fn record(payload: Bytes) -> ConsumedMessage {
+        ConsumedMessage {
+            topic: TbTopic::CORE.into(),
+            partition: 3,
+            offset: 42,
+            key: Some(Bytes::from_static(b"device-1")),
+            payload,
+        }
+    }
+
+    fn claim_msg() -> pb::ToCoreMsg {
+        pb::ToCoreMsg {
+            tenant_id: "t".into(),
+            entity_id: "d".into(),
+            msg: Some(pb::to_core_msg::Msg::ClaimDevice(pb::ClaimDeviceMsg {
+                session: None,
+                secret_key: "top-secret".into(),
+                duration_ms: 1000,
+            })),
+        }
+    }
+
+    #[tokio::test]
+    async fn poison_message_goes_to_dlq_with_source_context() {
+        let producer = RecordingProducer::default();
+        let calls = AtomicU32::new(0);
+        let poison = Bytes::from_static(&[0xff, 0xff, 0xff]);
+        process_record(&producer, "node-a", &record(poison), FAST, |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(()))
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let letters = producer.letters();
+        assert_eq!(letters.len(), 1);
+        let letter = &letters[0];
+        assert_eq!(letter["sourceTopic"], TbTopic::CORE);
+        assert_eq!(letter["partition"], 3);
+        assert_eq!(letter["offset"], 42);
+        assert_eq!(letter["key"], "device-1");
+        assert_eq!(letter["nodeId"], "node-a");
+        assert_eq!(letter["payloadHex"], "ffffff");
+        assert_eq!(letter["redacted"], false);
+        assert!(letter["error"].as_str().unwrap().contains("undecodable"));
+    }
+
+    #[tokio::test]
+    async fn transient_failure_is_retried_until_success() {
+        let producer = RecordingProducer::default();
+        let calls = AtomicU32::new(0);
+        let payload = Bytes::from(claim_msg().encode_to_vec());
+        process_record(&producer, "node-a", &record(payload), FAST, |_| {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(if n < 2 {
+                Err(TbError::Internal("redis unavailable".into()))
+            } else {
+                Ok(())
+            })
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(producer.letters().is_empty());
+    }
+
+    #[tokio::test]
+    async fn exhausted_retries_and_permanent_errors_go_to_redacted_dlq() {
+        let payload = Bytes::from(claim_msg().encode_to_vec());
+        let transient = || TbError::Internal("redis unavailable".into());
+        let permanent = || TbError::InvalidInput("bad claim".into());
+        let cases: [(&dyn Fn() -> TbError, u32); 2] = [(&transient, 3), (&permanent, 1)];
+        for (make_error, expected_attempts) in cases {
+            let producer = RecordingProducer::default();
+            let calls = AtomicU32::new(0);
+            let message = make_error().to_string();
+            process_record(&producer, "node-a", &record(payload.clone()), FAST, |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err(make_error()))
+            })
+            .await;
+            assert_eq!(calls.load(Ordering::SeqCst), expected_attempts);
+            let letters = producer.letters();
+            assert_eq!(letters.len(), 1, "{message}");
+            let letter = &letters[0];
+            assert_eq!(letter["attempts"], expected_attempts);
+            assert_eq!(letter["redacted"], true);
+            assert!(letter["error"].as_str().unwrap().contains(&message));
+            let stored = pb::ToCoreMsg::decode(
+                hex::decode(letter["payloadHex"].as_str().unwrap())
+                    .unwrap()
+                    .as_slice(),
+            )
+            .unwrap();
+            let Some(pb::to_core_msg::Msg::ClaimDevice(claim)) = stored.msg else {
+                panic!("claim message expected");
+            };
+            assert_eq!(claim.secret_key, "<redacted>");
+            assert_eq!(claim.duration_ms, 1000);
+        }
+    }
+
+    #[tokio::test]
+    async fn dlq_send_is_retried_before_returning() {
+        let producer = Arc::new(RecordingProducer {
+            failures_left: AtomicU32::new(2),
+            ..Default::default()
+        });
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            process_record(
+                producer.as_ref(),
+                "node-a",
+                &record(Bytes::from_static(&[0xff])),
+                FAST,
+                |_| std::future::ready(Ok(())),
+            ),
+        )
+        .await
+        .expect("dead letter eventually written");
+        assert_eq!(producer.letters().len(), 1);
+    }
+
+    #[test]
+    fn retry_delay_grows_and_is_capped() {
+        assert_eq!(RETRY_POLICY.delay(1), Duration::from_millis(200));
+        assert_eq!(RETRY_POLICY.delay(2), Duration::from_millis(400));
+        assert_eq!(RETRY_POLICY.delay(10), Duration::from_secs(5));
+        assert!(is_retryable(&TbError::Internal("x".into())));
+        assert!(!is_retryable(&TbError::InvalidInput("x".into())));
+        assert!(!is_retryable(&TbError::NotFound("x".into())));
+    }
 }

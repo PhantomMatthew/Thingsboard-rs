@@ -3174,6 +3174,7 @@ dependencies = [
 name = "tb-core"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "bytes",
  "chrono",
@@ -3338,6 +3339,7 @@ dependencies = [
  "tb-proto",
  "tb-queue",
  "tb-rule-engine",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "tracing-subscriber",

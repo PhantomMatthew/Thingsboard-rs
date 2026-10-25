@@ -200,7 +200,7 @@ impl Node for SaveTimeseriesNode {
     }
 }
 
-async fn save_timeseries(ctx: &NodeContext, msg: &TbMsg) -> TbResult<()> {
+pub(crate) async fn save_timeseries(ctx: &NodeContext, msg: &TbMsg) -> TbResult<()> {
     let (ts, values) = match &msg.data {
         serde_json::Value::Object(map)
             if map.get("values").is_some_and(serde_json::Value::is_object) =>
@@ -315,7 +315,7 @@ impl Node for SaveAttributesNode {
 }
 
 impl SaveAttributesNode {
-    async fn save(&self, ctx: &NodeContext, msg: &TbMsg) -> TbResult<()> {
+    pub(crate) async fn save(&self, ctx: &NodeContext, msg: &TbMsg) -> TbResult<()> {
         let (scope, kv) = match &msg.data {
             serde_json::Value::Object(map) if map.contains_key("kv") => {
                 let scope = match map.get("scope").and_then(|s| s.as_str()) {

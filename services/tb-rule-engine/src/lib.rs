@@ -93,7 +93,7 @@ async fn start_rule_engine_inner(
                                         tracing::error!(
                                             topic = %msg.topic,
                                             offset = msg.offset,
-                                            "DLQ send failed; offset not committed: {e}"
+                                            "offset not committed, retrying: {e}"
                                         );
                                         tokio::time::sleep(Duration::from_secs(1)).await;
                                     }
@@ -158,24 +158,33 @@ fn dlq_envelope(mut msg: TbMsg, error: String) -> ToRuleEngineMsg {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+enum ProcessError {
+    #[error("DLQ send failed: {0}")]
+    Dlq(#[from] tb_queue::QueueError),
+    #[error("transient processing failure: {0}")]
+    Transient(tb_common::TbError),
+}
+
 /// Ok 表示可以提交原 offset（包括 DLQ 已写成功）；Err 表示必须保留 offset。
+/// 数据库暂不可用时保留 offset 等待恢复，避免把可重放的消息提前送进 DLQ。
 async fn process_payload<P: QueueProducer>(
     engine: &RuleEngineService,
     producer: &P,
     payload: Bytes,
     key: &str,
-) -> Result<(), tb_queue::QueueError> {
+) -> Result<(), ProcessError> {
     let to_re = match ToRuleEngineMsg::decode(payload.clone()) {
         Ok(msg) => msg,
         Err(e) => {
             tracing::warn!("undecodable ToRuleEngineMsg, sending raw payload to DLQ: {e}");
-            return send_raw_dlq(producer, key, payload).await;
+            return Ok(send_raw_dlq(producer, key, payload).await?);
         }
     };
     let ToRuleEngineMsg { tenant_id, tb_msg } = to_re;
     let Some(tb_msg) = tb_msg else {
         tracing::warn!("ToRuleEngineMsg without TbMsg, sending raw payload to DLQ");
-        return send_raw_dlq(producer, key, payload).await;
+        return Ok(send_raw_dlq(producer, key, payload).await?);
     };
     match tb_proto::convert::tb_msg_from_proto(&tb_msg) {
         Ok(msg) => {
@@ -192,11 +201,12 @@ async fn process_payload<P: QueueProducer>(
                     tracing::debug!(%msg_id, %msg_type, "rule engine handled");
                     Ok(())
                 }
+                Err(e) if tb_dao::is_transient_error(&e) => Err(ProcessError::Transient(e)),
                 Err(e) => {
                     tracing::error!(%msg_id, %msg_type, "rule engine handle failed: {e}");
                     let envelope =
                         dlq_envelope(original, format!("rule engine handle failed: {e}"));
-                    send_dlq_envelope(producer, key, envelope).await
+                    Ok(send_dlq_envelope(producer, key, envelope).await?)
                 }
             }
         }
@@ -206,7 +216,7 @@ async fn process_payload<P: QueueProducer>(
             tb_msg
                 .metadata
                 .insert("error".into(), format!("bad TbMsgProto: {e}"));
-            send_dlq_envelope(
+            Ok(send_dlq_envelope(
                 producer,
                 key,
                 ToRuleEngineMsg {
@@ -214,7 +224,7 @@ async fn process_payload<P: QueueProducer>(
                     tb_msg: Some(tb_msg),
                 },
             )
-            .await
+            .await?)
         }
     }
 }
@@ -290,11 +300,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn engine_error_sends_original_message_to_dlq() {
-        let msg = message();
+    async fn database_outage_keeps_offset_without_dlq() {
+        let (producer, sent) = producer(false);
+        let result =
+            process_payload(&failing_engine(), &producer, payload(&message()), "key").await;
+        assert!(
+            matches!(result, Err(ProcessError::Transient(_))),
+            "{result:?}"
+        );
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn permanent_default_chain_failure_sends_original_message_to_dlq() {
+        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://thingsboard:thingsboard@localhost:5433/thingsboard".into()
+        });
+        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+        tb_dao::migrate(&pool).await.unwrap();
+        let (engine_producer, _) = producer(false);
+        let engine = RuleEngineService::with_queue_producer(
+            pool,
+            Arc::new(engine_producer),
+            Duration::from_secs(1),
+        );
+        let mut msg = message();
+        msg.data = serde_json::json!([1, 2]);
         let msg_id = msg.id.to_string();
         let (producer, sent) = producer(false);
-        process_payload(&failing_engine(), &producer, payload(&msg), "key")
+        process_payload(&engine, &producer, payload(&msg), "key")
             .await
             .unwrap();
 
@@ -308,7 +342,8 @@ mod tests {
             dlq_msg
                 .metadata
                 .get("error")
-                .is_some_and(|error| error.contains("rule engine handle failed"))
+                .is_some_and(|error| error.contains("rule engine handle failed")
+                    && error.contains("invalid input"))
         );
     }
 
@@ -330,8 +365,13 @@ mod tests {
     #[tokio::test]
     async fn dlq_failure_prevents_successful_processing_result() {
         let (producer, _) = producer(true);
-        let result =
-            process_payload(&failing_engine(), &producer, payload(&message()), "key").await;
-        assert!(result.is_err());
+        let result = process_payload(
+            &failing_engine(),
+            &producer,
+            Bytes::from_static(&[0xff]),
+            "key",
+        )
+        .await;
+        assert!(matches!(result, Err(ProcessError::Dlq(_))), "{result:?}");
     }
 }

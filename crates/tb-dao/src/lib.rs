@@ -56,6 +56,28 @@ pub use tenant::{TenantDao, TenantProfileDao};
 pub use timeseries::{Aggregation, TimeseriesDao};
 pub use user::{UserCredentialsDao, UserDao};
 
+/// 连接中断、连接池耗尽、事务冲突与资源不足等可重试的数据库故障；
+/// 约束冲突、数据格式等错误重试也不会成功，返回 false。
+pub fn is_transient_error(err: &tb_common::TbError) -> bool {
+    let tb_common::TbError::Database(db) = err else {
+        return false;
+    };
+    match db.0.downcast_ref::<sqlx::Error>() {
+        Some(sqlx::Error::Database(e)) => e
+            .code()
+            .is_some_and(|code| matches!(code.get(..2), Some("08" | "40" | "53" | "57" | "58"))),
+        Some(
+            sqlx::Error::Io(_)
+            | sqlx::Error::Tls(_)
+            | sqlx::Error::Protocol(_)
+            | sqlx::Error::PoolTimedOut
+            | sqlx::Error::PoolClosed
+            | sqlx::Error::WorkerCrashed,
+        ) => true,
+        _ => false,
+    }
+}
+
 pub(crate) fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }

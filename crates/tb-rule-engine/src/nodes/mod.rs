@@ -27,7 +27,7 @@ pub use legacy::{
 };
 pub use transform::{ChangeOriginatorNode, DeleteKeysNode, RenameKeysNode};
 
-pub(crate) use legacy::{parse_config, parse_scope};
+pub(crate) use legacy::{parse_config, parse_scope, save_timeseries};
 
 use tb_common::KvValue;
 

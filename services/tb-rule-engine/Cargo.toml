@@ -17,6 +17,7 @@ sqlx.workspace = true
 uuid.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+thiserror.workspace = true
 tb-common = { path = "../../crates/tb-common" }
 tb-proto = { path = "../../crates/tb-proto" }
 tb-queue = { path = "../../crates/tb-queue" }

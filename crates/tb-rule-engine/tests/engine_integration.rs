@@ -396,6 +396,39 @@ async fn engine_default_chain_fallback_without_root_chain() {
 }
 
 #[tokio::test]
+async fn engine_default_chain_surfaces_save_failures() {
+    let pool = setup().await;
+    let producer = KafkaQueueProducer::new("localhost:29092", "tb-rule-engine-test").unwrap();
+    let engine = RuleEngineService::new(pool.clone(), producer.clone());
+    let err = engine
+        .handle(telemetry_msg(json!([1, 2])))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, tb_common::TbError::InvalidInput(_)), "{err}");
+    assert!(!tb_dao::is_transient_error(&err));
+    let attributes = TbMsg::new(
+        msg_type::POST_ATTRIBUTES_REQUEST,
+        EntityId::new(EntityType::Device),
+        Uuid::now_v7(),
+        json!("not-an-object"),
+        HashMap::new(),
+    );
+    let err = engine.handle(attributes).await.unwrap_err();
+    assert!(matches!(err, tb_common::TbError::InvalidInput(_)), "{err}");
+
+    let unreachable = sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(std::time::Duration::from_millis(200))
+        .connect_lazy("postgres://thingsboard:thingsboard@127.0.0.1:1/thingsboard")
+        .unwrap();
+    let engine = RuleEngineService::new(unreachable, producer);
+    let err = engine
+        .handle(telemetry_msg(json!({"temperature": 1})))
+        .await
+        .unwrap_err();
+    assert!(tb_dao::is_transient_error(&err), "{err}");
+}
+
+#[tokio::test]
 async fn engine_loads_db_root_chain() {
     let pool = setup().await;
     let tenant = Tenant {

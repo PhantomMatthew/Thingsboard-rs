@@ -6,6 +6,8 @@ impl TbTopic {
     pub const TRANSPORT_API_REQUESTS: &'static str = "tb_transport.api.requests";
     pub const CORE: &'static str = "tb_core";
     pub const CORE_NOTIFICATIONS: &'static str = "tb_core.notifications";
+    /// tb_core 系列 topic 的死信：JSON 信封，含来源 topic/partition/offset、错误与原始 payload。
+    pub const CORE_DLQ: &'static str = "tb_core.dlq";
     pub const HOUSEKEEPER: &'static str = "tb_housekeeper";
     pub const USAGE_STATS: &'static str = "tb_usage_stats";
 
