@@ -331,12 +331,20 @@ pub(crate) async fn send_core(
     device: &pb::DeviceInfoProto,
     msg: core_pb::to_core_msg::Msg,
 ) {
+    let _ = send_core_result(state, device, msg).await;
+}
+
+pub(crate) async fn send_core_result(
+    state: &TransportState,
+    device: &pb::DeviceInfoProto,
+    msg: core_pb::to_core_msg::Msg,
+) -> Result<(), String> {
     let m = core_pb::ToCoreMsg {
         tenant_id: device.tenant_id.clone(),
         entity_id: device.device_id.clone(),
         msg: Some(msg),
     };
-    if let Err(e) = state
+    state
         .producer
         .send(
             TbTopic::CORE,
@@ -344,9 +352,10 @@ pub(crate) async fn send_core(
             Bytes::from(m.encode_to_vec()),
         )
         .await
-    {
-        tracing::warn!("send to tb_core failed: {e}");
-    }
+        .map_err(|e| {
+            tracing::warn!("send to tb_core failed: {e}");
+            format!("send to tb_core failed: {e}")
+        })
 }
 
 /// 主循环；返回关闭原因。
@@ -566,7 +575,7 @@ async fn handle_publish(
             return Err("gateway api not allowed for non-gateway device".into());
         }
         let packet_id = (p.qos == 1).then_some(p.packet_id).flatten();
-        crate::gateway::handle_publish(framed, state, session, p).await;
+        crate::gateway::handle_publish(framed, state, session, p).await?;
         if let Some(packet_id) = packet_id {
             send(framed, MqttPacket::PubAck(packet_id)).await;
         }
@@ -583,7 +592,7 @@ async fn handle_publish(
     if topic == TOPIC_CLAIM {
         let claim =
             parse_claim_payload(&p.payload).map_err(|e| format!("bad claim payload: {e}"))?;
-        send_core(
+        send_core_result(
             state,
             &session.device,
             core_pb::to_core_msg::Msg::ClaimDevice(core_pb::ClaimDeviceMsg {
@@ -592,83 +601,70 @@ async fn handle_publish(
                 duration_ms: claim.duration_ms,
             }),
         )
-        .await;
+        .await?;
         report_activity(state, session).await;
     } else if topic == TOPIC_TELEMETRY {
-        match parse_telemetry(&p.payload) {
-            Ok(entries) => {
-                let res = state
-                    .transport_api
-                    .publish_telemetry(&session.device, entries)
-                    .await;
-                crate::log_publish_result(res, "publish telemetry failed");
-            }
-            Err(e) => tracing::warn!("bad telemetry payload: {e}"),
-        }
+        let entries =
+            parse_telemetry(&p.payload).map_err(|e| format!("bad telemetry payload: {e}"))?;
+        let res = state
+            .transport_api
+            .publish_telemetry(&session.device, entries)
+            .await;
+        crate::check_publish_result(res, "publish telemetry failed")?;
         report_activity(state, session).await;
     } else if topic == TOPIC_ATTRIBUTES {
-        match serde_json::from_slice::<HashMap<String, KvValue>>(&p.payload) {
-            Ok(values) => {
-                let entries: Vec<KvEntry> = values
-                    .into_iter()
-                    .map(|(key, value)| KvEntry { key, value })
-                    .collect();
-                let res = state
-                    .transport_api
-                    .publish_attributes(&session.device, entries)
-                    .await;
-                crate::log_publish_result(res, "publish attributes failed");
-            }
-            Err(e) => tracing::warn!("bad attributes payload: {e}"),
-        }
+        let values = serde_json::from_slice::<HashMap<String, KvValue>>(&p.payload)
+            .map_err(|e| format!("bad attributes payload: {e}"))?;
+        let entries: Vec<KvEntry> = values
+            .into_iter()
+            .map(|(key, value)| KvEntry { key, value })
+            .collect();
+        let res = state
+            .transport_api
+            .publish_attributes(&session.device, entries)
+            .await;
+        crate::check_publish_result(res, "publish attributes failed")?;
         report_activity(state, session).await;
     } else if let Some(request_id) = topic.strip_prefix(TOPIC_RPC_REQUEST_PREFIX) {
-        match serde_json::from_slice::<RpcPayload>(&p.payload) {
-            Ok(rpc) => {
-                if let Err(e) = state
-                    .transport_api
-                    .publish_to_server_rpc(
-                        &session.device,
-                        &rpc.method,
-                        rpc.params,
-                        rpc.timeout.unwrap_or(0),
-                    )
-                    .await
-                {
-                    tracing::warn!(request_id, "publish to-server rpc failed: {e}");
-                }
-            }
-            Err(e) => tracing::warn!(request_id, "bad rpc payload: {e}"),
-        }
+        let rpc = serde_json::from_slice::<RpcPayload>(&p.payload)
+            .map_err(|e| format!("bad rpc payload for request {request_id}: {e}"))?;
+        let res = state
+            .transport_api
+            .publish_to_server_rpc(
+                &session.device,
+                &rpc.method,
+                rpc.params,
+                rpc.timeout.unwrap_or(0),
+            )
+            .await;
+        crate::check_publish_result(res, "publish to-server rpc failed")?;
         report_activity(state, session).await;
     } else if let Some(request_id) = topic.strip_prefix(TOPIC_RPC_RESPONSE_PREFIX) {
         // 服务端 RPC 的设备响应：回流 tb_core 完成 pending。
-        match request_id.parse::<i32>() {
-            Ok(request_id) => {
-                let route_key = (session.info.session_id.clone(), request_id);
-                let reply_node_id = state
-                    .rpc_reply_nodes
-                    .get(&route_key)
-                    .await
-                    .unwrap_or_default();
-                state.rpc_reply_nodes.invalidate(&route_key).await;
-                send_core(
-                    state,
-                    &session.device,
-                    core_pb::to_core_msg::Msg::RpcResponse(core_pb::RpcResponseMsg {
-                        session: Some(session.info.clone()),
-                        request_id,
-                        payload_json: String::from_utf8_lossy(&p.payload).into_owned(),
-                        error: String::new(),
-                        reply_node_id,
-                    }),
-                )
-                .await;
-            }
-            Err(_) => tracing::warn!(topic, "bad rpc response request id"),
-        }
+        let request_id = request_id
+            .parse::<i32>()
+            .map_err(|_| format!("bad rpc response request id: {topic}"))?;
+        let route_key = (session.info.session_id.clone(), request_id);
+        let reply_node_id = state
+            .rpc_reply_nodes
+            .get(&route_key)
+            .await
+            .unwrap_or_default();
+        send_core_result(
+            state,
+            &session.device,
+            core_pb::to_core_msg::Msg::RpcResponse(core_pb::RpcResponseMsg {
+                session: Some(session.info.clone()),
+                request_id,
+                payload_json: String::from_utf8_lossy(&p.payload).into_owned(),
+                error: String::new(),
+                reply_node_id,
+            }),
+        )
+        .await?;
+        state.rpc_reply_nodes.invalidate(&route_key).await;
     } else if let Some(request_id) = topic.strip_prefix(TOPIC_ATTRIBUTES_REQUEST_PREFIX) {
-        handle_attributes_request(framed, state, session, request_id, &p.payload).await;
+        handle_attributes_request(framed, state, session, request_id, &p.payload).await?;
     } else {
         tracing::debug!(topic, "ignored publish topic");
     }
@@ -706,19 +702,14 @@ async fn handle_attributes_request(
     session: &Session,
     request_id: &str,
     payload: &[u8],
-) {
+) -> Result<(), String> {
     let request = if payload.is_empty() {
         AttributesRequestPayload::default()
     } else {
-        match serde_json::from_slice::<AttributesRequestPayload>(payload) {
-            Ok(request) => request,
-            Err(e) => {
-                tracing::warn!(request_id, "bad attributes request payload: {e}");
-                return;
-            }
-        }
+        serde_json::from_slice::<AttributesRequestPayload>(payload)
+            .map_err(|e| format!("bad attributes request payload for {request_id}: {e}"))?
     };
-    let response = match state
+    let response = state
         .transport_api
         .get_attributes(
             &session.device.device_id,
@@ -726,13 +717,10 @@ async fn handle_attributes_request(
             split_attribute_keys(request.shared_keys.as_deref()),
         )
         .await
-    {
-        Ok(response) => response,
-        Err(e) => {
+        .map_err(|e| {
             tracing::warn!(request_id, "attributes request failed: {e}");
-            return;
-        }
-    };
+            format!("attributes request {request_id} failed: {e}")
+        })?;
     let body = serde_json::json!({
         "client": attributes_to_json(&response.client_attributes),
         "shared": attributes_to_json(&response.shared_attributes),
@@ -749,6 +737,7 @@ async fn handle_attributes_request(
         }),
     )
     .await;
+    Ok(())
 }
 
 async fn report_activity(state: &TransportState, session: &Session) {
@@ -951,6 +940,180 @@ mod tests {
         assert!(!registry.contains_key("root"));
         assert!(!registry.contains_key("sub-device"));
         assert!(registry.contains_key("unrelated"));
+    }
+
+    fn test_framed() -> (Framed<MqttStream, MqttCodec>, tokio::io::DuplexStream) {
+        let (server, client) = tokio::io::duplex(64 * 1024);
+        (
+            Framed::new(Box::new(server) as MqttStream, MqttCodec::default()),
+            client,
+        )
+    }
+
+    /// 不可达 broker：限流在投递前拒绝，Kafka 发送在 message.timeout 后失败。
+    fn unreachable_state() -> TransportState {
+        TransportState::new("127.0.0.1:1", &format!("unit-{}", Uuid::now_v7().simple()))
+            .expect("transport state")
+    }
+
+    fn qos1_publish(topic: &str, payload: &str) -> MqttPacket {
+        MqttPacket::Publish(PublishPacket {
+            dup: false,
+            qos: 1,
+            retain: false,
+            topic: topic.into(),
+            packet_id: Some(7),
+            payload: Bytes::from(payload.to_string()),
+        })
+    }
+
+    async fn assert_nothing_sent(client: &mut tokio::io::DuplexStream) {
+        use tokio::io::AsyncReadExt as _;
+        let mut buf = [0u8; 16];
+        let read = tokio::time::timeout(Duration::from_millis(100), client.read(&mut buf)).await;
+        assert!(read.is_err(), "unexpected bytes sent to client: {read:?}");
+    }
+
+    fn gateway_session_with_sub_device(name: &str) -> Session {
+        let mut session = empty_session();
+        session.is_gateway = true;
+        session.sub_devices.insert(
+            name.into(),
+            SubDevice {
+                info: core_pb::SessionInfoProto::default(),
+                device: pb::DeviceInfoProto {
+                    device_name: name.into(),
+                    ..Default::default()
+                },
+            },
+        );
+        session
+    }
+
+    #[tokio::test]
+    async fn rate_limited_qos1_uplinks_are_not_acked() {
+        let state = unreachable_state();
+        state.transport_api.set_rate_limit(1);
+        let two_points = r#"[{"ts":1,"values":{"a":1}},{"ts":2,"values":{"b":2}}]"#;
+        let cases = [
+            (TOPIC_TELEMETRY, two_points),
+            (
+                crate::gateway::TOPIC_TELEMETRY,
+                r#"{"sub":[{"ts":1,"values":{"a":1}},{"ts":2,"values":{"b":2}}]}"#,
+            ),
+        ];
+        for (topic, payload) in cases {
+            let (mut framed, mut client) = test_framed();
+            let mut session = gateway_session_with_sub_device("sub");
+            let result = handle(
+                &mut framed,
+                &state,
+                &mut session,
+                qos1_publish(topic, payload),
+            )
+            .await;
+            assert!(
+                result.as_ref().is_err_and(|e| e.contains("rate limit")),
+                "{topic}: {result:?}"
+            );
+            assert_nothing_sent(&mut client).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_qos1_uplinks_are_not_acked() {
+        let state = unreachable_state();
+        let cases = [
+            (TOPIC_TELEMETRY, "not json"),
+            (TOPIC_ATTRIBUTES, "[1,2]"),
+            (TOPIC_CLAIM, "[]"),
+            ("v1/devices/me/rpc/request/1", "{}"),
+            ("v1/devices/me/rpc/response/abc", "{}"),
+            ("v1/devices/me/attributes/request/1", "nope"),
+            (crate::gateway::TOPIC_CONNECT, "{}"),
+            (crate::gateway::TOPIC_DISCONNECT, "{}"),
+            (
+                crate::gateway::TOPIC_TELEMETRY,
+                r#"{"sub":"not-telemetry"}"#,
+            ),
+            (crate::gateway::TOPIC_ATTRIBUTES, r#"{"sub":[1]}"#),
+            (crate::gateway::TOPIC_ATTRIBUTES_REQUEST, "{}"),
+            (crate::gateway::TOPIC_RPC, r#"{"device":"sub"}"#),
+        ];
+        for (topic, payload) in cases {
+            let (mut framed, mut client) = test_framed();
+            let mut session = gateway_session_with_sub_device("sub");
+            let result = handle(
+                &mut framed,
+                &state,
+                &mut session,
+                qos1_publish(topic, payload),
+            )
+            .await;
+            assert!(result.is_err(), "{topic} {payload} should be rejected");
+            assert_nothing_sent(&mut client).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn kafka_failures_are_not_acked() {
+        let state = unreachable_state();
+        let run = |topic: &'static str, payload: &'static str| {
+            let state = state.clone();
+            async move {
+                let (mut framed, mut client) = test_framed();
+                let mut session = gateway_session_with_sub_device("sub");
+                let result = handle(
+                    &mut framed,
+                    &state,
+                    &mut session,
+                    qos1_publish(topic, payload),
+                )
+                .await;
+                assert!(result.is_err(), "{topic} should fail without Kafka");
+                assert_nothing_sent(&mut client).await;
+                assert!(
+                    session.sub_devices.len() == 1,
+                    "{topic} must not add sub-devices"
+                );
+            }
+        };
+        tokio::join!(
+            run(TOPIC_CLAIM, r#"{"secretKey":"s"}"#),
+            run(TOPIC_TELEMETRY, r#"{"a":1}"#),
+            run(TOPIC_ATTRIBUTES, r#"{"a":1}"#),
+            run("v1/devices/me/rpc/request/1", r#"{"method":"m"}"#),
+            run("v1/devices/me/rpc/response/5", r#"{"ok":true}"#),
+            run(crate::gateway::TOPIC_CONNECT, r#"{"device":"new"}"#),
+            run(crate::gateway::TOPIC_TELEMETRY, r#"{"sub":{"a":1}}"#),
+            run(crate::gateway::TOPIC_ATTRIBUTES, r#"{"sub":{"a":1}}"#),
+            run(
+                crate::gateway::TOPIC_RPC,
+                r#"{"device":"sub","data":{"id":1,"response":{}}}"#
+            ),
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_topic_is_still_acked() {
+        let state = unreachable_state();
+        let (mut framed, mut client) = test_framed();
+        let mut session = empty_session();
+        handle(
+            &mut framed,
+            &state,
+            &mut session,
+            qos1_publish("v1/unknown", "x"),
+        )
+        .await
+        .unwrap();
+        let mut reader = Framed::new(&mut client, MqttCodec::default());
+        let ack = tokio::time::timeout(Duration::from_secs(1), reader.next())
+            .await
+            .expect("puback")
+            .expect("frame")
+            .expect("decode");
+        assert!(matches!(ack, MqttPacket::PubAck(7)));
     }
 
     #[test]

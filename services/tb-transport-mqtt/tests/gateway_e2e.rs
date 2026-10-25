@@ -254,8 +254,8 @@ async fn gateway_e2e() {
     assert_eq!(resp.status(), StatusCode::OK);
     let unowned: Value = resp.json().await.unwrap();
     let unowned_id = unowned["id"].as_str().unwrap();
-    let other_gateway = connect_until_success(mqtt_addr, "gw-e2e-2", "GW2_TOKEN").await;
     for device_name in ["gw-sub-1", "admin-unowned-device"] {
+        let mut other_gateway = connect_until_success(mqtt_addr, "gw-e2e-2", "GW2_TOKEN").await;
         other_gateway
             .client
             .publish(
@@ -266,7 +266,24 @@ async fn gateway_e2e() {
             )
             .await
             .unwrap();
+        // 绑定被拒：connect 不确认，连接关闭。
+        let acked = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match other_gateway.rx.recv().await {
+                    Some(PumpEvent::Packet(Packet::PubAck(_))) => return true,
+                    Some(PumpEvent::Packet(_)) => {}
+                    _ => return false,
+                }
+            }
+        })
+        .await
+        .expect("rejected gateway connect must close the connection");
+        assert!(
+            !acked,
+            "rejected connect for {device_name} was acknowledged"
+        );
     }
+    let mut other_gateway = connect_until_success(mqtt_addr, "gw-e2e-2", "GW2_TOKEN").await;
     other_gateway
         .client
         .publish(
@@ -281,6 +298,11 @@ async fn gateway_e2e() {
         )
         .await
         .unwrap();
+    // 未 connect 的子设备数据按无效数据丢弃。
+    wait_for(&mut other_gateway.rx, Duration::from_secs(10), |p| {
+        matches!(p, Packet::PubAck(_))
+    })
+    .await;
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(
         latest_telemetry(&client, &core, &admin_token, &sub_id).await["temperature"][0]["value"],

@@ -25,14 +25,18 @@ use crate::codec::MqttPacket;
 /// 订阅标志位 sentinel：未订阅。
 pub const UNSUBSCRIBED: u8 = 0xFF;
 
-/// 上行 publish 结果记录：限流静默丢弃（debug，MQTT 无错误回执语义），其余 warn。
-pub fn log_publish_result(result: tb_common::TbResult<()>, context: &str) {
+/// 上行 publish 失败时拒绝确认，由会话层关闭连接并让客户端重试。
+pub fn check_publish_result(result: tb_common::TbResult<()>, context: &str) -> Result<(), String> {
     match result {
-        Ok(()) => {}
-        Err(tb_common::TbError::RateLimitExceeded(_)) => {
-            tracing::debug!("{context}: dropped by tenant rate limit");
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if matches!(e, tb_common::TbError::RateLimitExceeded(_)) {
+                tracing::debug!("{context}: dropped by tenant rate limit");
+            } else {
+                tracing::warn!("{context}: {e}");
+            }
+            Err(format!("{context}: {e}"))
         }
-        Err(e) => tracing::warn!("{context}: {e}"),
     }
 }
 

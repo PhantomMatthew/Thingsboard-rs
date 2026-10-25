@@ -26,12 +26,13 @@ pub const TOPIC_ATTRIBUTES_REQUEST: &str = "v1/gateway/attributes/request";
 pub const TOPIC_ATTRIBUTES_RESPONSE: &str = "v1/gateway/attributes/response";
 pub const TOPIC_RPC: &str = "v1/gateway/rpc";
 
+/// 返回 Err 时会话层不 PUBACK 并关闭连接，由网关重连后重发。
 pub async fn handle_publish(
     framed: &mut Framed<MqttStream, MqttCodec>,
     state: &TransportState,
     session: &mut Session,
     p: PublishPacket,
-) {
+) -> Result<(), String> {
     match p.topic.as_str() {
         TOPIC_CONNECT => on_connect(state, session, &p.payload).await,
         TOPIC_DISCONNECT => on_disconnect(state, session, &p.payload).await,
@@ -39,7 +40,10 @@ pub async fn handle_publish(
         TOPIC_ATTRIBUTES => on_attributes(state, session, &p.payload).await,
         TOPIC_ATTRIBUTES_REQUEST => on_attributes_request(framed, state, session, &p.payload).await,
         TOPIC_RPC => on_rpc(state, session, &p.payload).await,
-        other => tracing::debug!(topic = other, "ignored gateway publish topic"),
+        other => {
+            tracing::debug!(topic = other, "ignored gateway publish topic");
+            Ok(())
+        }
     }
 }
 
@@ -49,11 +53,13 @@ struct ConnectPayload {
     r#type: Option<String>,
 }
 
-async fn on_connect(state: &TransportState, session: &mut Session, payload: &[u8]) {
-    let Ok(req) = serde_json::from_slice::<ConnectPayload>(payload) else {
-        tracing::warn!("bad gateway connect payload");
-        return;
-    };
+async fn on_connect(
+    state: &TransportState,
+    session: &mut Session,
+    payload: &[u8],
+) -> Result<(), String> {
+    let req = serde_json::from_slice::<ConnectPayload>(payload)
+        .map_err(|e| format!("bad gateway connect payload: {e}"))?;
     let device = state
         .transport_api
         .get_or_create_gateway_device(
@@ -61,14 +67,11 @@ async fn on_connect(state: &TransportState, session: &mut Session, payload: &[u8
             &req.device,
             req.r#type.as_deref().unwrap_or(""),
         )
-        .await;
-    let device = match device {
-        Ok(d) => d,
-        Err(e) => {
+        .await
+        .map_err(|e| {
             tracing::warn!(device = req.device, "gateway get-or-create failed: {e}");
-            return;
-        }
-    };
+            format!("gateway get-or-create {} failed: {e}", req.device)
+        })?;
     // 同名重复 connect：先关闭旧子会话。
     if let Some(old) = session.sub_devices.remove(&device.device_name) {
         session::send_core(
@@ -103,14 +106,21 @@ async fn on_connect(state: &TransportState, session: &mut Session, payload: &[u8
             gateway_device: Some(device.device_name.clone()),
         },
     );
-    session::send_core(
+    if let Err(e) = session::send_core_result(
         state,
         &device,
         core_pb::to_core_msg::Msg::SessionOpen(core_pb::SessionOpenMsg {
             session: Some(info.clone()),
         }),
     )
-    .await;
+    .await
+    {
+        state.sessions.remove(&info.session_id);
+        return Err(format!(
+            "gateway sub-device {} session open failed: {e}",
+            device.device_name
+        ));
+    }
     if rpc_subscribed != UNSUBSCRIBED {
         session::send_core(
             state,
@@ -126,6 +136,7 @@ async fn on_connect(state: &TransportState, session: &mut Session, payload: &[u8
     session
         .sub_devices
         .insert(device.device_name.clone(), SubDevice { info, device });
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,12 +144,15 @@ struct DisconnectPayload {
     device: String,
 }
 
-async fn on_disconnect(state: &TransportState, session: &mut Session, payload: &[u8]) {
-    let Ok(req) = serde_json::from_slice::<DisconnectPayload>(payload) else {
-        tracing::warn!("bad gateway disconnect payload");
-        return;
-    };
+async fn on_disconnect(
+    state: &TransportState,
+    session: &mut Session,
+    payload: &[u8],
+) -> Result<(), String> {
+    let req = serde_json::from_slice::<DisconnectPayload>(payload)
+        .map_err(|e| format!("bad gateway disconnect payload: {e}"))?;
     close_sub_device(state, session, &req.device, "gateway disconnect").await;
+    Ok(())
 }
 
 /// 关闭单个子设备会话：session_close 回流 core + 移除注册表。
@@ -172,36 +186,42 @@ pub async fn close_all_sub_devices(state: &TransportState, session: &mut Session
 }
 
 /// {"deviceA": {"ts":ms,"values":{...}} | [...] | {k:v}}：逐子设备上行，originator=子设备。
-async fn on_telemetry(state: &TransportState, session: &Session, payload: &[u8]) {
-    let Ok(map) = serde_json::from_slice::<HashMap<String, Value>>(payload) else {
-        tracing::warn!("bad gateway telemetry payload");
-        return;
-    };
+/// 未 connect 的子设备数据按无效数据丢弃；任一已连接子设备投递失败则整包不确认。
+async fn on_telemetry(
+    state: &TransportState,
+    session: &Session,
+    payload: &[u8],
+) -> Result<(), String> {
+    let map = serde_json::from_slice::<HashMap<String, Value>>(payload)
+        .map_err(|e| format!("bad gateway telemetry payload: {e}"))?;
+    let mut batches = Vec::with_capacity(map.len());
     for (name, value) in map {
         let Some(sub) = session.sub_devices.get(&name) else {
             tracing::warn!(device = name, "telemetry for unknown sub-device");
             continue;
         };
-        match session::parse_telemetry(&serde_json::to_vec(&value).unwrap_or_default()) {
-            Ok(entries) => {
-                let res = state
-                    .transport_api
-                    .publish_telemetry(&sub.device, entries)
-                    .await;
-                crate::log_publish_result(res, "gateway telemetry publish failed");
-            }
-            Err(e) => tracing::warn!(device = name, "bad gateway telemetry values: {e}"),
-        }
+        let entries = session::parse_telemetry(&serde_json::to_vec(&value).unwrap_or_default())
+            .map_err(|e| format!("bad gateway telemetry values for {name}: {e}"))?;
+        batches.push((sub, entries));
     }
+    for (sub, entries) in batches {
+        let res = state
+            .transport_api
+            .publish_telemetry(&sub.device, entries)
+            .await;
+        crate::check_publish_result(res, "gateway telemetry publish failed")?;
+    }
+    Ok(())
 }
 
 /// {"deviceA": {k:v}}：逐子设备 CLIENT_SCOPE 属性上行。
-async fn on_attributes(state: &TransportState, session: &Session, payload: &[u8]) {
-    let Ok(map) = serde_json::from_slice::<HashMap<String, HashMap<String, KvValue>>>(payload)
-    else {
-        tracing::warn!("bad gateway attributes payload");
-        return;
-    };
+async fn on_attributes(
+    state: &TransportState,
+    session: &Session,
+    payload: &[u8],
+) -> Result<(), String> {
+    let map = serde_json::from_slice::<HashMap<String, HashMap<String, KvValue>>>(payload)
+        .map_err(|e| format!("bad gateway attributes payload: {e}"))?;
     for (name, values) in map {
         let Some(sub) = session.sub_devices.get(&name) else {
             tracing::warn!(device = name, "attributes for unknown sub-device");
@@ -215,8 +235,9 @@ async fn on_attributes(state: &TransportState, session: &Session, payload: &[u8]
             .transport_api
             .publish_attributes(&sub.device, entries)
             .await;
-        crate::log_publish_result(res, "gateway attributes publish failed");
+        crate::check_publish_result(res, "gateway attributes publish failed")?;
     }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -245,17 +266,15 @@ async fn on_attributes_request(
     state: &TransportState,
     session: &Session,
     payload: &[u8],
-) {
-    let Ok(req) = serde_json::from_slice::<AttributesRequestPayload>(payload) else {
-        tracing::warn!("bad gateway attributes request payload");
-        return;
-    };
+) -> Result<(), String> {
+    let req = serde_json::from_slice::<AttributesRequestPayload>(payload)
+        .map_err(|e| format!("bad gateway attributes request payload: {e}"))?;
     let Some(sub) = session.sub_devices.get(&req.device) else {
         tracing::warn!(
             device = req.device,
             "attributes request for unknown sub-device"
         );
-        return;
+        return Ok(());
     };
     let (client_keys, shared_keys) = if req.client {
         (req.keys.clone(), Vec::new())
@@ -265,11 +284,14 @@ async fn on_attributes_request(
     let resp = state
         .transport_api
         .get_attributes(&sub.device.device_id, client_keys, shared_keys)
-        .await;
-    let Ok(resp) = resp else {
-        tracing::warn!(device = req.device, "gateway attributes request failed");
-        return;
-    };
+        .await
+        .map_err(|e| {
+            tracing::warn!(
+                device = req.device,
+                "gateway attributes request failed: {e}"
+            );
+            format!("gateway attributes request for {} failed: {e}", req.device)
+        })?;
     let kvs = if req.client {
         &resp.client_attributes
     } else {
@@ -296,6 +318,7 @@ async fn on_attributes_request(
         }),
     )
     .await;
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -312,14 +335,12 @@ struct RpcData {
 }
 
 /// 子设备 RPC 响应上行：{"device","data":{"id","response"|"error"}} → core 完成 pending。
-async fn on_rpc(state: &TransportState, session: &Session, payload: &[u8]) {
-    let Ok(rpc) = serde_json::from_slice::<RpcPayload>(payload) else {
-        tracing::warn!("bad gateway rpc payload");
-        return;
-    };
+async fn on_rpc(state: &TransportState, session: &Session, payload: &[u8]) -> Result<(), String> {
+    let rpc = serde_json::from_slice::<RpcPayload>(payload)
+        .map_err(|e| format!("bad gateway rpc payload: {e}"))?;
     let Some(sub) = session.sub_devices.get(&rpc.device) else {
         tracing::warn!(device = rpc.device, "rpc response for unknown sub-device");
-        return;
+        return Ok(());
     };
     let (payload_json, error) = match (rpc.data.response, rpc.data.error) {
         (Some(response), _) => (response.to_string(), String::new()),
@@ -332,8 +353,7 @@ async fn on_rpc(state: &TransportState, session: &Session, payload: &[u8]) {
         .get(&route_key)
         .await
         .unwrap_or_default();
-    state.rpc_reply_nodes.invalidate(&route_key).await;
-    session::send_core(
+    session::send_core_result(
         state,
         &sub.device,
         core_pb::to_core_msg::Msg::RpcResponse(core_pb::RpcResponseMsg {
@@ -344,7 +364,9 @@ async fn on_rpc(state: &TransportState, session: &Session, payload: &[u8]) {
             reply_node_id,
         }),
     )
-    .await;
+    .await?;
+    state.rpc_reply_nodes.invalidate(&route_key).await;
+    Ok(())
 }
 
 /// 网关订阅 v1/gateway/rpc：存量子设备逐个发 subscribe_rpc，后续 connect 的子设备自动带上。

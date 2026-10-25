@@ -511,12 +511,14 @@ async fn dispatch(state: &TransportState, request: &CoapRequest<SocketAddr>) -> 
                 if observer.device.device_id != device.device_id {
                     return None;
                 }
-                let (_, (reply_node_id, _)) = observer.rpc_reply_nodes.remove(&request_id)?;
-                Some((observer.info.clone(), reply_node_id))
+                let reply_node_id = observer.rpc_reply_nodes.get(&request_id)?.0.clone();
+                Some((observer.clone(), reply_node_id))
             });
-            let (info, reply_node_id) =
-                route.unwrap_or_else(|| (session_info(state, &device, ""), String::new()));
-            send_core(
+            let (info, reply_node_id) = route
+                .as_ref()
+                .map(|(observer, reply_node_id)| (observer.info.clone(), reply_node_id.clone()))
+                .unwrap_or_else(|| (session_info(state, &device, ""), String::new()));
+            let sent = send_core_result(
                 state,
                 &device,
                 core_pb::to_core_msg::Msg::RpcResponse(core_pb::RpcResponseMsg {
@@ -528,7 +530,18 @@ async fn dispatch(state: &TransportState, request: &CoapRequest<SocketAddr>) -> 
                 }),
             )
             .await;
-            reply(request, ResponseType::Changed, Vec::new())
+            match sent {
+                Ok(()) => {
+                    if let Some((observer, _)) = route {
+                        observer.rpc_reply_nodes.remove(&request_id);
+                    }
+                    reply(request, ResponseType::Changed, Vec::new())
+                }
+                Err(e) => {
+                    tracing::warn!("CoAP rpc response publish failed: {e}");
+                    reply(request, ResponseType::InternalServerError, Vec::new())
+                }
+            }
         }
         (RequestType::Post, "claim", None) => {
             let device = match validate(state, token).await {
