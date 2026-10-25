@@ -155,6 +155,79 @@ async fn provision_e2e() {
     let resp = provision_request(mqtt_addr, "prov-dev-1", "PROV_KEY", "WRONG").await;
     assert_eq!(resp["status"], "FAILURE");
 
+    let resp = client
+        .post(format!("{core}/api/deviceProfile"))
+        .header("Authorization", bearer(&admin_token))
+        .json(&json!({
+            "name": "duplicate-provision-key",
+            "provisionType": "ALLOW_CREATE_NEW_DEVICES",
+            "profileData": {"provisionConfiguration": {
+                "provisionDeviceKey": "PROV_KEY", "provisionDeviceSecret": "OTHER"
+            }},
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    let resp = client
+        .post(format!("{core}/api/device"))
+        .header("Authorization", bearer(&admin_token))
+        .json(&json!({"name": "admin-owned-device", "accessToken": "ADMIN_OWNED_TOKEN"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let admin_device: Value = resp.json().await.unwrap();
+    let admin_device_id = admin_device["id"].as_str().unwrap();
+    let resp = provision_request(mqtt_addr, "admin-owned-device", "PROV_KEY", "PROV_SECRET").await;
+    assert_eq!(resp["status"], "FAILURE");
+    let resp = client
+        .get(format!("{core}/api/device/{admin_device_id}/credentials"))
+        .header("Authorization", bearer(&admin_token))
+        .send()
+        .await
+        .unwrap();
+    let credentials: Value = resp.json().await.unwrap();
+    assert_eq!(credentials["credentialsId"], "ADMIN_OWNED_TOKEN");
+
+    let resp = client
+        .post(format!("{core}/api/deviceProfile"))
+        .header("Authorization", bearer(&admin_token))
+        .json(&json!({
+            "name": "pre-provisioned-profile",
+            "provisionType": "CHECK_PRE_PROVISIONED_DEVICES",
+            "profileData": {"provisionConfiguration": {
+                "provisionDeviceKey": "CHECK_KEY", "provisionDeviceSecret": "CHECK_SECRET"
+            }},
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let check_profile: Value = resp.json().await.unwrap();
+    let resp = client
+        .post(format!("{core}/api/device"))
+        .header("Authorization", bearer(&admin_token))
+        .json(&json!({
+            "name": "pre-provisioned-device",
+            "deviceProfileId": check_profile["id"],
+            "accessToken": "PRE_PROVISIONED_TOKEN"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = provision_request(
+        mqtt_addr,
+        "pre-provisioned-device",
+        "CHECK_KEY",
+        "CHECK_SECRET",
+    )
+    .await;
+    assert_eq!(resp["status"], "SUCCESS");
+    assert_eq!(resp["credentialsValue"], "PRE_PROVISIONED_TOKEN");
+
     // 正确 key/secret → SUCCESS + ACCESS_TOKEN 凭证
     let resp = provision_request(mqtt_addr, "prov-dev-1", "PROV_KEY", "PROV_SECRET").await;
     assert_eq!(resp["status"], "SUCCESS", "provision failed: {resp}");

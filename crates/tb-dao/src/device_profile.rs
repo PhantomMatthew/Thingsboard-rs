@@ -73,9 +73,10 @@ impl DeviceProfileDao {
         key: &str,
     ) -> TbResult<Option<DeviceProfile>> {
         sqlx::query_as::<_, DeviceProfile>(
-            "SELECT * FROM device_profile WHERE provision_type != 'DISABLED' \
+            "SELECT * FROM device_profile \
+             WHERE provision_type IN ('ALLOW_CREATE_NEW_DEVICES', 'CHECK_PRE_PROVISIONED_DEVICES') \
              AND profile_data->'provisionConfiguration'->>'provisionDeviceKey' = $1 \
-             AND ($2::uuid IS NULL OR tenant_id = $2) LIMIT 1",
+             AND $1 <> '' AND ($2::uuid IS NULL OR tenant_id = $2)",
         )
         .bind(key)
         .bind(tenant_id)

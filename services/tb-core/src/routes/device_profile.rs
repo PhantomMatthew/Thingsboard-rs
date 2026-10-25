@@ -88,6 +88,28 @@ async fn save_profile(
         firmware_id: req.firmware_id,
         software_id: req.software_id,
     };
+    if matches!(
+        profile.provision_type.as_str(),
+        "ALLOW_CREATE_NEW_DEVICES" | "CHECK_PRE_PROVISIONED_DEVICES"
+    ) {
+        let key = profile
+            .profile_data
+            .get("provisionConfiguration")
+            .and_then(|config| config.get("provisionDeviceKey"))
+            .and_then(|value| value.as_str())
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| {
+                TbError::InvalidInput("provisionDeviceKey is required for provisioning".into())
+            })?;
+        if state
+            .device_profile_dao
+            .find_by_provision_key(None, key)
+            .await?
+            .is_some_and(|existing| existing.id != profile.id)
+        {
+            return Err(TbError::Conflict("provisionDeviceKey already exists".into()).into());
+        }
+    }
     let saved = state.device_profile_dao.save(&profile).await?;
     audit(
         &state,

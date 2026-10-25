@@ -4,6 +4,7 @@
 use bytes::Bytes;
 use prost::Message as _;
 use rustls_pki_types::{CertificateDer, UnixTime};
+use sha2::{Digest, Sha256};
 use tb_common::{EntityType, TbError, TbResult};
 use tb_dao::models::{
     CredentialsType, Device, DeviceCredentials, DeviceProfile, EntityRelation, OtaPackage,
@@ -815,6 +816,55 @@ async fn get_ota_chunk(state: &AppState, r: &pb::GetOtaChunkRequest) -> pb::GetO
     pb::GetOtaChunkResponse { data }
 }
 
+const MAX_PROVISION_FAILURES: u32 = 20;
+const PROVISION_FAILURE_WINDOW_MS: usize = 60_000;
+
+fn provision_failure_key(key: &str) -> String {
+    format!(
+        "provision:failures:{}",
+        hex::encode(Sha256::digest(key.as_bytes()))
+    )
+}
+
+async fn provision_rate_limited(state: &AppState, key: &str) -> TbResult<bool> {
+    let mut redis = state.redis_manager().await.map_err(TbError::internal)?;
+    let failures: Option<u32> = redis::cmd("GET")
+        .arg(provision_failure_key(key))
+        .query_async(&mut redis)
+        .await
+        .map_err(TbError::internal)?;
+    Ok(failures.is_some_and(|count| count >= MAX_PROVISION_FAILURES))
+}
+
+async fn record_provision_failure(state: &AppState, key: &str) -> TbResult<()> {
+    let mut redis = state.redis_manager().await.map_err(TbError::internal)?;
+    let redis_key = provision_failure_key(key);
+    let failures: u32 = redis::cmd("INCR")
+        .arg(&redis_key)
+        .query_async(&mut redis)
+        .await
+        .map_err(TbError::internal)?;
+    if failures == 1 {
+        let _: bool = redis::cmd("PEXPIRE")
+            .arg(redis_key)
+            .arg(PROVISION_FAILURE_WINDOW_MS)
+            .query_async(&mut redis)
+            .await
+            .map_err(TbError::internal)?;
+    }
+    Ok(())
+}
+
+async fn clear_provision_failures(state: &AppState, key: &str) -> TbResult<()> {
+    let mut redis = state.redis_manager().await.map_err(TbError::internal)?;
+    let _: usize = redis::cmd("DEL")
+        .arg(provision_failure_key(key))
+        .query_async(&mut redis)
+        .await
+        .map_err(TbError::internal)?;
+    Ok(())
+}
+
 /// 设备 provisioning：profile_data.provisionConfiguration 校验 key/secret；
 /// ALLOW_CREATE_NEW_DEVICES 可就地建设备，CHECK_PRE_PROVISIONED_DEVICES 要求设备已存在。
 async fn provision_device(
@@ -848,21 +898,47 @@ async fn provision_device(
             return failure("internal error");
         }
     };
-    let configured_secret = profile
+    let Some(configured_secret) = profile
         .profile_data
         .get("provisionConfiguration")
         .and_then(|c| c.get("provisionDeviceSecret"))
         .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if configured_secret != r.provision_device_secret {
+        .filter(|secret| !secret.is_empty())
+    else {
+        return failure("provision secret is not configured");
+    };
+    match provision_rate_limited(state, &r.provision_device_key).await {
+        Ok(true) => return failure("too many failed provision attempts"),
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!("provision rate limit lookup failed: {e}");
+            return failure("internal error");
+        }
+    }
+    if !constant_time_eq(configured_secret, &r.provision_device_secret) {
+        if let Err(e) = record_provision_failure(state, &r.provision_device_key).await {
+            tracing::warn!("provision failure counter update failed: {e}");
+            return failure("internal error");
+        }
         return failure("invalid provision secret");
+    }
+    if let Err(e) = clear_provision_failures(state, &r.provision_device_key).await {
+        tracing::warn!("provision failure counter reset failed: {e}");
+        return failure("internal error");
     }
     let device = match state
         .device_dao
         .find_by_name(profile.tenant_id, &r.device_name)
         .await
     {
-        Ok(Some(d)) => d,
+        Ok(Some(d)) => {
+            if profile.provision_type != "CHECK_PRE_PROVISIONED_DEVICES"
+                || d.device_profile_id != profile.id
+            {
+                return failure("existing device is not pre-provisioned by this profile");
+            }
+            d
+        }
         Ok(None) => {
             if profile.provision_type != "ALLOW_CREATE_NEW_DEVICES" {
                 return failure("device not pre-provisioned");

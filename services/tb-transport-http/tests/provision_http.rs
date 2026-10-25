@@ -106,4 +106,33 @@ async fn http_provision_e2e() {
             .is_some_and(|a| a.iter().any(|e| e["value"] == "http-provision"))
     })
     .await;
+
+    for _ in 0..20 {
+        let resp = client
+            .post(format!("{transport}/api/v1/provision"))
+            .json(&json!({
+                "deviceName": "rate-limited-device",
+                "provisionDeviceKey": "HTTP_KEY",
+                "provisionDeviceSecret": "WRONG",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "FAILURE");
+    }
+    let resp = client
+        .post(format!("{transport}/api/v1/provision"))
+        .json(&json!({
+            "deviceName": "rate-limited-device",
+            "provisionDeviceKey": "HTTP_KEY",
+            "provisionDeviceSecret": "HTTP_SECRET",
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "FAILURE");
+    assert_eq!(body["errorMsg"], "too many failed provision attempts");
 }
