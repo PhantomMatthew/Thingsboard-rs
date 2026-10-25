@@ -117,6 +117,115 @@ async fn edqs_proxy_entity_data_query() {
     }
     assert!(found, "device did not appear in edqs proxy query");
 
+    let (customer_a, customer_a_token) = create_customer_user(
+        &client,
+        &base,
+        &token,
+        "EDQS Customer A",
+        "customer.a@edqs.io",
+    )
+    .await;
+    let (customer_b, _) = create_customer_user(
+        &client,
+        &base,
+        &token,
+        "EDQS Customer B",
+        "customer.b@edqs.io",
+    )
+    .await;
+    let other_device_id = create_device(&client, &base, &token, "EDQS Other Customer Device").await;
+    assign_device(&client, &base, &token, &device_id, &customer_a).await;
+    assign_device(&client, &base, &token, &other_device_id, &customer_b).await;
+
+    let all_query = json!({
+        "tenantId": tenant_id,
+        "entityFilter": {"type": "ALL"},
+        "fields": [{"key": "name", "source": "ENTITY_FIELD"}]
+    });
+    let mut both_visible = false;
+    for _ in 0..75 {
+        let resp = client
+            .post(format!("{base}/api/edqs/query/entityData"))
+            .header("Authorization", bearer(&token))
+            .json(&all_query)
+            .send()
+            .await
+            .unwrap();
+        let body: Value = resp.json().await.unwrap();
+        if body["totalElements"] == 2 {
+            both_visible = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(both_visible, "customer assignments did not reach edqs");
+
+    let scoped_query = json!({
+        "tenantId": tenant_id,
+        "customerId": customer_b,
+        "entityFilter": {"type": "ENTITY_IDS", "ids": [device_id, other_device_id]},
+        "fields": [{"key": "name", "source": "ENTITY_FIELD"}]
+    });
+    let resp = client
+        .post(format!("{base}/api/edqs/query/entityData"))
+        .header("Authorization", bearer(&customer_a_token))
+        .json(&scoped_query)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["totalElements"], 1);
+    assert_eq!(body["data"][0]["entityId"], device_id);
+
+    let resp = client
+        .get(format!("{base}/api/edqs/query/entityData"))
+        .header("Authorization", bearer(&customer_a_token))
+        .query(&[
+            ("tenantId", tenant_id.as_str()),
+            ("customerId", customer_b.as_str()),
+            ("entityType", "DEVICE"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["totalElements"], 1);
+    assert_eq!(body["data"][0]["entityId"], device_id);
+
+    let resp = client
+        .post(format!("http://{edqs_addr}/api/query/entityData"))
+        .header("X-EDQS-KEY", "edqs-proxy-test-key")
+        .json(&json!({
+            "tenantId": tenant_id,
+            "customerId": customer_a,
+            "entityFilter": {"type": "ENTITY_IDS", "ids": [device_id, other_device_id]}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["totalElements"], 1);
+    assert_eq!(body["data"][0]["entityId"], device_id);
+
+    let resp = client
+        .get(format!("http://{edqs_addr}/api/query/entityData"))
+        .header("X-EDQS-KEY", "edqs-proxy-test-key")
+        .query(&[
+            ("tenantId", tenant_id.as_str()),
+            ("customerId", customer_a.as_str()),
+            ("entityType", "DEVICE"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["totalElements"], 1);
+    assert_eq!(body["data"][0]["entityId"], device_id);
+
     // 新遥测经 Kafka 事件到达（快照之后的数据）。
     let resp = client
         .post(format!(
@@ -153,6 +262,58 @@ async fn edqs_proxy_entity_data_query() {
     assert!(updated, "post-snapshot telemetry did not reach edqs");
 
     consumer.abort();
+}
+
+async fn create_customer_user(
+    client: &reqwest::Client,
+    base: &str,
+    admin_token: &str,
+    title: &str,
+    email: &str,
+) -> (String, String) {
+    let resp = client
+        .post(format!("{base}/api/customer"))
+        .header("Authorization", bearer(admin_token))
+        .json(&json!({"title": title}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let customer: Value = resp.json().await.unwrap();
+    let customer_id = customer["id"].as_str().unwrap().to_string();
+    let resp = client
+        .post(format!("{base}/api/user"))
+        .header("Authorization", bearer(admin_token))
+        .json(&json!({
+            "email": email,
+            "authority": "CUSTOMER_USER",
+            "customerId": customer_id,
+            "password": "customer",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let tokens = login(client, base, email, "customer").await;
+    (customer_id, tokens["token"].as_str().unwrap().to_string())
+}
+
+async fn assign_device(
+    client: &reqwest::Client,
+    base: &str,
+    admin_token: &str,
+    device_id: &str,
+    customer_id: &str,
+) {
+    let resp = client
+        .post(format!(
+            "{base}/api/device/{device_id}/assign/{customer_id}"
+        ))
+        .header("Authorization", bearer(admin_token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 async fn edqs_returning(status: StatusCode) -> String {
@@ -404,4 +565,106 @@ async fn edqs_proxy_non_unavailable_response_is_not_replaced_by_fallback() {
         resp.json::<Value>().await.unwrap(),
         json!({"source": "edqs"})
     );
+}
+
+#[tokio::test]
+async fn edqs_customer_scope_is_enforced_during_postgres_fallback() {
+    let _guard = INTEGRATION_LOCK.lock().await;
+    unsafe {
+        std::env::set_var("TB_EDQS_URL", edqs_returning(StatusCode::BAD_GATEWAY).await);
+    }
+
+    let (base, pool) = start_server_with_pool().await;
+    let client = reqwest::Client::new();
+    let (admin_token, tenant_id) = setup_tenant_admin(
+        &client,
+        &base,
+        "Fallback Customers",
+        "fallback.admin@edqs.io",
+    )
+    .await;
+    let (customer_a, customer_a_token) = create_customer_user(
+        &client,
+        &base,
+        &admin_token,
+        "Fallback Customer A",
+        "fallback.a@edqs.io",
+    )
+    .await;
+    let (customer_b, _) = create_customer_user(
+        &client,
+        &base,
+        &admin_token,
+        "Fallback Customer B",
+        "fallback.b@edqs.io",
+    )
+    .await;
+    let own_id = create_fallback_device(&pool, &tenant_id, "Fallback Own").await;
+    let other_id = create_fallback_device(&pool, &tenant_id, "Fallback Other").await;
+    assign_device(&client, &base, &admin_token, &own_id, &customer_a).await;
+    assign_device(&client, &base, &admin_token, &other_id, &customer_b).await;
+    save_telemetry_and_attribute(&pool, &own_id).await;
+    save_telemetry_and_attribute(&pool, &other_id).await;
+
+    let resp = client
+        .post(format!("{base}/api/edqs/query/entityData"))
+        .header("Authorization", bearer(&customer_a_token))
+        .json(&json!({
+            "customerId": customer_b,
+            "entityFilter": {"type": "ENTITY_IDS", "ids": [own_id, other_id]},
+            "fields": [
+                {"key": "name", "source": "ENTITY_FIELD"},
+                {"key": "temperature", "source": "LATEST"},
+                {"key": "region", "source": "SERVER"}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["totalElements"], 1);
+    assert_eq!(body["data"][0]["entityId"], own_id);
+    assert_eq!(body["data"][0]["values"]["temperature"], 42);
+    assert_eq!(body["data"][0]["values"]["region"], "eu");
+
+    let resp = client
+        .get(format!("{base}/api/edqs/query/entityData"))
+        .header("Authorization", bearer(&customer_a_token))
+        .query(&[
+            ("customerId", customer_b.as_str()),
+            ("entityType", "DEVICE"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["totalElements"], 1);
+    assert_eq!(body["data"][0]["entityId"], own_id);
+
+    let resp = client
+        .post(format!("{base}/api/user"))
+        .header("Authorization", bearer(&admin_token))
+        .json(&json!({
+            "email": "unassigned@edqs.io",
+            "authority": "CUSTOMER_USER",
+            "password": "customer"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let unassigned = login(&client, &base, "unassigned@edqs.io", "customer").await;
+    let resp = client
+        .post(format!("{base}/api/edqs/query/entityData"))
+        .header(
+            "Authorization",
+            bearer(unassigned["token"].as_str().unwrap()),
+        )
+        .json(&json!({"entityFilter": {"type": "ALL"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }

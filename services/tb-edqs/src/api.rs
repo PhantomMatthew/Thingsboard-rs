@@ -70,6 +70,7 @@ async fn query_entity_data(
 #[serde(rename_all = "camelCase")]
 pub struct GetQueryParams {
     pub tenant_id: Uuid,
+    pub customer_id: Option<Uuid>,
     pub entity_type: Option<String>,
     pub name_contains: Option<String>,
     pub page: Option<i64>,
@@ -91,6 +92,7 @@ pub fn entity_data_query(p: GetQueryParams) -> EntityDataQuery {
     };
     EntityDataQuery {
         tenant_id: p.tenant_id,
+        customer_id: p.customer_id,
         entity_filter,
         key_filters: vec![],
         page_link: PageLinkReq {
@@ -242,6 +244,7 @@ mod tests {
         });
         let query = EntityDataQuery {
             tenant_id,
+            customer_id: None,
             entity_filter: EntityFilter::All,
             key_filters: vec![],
             page_link: PageLinkReq::default(),
@@ -262,6 +265,7 @@ mod tests {
         });
         let query = EntityDataQuery {
             tenant_id,
+            customer_id: None,
             entity_filter: EntityFilter::All,
             key_filters: vec![],
             page_link: PageLinkReq::default(),

@@ -34,7 +34,7 @@ REST 是重新设计的，遥测和属性集中在 `/api/telemetry/...`。Java �
 
 没有实体视图（Entity View），也没有通用关系增删查 REST API。关系数据已用于规则链关系过滤、关联实体属性富化、关联 originator，以及网关自动创建的 `Created` 边。
 
-EDQS 只有四种过滤：全部、按类型、名称包含、按 ID。可读实体字段、最新遥测和 CLIENT/SHARED/SERVER 属性。Java 的 EDQS 还有关系过滤、设备/资产类型、单实体、实体计数、available keys、告警查询、告警计数、API 用量查询，以及按客户隔离。这里的客户用户会看到整个租户。
+EDQS 只有四种过滤：全部、按类型、名称包含、按 ID。可读实体字段、最新遥测和 CLIENT/SHARED/SERVER 属性；POST、GET、直连查询和 PostgreSQL fallback 均已强制 customer 隔离。Java 的 EDQS 还有关系过滤、设备/资产类型、单实体、实体计数、available keys、告警查询、告警计数和 API 用量查询。
 
 计算字段只做「若干遥测或属性参数 + 一条 Rhai 表达式 + 一个遥测或服务端属性输出」。Java 还有关联实体参数、向关联实体传播、多输出、调试、告警规则和 TBEL。
 

@@ -1,5 +1,5 @@
 //! /api/edqs/...：EDQS 查询代理。认证后强制 tenantId = JWT tenant（SYS_ADMIN 可指定），
-//! 转发给内网 tb-edqs；EDQS 不可用时从 PostgreSQL 装载同租户读模型并复用查询引擎。
+//! CUSTOMER_USER 强制 customerId = JWT customer；转发与 PostgreSQL fallback 复用相同隔离语义。
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -24,17 +24,24 @@ pub fn router() -> Router<AppState> {
 
 /// TENANT_ADMIN / CUSTOMER_USER 强制覆盖为自身租户；SYS_ADMIN 可指定 tenantId。
 fn resolve_tenant(user: &AuthUser, body: &mut Value) -> TbResult<Uuid> {
-    match user.0.authority {
+    let tenant_id = match user.0.authority {
         Authority::SysAdmin => {
             let raw = body["tenantId"].as_str().unwrap_or_default();
             Uuid::parse_str(raw)
-                .map_err(|_| TbError::InvalidInput("tenantId is required for SYS_ADMIN".into()))
+                .map_err(|_| TbError::InvalidInput("tenantId is required for SYS_ADMIN".into()))?
         }
         _ => {
             body["tenantId"] = json!(user.0.tenant_id.to_string());
-            Ok(user.0.tenant_id)
+            user.0.tenant_id
         }
-    }
+    };
+    body["customerId"] = match user.0.authority {
+        Authority::CustomerUser => json!(user.0.customer_id.ok_or_else(|| {
+            TbError::PermissionDenied("customer user has no customer assignment".into())
+        })?),
+        _ => Value::Null,
+    };
+    Ok(tenant_id)
 }
 
 fn with_api_key(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -105,6 +112,7 @@ async fn query_entity_data(
 #[serde(rename_all = "camelCase")]
 struct GetParams {
     tenant_id: Option<String>,
+    customer_id: Option<String>,
     entity_type: Option<String>,
     name_contains: Option<String>,
     page: Option<i64>,
@@ -121,9 +129,16 @@ fn get_query(params: GetParams) -> TbResult<tb_edqs::EntityDataQuery> {
         .and_then(|id| {
             Uuid::parse_str(id).map_err(|_| TbError::InvalidInput("invalid tenantId".into()))
         })?;
+    let customer_id = params
+        .customer_id
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|_| TbError::InvalidInput("invalid customerId".into()))?;
     Ok(tb_edqs::api::entity_data_query(
         tb_edqs::api::GetQueryParams {
             tenant_id,
+            customer_id,
             entity_type: params.entity_type,
             name_contains: params.name_contains,
             page: params.page,
@@ -142,6 +157,17 @@ async fn query_entity_data_get(
     if user.0.authority != Authority::SysAdmin {
         params.tenant_id = Some(user.0.tenant_id.to_string());
     }
+    params.customer_id = match user.0.authority {
+        Authority::CustomerUser => Some(
+            user.0
+                .customer_id
+                .ok_or_else(|| {
+                    TbError::PermissionDenied("customer user has no customer assignment".into())
+                })?
+                .to_string(),
+        ),
+        _ => None,
+    };
     let fallback_params = params.clone();
     let mut qs: Vec<(&str, String)> = vec![];
     let mut push = |k: &'static str, v: Option<String>| {
@@ -150,6 +176,7 @@ async fn query_entity_data_get(
         }
     };
     push("tenantId", params.tenant_id);
+    push("customerId", params.customer_id);
     push("entityType", params.entity_type);
     push("nameContains", params.name_contains);
     push("page", params.page.map(|v| v.to_string()));

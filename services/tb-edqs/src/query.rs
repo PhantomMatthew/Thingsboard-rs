@@ -13,6 +13,8 @@ use crate::state::{EntityRecord, TenantRepo};
 #[serde(rename_all = "camelCase")]
 pub struct EntityDataQuery {
     pub tenant_id: Uuid,
+    #[serde(default)]
+    pub customer_id: Option<Uuid>,
     pub entity_filter: EntityFilter,
     #[serde(default)]
     pub key_filters: Vec<KeyFilter>,
@@ -329,6 +331,11 @@ pub fn execute_query(repo: &TenantRepo, query: &EntityDataQuery) -> PageDataResu
     let mut matched: Vec<&EntityRecord> = repo
         .entities
         .values()
+        .filter(|r| {
+            query
+                .customer_id
+                .is_none_or(|customer_id| r.customer_id == Some(customer_id))
+        })
         .filter(|r| matches_filter(r, &query.entity_filter))
         .filter(|r| {
             query.key_filters.iter().all(|f| {
@@ -415,6 +422,7 @@ mod tests {
     fn query(page: i64, page_size: i64, sort_by: Option<SortBy>) -> EntityDataQuery {
         EntityDataQuery {
             tenant_id: Uuid::nil(),
+            customer_id: None,
             entity_filter: EntityFilter::All,
             key_filters: vec![],
             page_link: PageLinkReq {
@@ -482,5 +490,33 @@ mod tests {
         let negative_size = execute_query(&repo, &query(0, -10, None));
         assert_eq!(negative_size.data.len(), 1);
         assert_eq!(negative_size.total_pages, 1001);
+    }
+
+    #[test]
+    fn customer_scope_applies_to_every_entity_filter() {
+        let customer_id = Uuid::now_v7();
+        let mut own = record("own", 1);
+        own.customer_id = Some(customer_id);
+        let mut other = record("other", 2);
+        other.customer_id = Some(Uuid::now_v7());
+        let unassigned = record("unassigned", 3);
+        let mut repo = TenantRepo::default();
+        for entity in [own.clone(), other, unassigned] {
+            repo.upsert_entity(entity);
+        }
+
+        let mut scoped = query(0, 10, None);
+        scoped.customer_id = Some(customer_id);
+        scoped.entity_filter = EntityFilter::EntityIds {
+            ids: repo.entities.keys().copied().collect(),
+        };
+        let result = execute_query(&repo, &scoped);
+        assert_eq!(result.total_elements, 1);
+        assert_eq!(result.data[0].entity_id, own.id);
+
+        scoped.entity_filter = EntityFilter::All;
+        assert_eq!(execute_query(&repo, &scoped).total_elements, 1);
+        scoped.customer_id = None;
+        assert_eq!(execute_query(&repo, &scoped).total_elements, 3);
     }
 }
