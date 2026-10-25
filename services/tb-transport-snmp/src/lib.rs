@@ -5,7 +5,7 @@ mod discovery;
 mod mapping;
 mod runner;
 
-pub use discovery::discover_devices;
+pub use discovery::{DEFAULT_DISCOVERY_PAGE_SIZE, RefreshReport, SnmpDeviceManager};
 
 pub use config::{
     CommunicationConfig, ConfigError, DataType, DeviceTransportConfiguration, Mapping,

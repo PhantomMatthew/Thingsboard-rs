@@ -78,6 +78,7 @@ ThingsBoard IoT 平台的 Rust 重写版（微服务架构，非兼容重设计�
 | `TB_COAP_BIND` | tb-transport-coap | `0.0.0.0:5683` | CoAP 监听地址 |
 | `TB_LWM2M_BIND` | tb-transport-lwm2m | `0.0.0.0:5685` | LwM2M UDP 监听地址 |
 | `TB_NODE_ID` | transport | 自动生成 | 节点 ID（Kafka 下行 topic 路由键） |
+| `TB_SNMP_DISCOVERY_INTERVAL_SEC` | tb-transport-snmp | 60 | SNMP 设备发现刷新周期（最小 1）：分页拉取全部 SNMP 设备，启动新增、重启配置变化、停止已删除设备 |
 | `TB_EDQS_PORT` / `TB_EDQS_GROUP` | tb-edqs | 8090 / 默认组 | 查询端口 / 消费组 |
 | `TB_EDQS_RECONCILE_INTERVAL_SECS` | tb-edqs | 600 | 从 PostgreSQL 重载全部租户的对账周期（0=关闭）；增量丢失时另有按租户重同步 |
 | `TB_HOUSEKEEPER_INTERVAL_SEC` | tb-housekeeper | 3600 | 清理周期 |
@@ -86,7 +87,7 @@ ThingsBoard IoT 平台的 Rust 重写版（微服务架构，非兼容重设计�
 
 MQTTS 客户端证书为可选项。支持设备绑定的 SHA3-256 pinned certificate，以及按租户设备档案配置的私有 CA 证书链校验和设备自动 provisioning；未提供证书时仍可使用 access token 或 MQTT basic。
 
-SNMP 当前支持 v2c 主动 GET 周期采集和设备发现，不支持 v3、Trap/Inform 或 SET。LwM2M 当前支持 NoSec 注册/更新/注销、Read、TLV 和 SINGLE Observe，不支持 DTLS、Bootstrap、Composite Observe、固件 OTA 或下行 Write/Execute。LwM2M 资源类型使用显式内置对象模型，未建模资源会拒绝而不会按长度猜测。二者均通过 transport-api 校验设备档案和凭证，并经 core 写入遥测与属性。
+SNMP 当前支持 v2c 主动 GET 周期采集和设备发现（分页拉取全部设备并按 `TB_SNMP_DISCOVERY_INTERVAL_SEC` 周期刷新），不支持 v3、Trap/Inform 或 SET；多个 SNMP 实例之间不分片，每个实例都会轮询全部 SNMP 设备。LwM2M 当前支持 NoSec 注册/更新/注销、Read、TLV 和 SINGLE Observe，不支持 DTLS、Bootstrap、Composite Observe、固件 OTA 或下行 Write/Execute。LwM2M 资源类型使用显式内置对象模型，未建模资源会拒绝而不会按长度猜测。二者均通过 transport-api 校验设备档案和凭证，并经 core 写入遥测与属性。
 
 真实 Leshan 2.0.0-M15 互操作测试需要 Java、Docker 以及开发依赖（PostgreSQL、Kafka、Redis）。首次准备依赖后显式运行：
 

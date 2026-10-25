@@ -47,7 +47,7 @@ Java 社区版还有、这里未完整覆盖的接入：
 | 能力 | 当前主分支现状 |
 | --- | --- |
 | LwM2M | 已有 UDP NoSec 注册、Read、TLV、SINGLE Observe；缺 DTLS、Bootstrap、Composite、Write/Execute/Discover/Create/Delete、下行 RPC、Queue Mode 和 OTA |
-| SNMP | 已有 v2c UDP GET 周期采集；缺 v1/v3、TCP、SET、Trap、RPC 和运行期设备刷新；启动发现仅取第一页最多 1000 台 |
+| SNMP | 已有 v2c UDP GET 周期采集，设备发现分页拉取全部 SNMP 设备并周期刷新（新增启动、设备或 Profile 配置变化重启、删除停止）；缺 v1/v3、TCP、SET、Trap、RPC，多实例之间不分片 |
 | CoAP | 缺 DTLS、provision 和 firmware/software OTA |
 | OTA | MQTT/HTTP 已覆盖 firmware 与 software 分块分发；选包只看设备级、其次 Profile 级显式绑定（校验租户、类型、Profile 与数据），生效包变化时回写 `target_*`、`{fw,sw}_state`（QUEUED/INITIATED）和 `{fw,sw}_*` shared 属性，解绑删除；缺 CoAP/LwM2M 分发、按 Profile 批量限速推送和下载进度类服务端状态 |
 | MQTT/HTTP 兼容项 | 已实现路径保持 topic/path 兼容；缺 MQTT v2 短 topic、JSON/Protobuf、MQTT over WebSocket，HTTP attributes 长轮询未实现（Java 已弃用） |
