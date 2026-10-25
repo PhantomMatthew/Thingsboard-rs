@@ -124,8 +124,29 @@ impl JwtTokenFactory {
         self.encode(user, TokenType::Refresh, self.refresh_exp)
     }
 
+    pub(crate) fn create_access_token_at(&self, user: &SecurityUser, iat: i64) -> TbResult<String> {
+        self.encode_at(user, TokenType::Access, iat, self.access_exp)
+    }
+
+    pub(crate) fn create_refresh_token_at(
+        &self,
+        user: &SecurityUser,
+        iat: i64,
+    ) -> TbResult<String> {
+        self.encode_at(user, TokenType::Refresh, iat, self.refresh_exp)
+    }
+
     fn encode(&self, user: &SecurityUser, token_type: TokenType, ttl: i64) -> TbResult<String> {
-        let iat = chrono::Utc::now().timestamp();
+        self.encode_at(user, token_type, chrono::Utc::now().timestamp(), ttl)
+    }
+
+    fn encode_at(
+        &self,
+        user: &SecurityUser,
+        token_type: TokenType,
+        iat: i64,
+        ttl: i64,
+    ) -> TbResult<String> {
         let claims = Claims {
             sub: user.id.to_string(),
             tenant_id: user.tenant_id.to_string(),

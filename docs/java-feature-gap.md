@@ -12,9 +12,10 @@
 
 - 设备上报遥测和属性，默认根规则链把这两类消息落到 PostgreSQL。
 - REST 查询遥测、属性和告警；在线单向/双向 RPC。
-- MQTT、HTTP、CoAP 接入，access token、MQTT basic、证书钉扎。
+- MQTT、HTTP、CoAP 接入，access token、MQTT basic、证书钉扎、租户私有 CA 证书链认证与设备自动注册。
+- LwM2M NoSec 注册、Read、TLV、SINGLE Observe；SNMP v2c UDP GET 周期采集。
 - 网关的 connect、disconnect、telemetry、attributes、attributes request、rpc。
-- OTA 分块、provision、设备认领。
+- MQTT/HTTP firmware OTA 分块、MQTT/HTTP provision、设备认领；software 和 CoAP OTA/provision 尚未覆盖。
 - 简化版 EDQS、简化版计算字段、审计日志、housekeeper 清理。
 
 默认根规则链只连接「消息类型开关 → 保存遥测 / 保存属性」，不处理连接、断开、RPC 和告警规则。
@@ -31,34 +32,37 @@ REST 是重新设计的，遥测和属性集中在 `/api/telemetry/...`。Java �
 
 已有租户、客户、用户、设备、资产、设备/资产 Profile、规则链、OTA、计算字段。
 
-没有实体视图（Entity View）。没有关系的增删查 API。关系表只给规则链连线，以及网关自动创建的 `Created` 边使用。
+没有实体视图（Entity View），也没有通用关系增删查 REST API。关系数据已用于规则链关系过滤、关联实体属性富化、关联 originator，以及网关自动创建的 `Created` 边。
 
-EDQS 只有四种过滤：全部、按类型、名称包含、按 ID。可读实体字段、最新遥测和 CLIENT/SHARED/SERVER 属性。Java 的 EDQS 还有关系过滤、设备/资产类型、单实体、告警查询、告警计数、API 用量查询，以及按客户隔离。这里的客户用户会看到整个租户。
+EDQS 只有四种过滤：全部、按类型、名称包含、按 ID。可读实体字段、最新遥测和 CLIENT/SHARED/SERVER 属性。Java 的 EDQS 还有关系过滤、设备/资产类型、单实体、实体计数、available keys、告警查询、告警计数、API 用量查询，以及按客户隔离。这里的客户用户会看到整个租户。
 
-计算字段只做「若干遥测或属性参数 + 一条 Rhai 表达式 + 一个遥测或服务端属性输出」。Java 还有关联实体参数、向关联实体传播、多输出、调试和 TBEL。
+计算字段只做「若干遥测或属性参数 + 一条 Rhai 表达式 + 一个遥测或服务端属性输出」。Java 还有关联实体参数、向关联实体传播、多输出、调试、告警规则和 TBEL。
 
 ## 设备接入
 
-已有 MQTT、HTTP、CoAP，以及 access token、MQTT basic、证书钉扎、上述网关子集、OTA 分块、provision、认领、在线 RPC。
+已有 MQTT、HTTP、CoAP，以及 access token、MQTT basic、证书钉扎和证书链认证、上述网关子集、部分 OTA/provision、认领、在线 RPC。
 
-Java 社区版还有、这里没有的接入：
+Java 社区版还有、这里未完整覆盖的接入：
 
-| 能力 | 现状（相对 `aae9e01`） |
+| 能力 | 当前主分支现状 |
 | --- | --- |
-| LwM2M、SNMP | 设备 Profile 的 `transport_type` 注释写了这两种，没有传输实现。其后提交已分别接入 LwM2M NoSec 与 SNMP v2c |
-| CoAP over DTLS、MQTT over WebSocket | 无 |
+| LwM2M | 已有 UDP NoSec 注册、Read、TLV、SINGLE Observe；缺 DTLS、Bootstrap、Composite、Write/Execute/Discover/Create/Delete、下行 RPC、Queue Mode 和 OTA |
+| SNMP | 已有 v2c UDP GET 周期采集；缺 v1/v3、TCP、SET、Trap、RPC 和运行期设备刷新；启动发现仅取第一页最多 1000 台 |
+| CoAP | 缺 DTLS、provision 和 firmware/software OTA |
+| OTA | MQTT/HTTP 仅覆盖 firmware 主路径；缺 software 分发、CoAP 分发和完整状态回写，设备/Profile 显式绑定也未正确参与选包 |
+| MQTT/HTTP 兼容项 | 已实现路径保持 topic/path 兼容；缺 MQTT v2 短 topic、JSON/Protobuf、MQTT over WebSocket，HTTP attributes 长轮询未实现（Java 已弃用） |
 | 离线持久 RPC | RPC 要求设备在线且已订阅，超时即失败 |
-| Profile 不活动超时 | 只在连接和断开时写 `active`、`lastConnectTime`、`lastDisconnectTime`，没有「超过 N 分钟无消息则离线」 |
+| Profile 不活动超时 | 消息活动会节流更新 `active`、`lastActivityTime`，连接/断开也会写活动属性；没有「超过 N 分钟无消息则离线」的 Profile 状态机 |
 | 网关认领、Sparkplug | 无 `v1/gateway/claim`，无 Sparkplug |
-| 证书链签发和自动注册 | 当时 MQTTS 按已绑定证书哈希钉扎。其后 `dc57200` 增加了租户私有 CA 的证书链验证与设备自动开通 |
+| 证书链认证和自动注册 | 基线 `aae9e01` 仅有证书哈希钉扎；其后 `dc57200` 增加了租户私有 CA 的证书链验证与设备自动开通，不提供 CA 证书签发服务 |
 
 ## 告警、规则和通知
 
-告警可以创建、确认、清除，同一来源、同一类型同时只有一条活跃告警。没有告警评论、告警指派，也没有设备 Profile 上的阈值规则。Java 的 `TbDeviceProfileNode` 不存在。Profile 的 `profile_data` 可以存 JSON，但不会据此自动产生告警。
+规则节点可以创建、确认、清除告警，同一来源、同一类型同时只有一条活跃告警；REST 只有查询、ack、clear，没有 Java 的告警创建接口。没有告警评论、告警指派、owner/tenant/关系传播，也没有设备 Profile 上的阈值规则。Java 的 `TbDeviceProfileNode` 不存在。Profile 的 `profile_data` 可以存 JSON，但不会据此自动产生告警。
 
-规则节点注册表共 31 个：过滤、富化、改 key、改 originator、保存遥测/属性、创建/清除告警、延迟、去重、数学、单向 RPC、REST、Kafka、MQTT、子规则链。
+规则节点注册表共 30 个：过滤、富化、改 key、改 originator、保存遥测/属性、创建/清除告警、延迟、去重、数学、单向 RPC、REST、Kafka、MQTT、子规则链。
 
-Java 社区版常见、这里没有的节点包括：脚本 switch、设备/资产 Profile switch、告警状态过滤、读取原始遥测、计算 delta、客户/租户属性、发邮件、拆分数组、生成器、把设备分配给客户、创建或删除关系、同步节点、RabbitMQ、AWS SNS/SQS、GCP Pub/Sub、Azure IoT Hub、通知中心节点、推送到 Edge。
+Java 社区版常见、这里没有的节点包括：脚本 switch、设备/资产 Profile switch、告警状态过滤、读取原始遥测、计算 delta、客户/租户属性、双向 RPC 调用、发邮件、拆分数组、生成器、把设备分配给客户、创建或删除关系、同步节点、RabbitMQ、AWS SNS/SQS、GCP Pub/Sub、Azure IoT Hub、通知中心节点、推送到 Edge。
 
 脚本引擎只有 Rhai。Java 的 JS 和 TBEL 规则链不能直接导入。
 
@@ -72,7 +76,7 @@ OAuth2 是简化的授权码换邮箱，没有 Java 的 mapper（按域名归入
 
 租户 Profile 只有种子数据中的一条默认记录，创建租户时会挂上。没有 Profile 管理 API，也不按 Profile 限制设备数、消息数或数据点。用量接口只累计 transport 消息、规则执行和 REST 请求，超限不会拒绝。
 
-规则引擎队列只有一个 `Main`，没有按租户配置多队列、隔离以及提交/处理策略。
+规则引擎默认消费 `Main`，进程级 `TB_RE_QUEUE` 可改名；没有按租户配置多队列路由、隔离以及提交/处理策略。
 
 审计日志只覆盖一部分写操作。没有 Java 的系统设置面（邮件服务器、JWT、短信等存在管理设置中）。
 
@@ -97,4 +101,4 @@ OAuth2 是简化的授权码换邮箱，没有 Java 的 mapper（按域名归入
 
 ## 差距摘要
 
-缺的主要是管理界面、实时订阅、LwM2M/SNMP（审查时点尚无实现）、Profile 告警、离线 RPC、通知和邮件，以及 Java 规则链和 REST 的直接兼容。设备上报、落库、REST 查询、在线 RPC、OTA、provision 和认领已经有主路径。
+缺的主要是管理界面、实时订阅、完整 LwM2M/SNMP/OTA 协议面、Profile 告警、离线 RPC、通知和邮件，以及 Java 规则链和 REST 的直接兼容。设备上报、落库、REST 查询、在线 RPC、LwM2M/SNMP 有限采集、firmware OTA、MQTT/HTTP provision 和认领已经有主路径。

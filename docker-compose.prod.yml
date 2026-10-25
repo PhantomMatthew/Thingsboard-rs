@@ -98,11 +98,13 @@ services:
     environment:
       TB_DATABASE_URL: postgres://${POSTGRES_USER:-thingsboard}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-thingsboard}
       TB_KAFKA_BROKERS: kafka:9092
+      TB_REDIS_URL: redis://redis:6379
       TB_RE_QUEUE: Main
       RUST_LOG: ${RUST_LOG:-info}
     depends_on:
       postgres: { condition: service_healthy }
       kafka: { condition: service_healthy }
+      redis: { condition: service_healthy }
     restart: unless-stopped
 
   tb-transport-mqtt:

@@ -8,9 +8,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tb_auth::oauth2::Oauth2LoginRequest;
-use tb_auth::{ApiError, AuthUser, SecurityUser, TokenPair, TokenType};
-use tb_common::TbError;
+use tb_auth::oauth2::{Oauth2LoginRequest, validate_oauth2_browser_uri, validate_oauth2_uri};
+use tb_auth::{ApiError, AuthUser, SecurityUser, TokenPair};
+use tb_common::{TbError, TbResult};
 use tb_dao::models::{Authority, Oauth2Client};
 use uuid::Uuid;
 
@@ -29,18 +29,17 @@ pub fn router() -> Router<AppState> {
         )
 }
 
-fn try_admin(state: &AppState, headers: &HeaderMap) -> Option<SecurityUser> {
-    let token = headers
-        .get(header::AUTHORIZATION)?
+async fn try_admin(state: &AppState, headers: &HeaderMap) -> TbResult<Option<SecurityUser>> {
+    let Some(value) = headers.get(header::AUTHORIZATION) else {
+        return Ok(None);
+    };
+    let token = value
         .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")?;
-    let claims = state
-        .jwt_factory
-        .parse_typed(token, TokenType::Access)
-        .ok()?;
-    let user = claims.to_security_user().ok()?;
-    matches!(user.authority, Authority::SysAdmin | Authority::TenantAdmin).then_some(user)
+        .ok()
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| TbError::Unauthenticated("expected Bearer token".into()))?;
+    let user = state.auth_service.get_user_from_token(token).await?;
+    Ok(matches!(user.authority, Authority::SysAdmin | Authority::TenantAdmin).then_some(user))
 }
 
 async fn list_clients(
@@ -48,7 +47,7 @@ async fn list_clients(
     headers: HeaderMap,
     Query(page): Query<PageQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    match try_admin(&state, &headers) {
+    match try_admin(&state, &headers).await? {
         Some(user) => {
             let tenant_id = match user.authority {
                 Authority::SysAdmin => None,
@@ -90,28 +89,17 @@ pub struct SaveOauth2ClientRequest {
     pub enabled: Option<bool>,
 }
 
-fn validate_http_uri(name: &str, value: &str) -> Result<(), TbError> {
-    let url = reqwest::Url::parse(value)
-        .map_err(|_| TbError::InvalidInput(format!("{name} must be an absolute HTTP(S) URL")))?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        return Err(TbError::InvalidInput(format!(
-            "{name} must be an absolute HTTP(S) URL"
-        )));
-    }
-    Ok(())
-}
-
 async fn save_client(
     State(state): State<AppState>,
     user: AuthUser,
     Json(req): Json<SaveOauth2ClientRequest>,
 ) -> Result<Json<Oauth2Client>, ApiError> {
     require_authority(&user, &[Authority::SysAdmin])?;
-    validate_http_uri("authorizationUri", &req.authorization_uri)?;
-    validate_http_uri("tokenUri", &req.token_uri)?;
-    validate_http_uri("userInfoUri", &req.user_info_uri)?;
+    validate_oauth2_browser_uri("authorizationUri", &req.authorization_uri)?;
+    validate_oauth2_uri("tokenUri", &req.token_uri).await?;
+    validate_oauth2_uri("userInfoUri", &req.user_info_uri).await?;
     if let Some(uri) = &req.redirect_uri_template {
-        validate_http_uri("redirectUriTemplate", uri)?;
+        validate_oauth2_browser_uri("redirectUriTemplate", uri)?;
     }
     let tenant_id = req.tenant_id;
     let (id, created_time) = match req.id {
@@ -175,19 +163,4 @@ async fn load_and_check(
         ));
     }
     Ok(client)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::validate_http_uri;
-
-    #[test]
-    fn oauth2_client_uris_require_http_or_https() {
-        for uri in ["https://idp.example.com/token", "http://127.0.0.1/token"] {
-            validate_http_uri("tokenUri", uri).unwrap();
-        }
-        for uri in ["file:///etc/passwd", "ftp://example.com/token", "/relative"] {
-            assert!(validate_http_uri("tokenUri", uri).is_err(), "{uri}");
-        }
-    }
 }

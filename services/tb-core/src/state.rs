@@ -211,3 +211,9 @@ impl axum::extract::FromRef<AppState> for Arc<JwtTokenFactory> {
         state.jwt_factory.clone()
     }
 }
+
+impl axum::extract::FromRef<AppState> for Arc<AuthService> {
+    fn from_ref(state: &AppState) -> Self {
+        state.auth_service.clone()
+    }
+}

@@ -129,11 +129,80 @@ async fn password_change_rejects_old_refresh_and_accepts_new_login() -> TbResult
 
     let err = auth.refresh(&old_pair.refresh_token).await.unwrap_err();
     assert!(matches!(err, TbError::Unauthenticated(_)), "{err:?}");
+    let err = auth.get_user_from_token(&old_pair.token).await.unwrap_err();
+    assert!(matches!(err, TbError::Unauthenticated(_)), "{err:?}");
 
     let new_pair = auth.login(&user.email, NEW_PASSWORD).await?;
     auth.factory()
         .parse_typed(&new_pair.token, TokenType::Access)?;
+    auth.get_user_from_token(&new_pair.token).await?;
+    let after_login = UserCredentialsDao::new(pool.clone())
+        .find_by_user_id(user.id)
+        .await?
+        .expect("credentials after new login");
+    assert_eq!(after_login.password, credentials.password);
+    assert_eq!(
+        after_login.password_changed_ts,
+        credentials.password_changed_ts
+    );
+    let credentials_dao = UserCredentialsDao::new(pool.clone());
+    let stale = credentials_dao
+        .upsert_password(
+            user.id,
+            after_login.password.as_deref().unwrap(),
+            credentials.password_changed_ts.unwrap() - 1,
+        )
+        .await?;
+    assert_eq!(stale.password_changed_ts, credentials.password_changed_ts);
+    let concurrent_reset = credentials_dao
+        .record_login_success(
+            user.id,
+            chrono::Utc::now().timestamp_millis(),
+            "not-the-current-password-hash",
+        )
+        .await?;
+    assert!(concurrent_reset.is_none());
     assert!(auth.login(&user.email, OLD_PASSWORD).await.is_err());
+
+    delete_user_tenant(&pool, &user).await
+}
+
+#[tokio::test]
+async fn access_token_uses_current_identity_and_rejects_deleted_user() -> TbResult<()> {
+    let pool = setup().await;
+    let auth = auth_service(&pool);
+    let (mut user, _) = create_user(&pool, true).await?;
+    let pair = auth.issue_tokens(&user)?;
+
+    let customer = tb_dao::CustomerDao::new(pool.clone())
+        .save(&tb_dao::models::Customer {
+            id: Uuid::now_v7(),
+            created_time: 0,
+            tenant_id: user.tenant_id,
+            title: "auth integration customer".into(),
+            country: None,
+            state: None,
+            city: None,
+            address: None,
+            address2: None,
+            zip: None,
+            phone: None,
+            email: None,
+            additional_info: None,
+        })
+        .await?;
+    user.authority = Authority::CustomerUser;
+    user.customer_id = Some(customer.id);
+    UserDao::new(pool.clone()).save(&user).await?;
+    let current = auth.get_user_from_token(&pair.token).await?;
+    assert_eq!(current.authority, Authority::CustomerUser);
+    assert_eq!(current.customer_id, user.customer_id);
+
+    UserDao::new(pool.clone()).delete_by_id(user.id).await?;
+    let err = auth.get_user_from_token(&pair.token).await.unwrap_err();
+    assert!(matches!(err, TbError::Unauthenticated(_)), "{err:?}");
+    let err = auth.refresh(&pair.refresh_token).await.unwrap_err();
+    assert!(matches!(err, TbError::Unauthenticated(_)), "{err:?}");
 
     delete_user_tenant(&pool, &user).await
 }

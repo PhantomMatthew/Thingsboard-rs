@@ -55,6 +55,12 @@ impl axum::extract::FromRef<AuthState> for Arc<JwtTokenFactory> {
     }
 }
 
+impl axum::extract::FromRef<AuthState> for Arc<AuthService> {
+    fn from_ref(state: &AuthState) -> Self {
+        state.auth_service.clone()
+    }
+}
+
 /// 统一错误响应：{status, message} + TbError::http_status()。
 pub fn error_response(err: &TbError) -> Response {
     tracing::error!(error = %err, "request failed");

@@ -100,19 +100,12 @@ async fn save_user(
     match (&req.password, created_time == 0) {
         // 简化路径：直接设置密码并激活。
         (Some(password), _) => {
-            let creds = UserCredentials {
-                id: Uuid::now_v7(),
-                created_time: 0,
-                user_id: saved.id,
-                enabled: true,
-                password: Some(tb_auth::password::hash_password(password)?),
-                activate_token: None,
-                reset_token: None,
-                failed_login_attempts: 0,
-                last_login_ts: None,
-                password_changed_ts: None,
-            };
-            state.user_credentials_dao.save(&creds).await?;
+            let password = tb_auth::password::hash_password(password)?;
+            let changed_ts = chrono::Utc::now().timestamp_millis();
+            state
+                .user_credentials_dao
+                .upsert_password(saved.id, &password, changed_ts)
+                .await?;
         }
         // 新用户未带密码：生成未激活凭证（激活邮件流程此处省略）。
         (None, true) => {

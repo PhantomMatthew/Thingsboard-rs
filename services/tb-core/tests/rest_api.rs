@@ -90,6 +90,8 @@ async fn rest_api_end_to_end() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    let tenant_admin: Value = resp.json().await.unwrap();
+    let tenant_admin_id = tenant_admin["id"].as_str().unwrap().to_string();
 
     // 4. tenant admin 登录
     let tokens = login(&client, &base, "tenant.admin@thingsboard.org", "tenant").await;
@@ -264,4 +266,47 @@ async fn rest_api_end_to_end() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let old_pair = login(&client, &base, "tenant.admin@thingsboard.org", "tenant").await;
+    let resp = client
+        .post(format!("{base}/api/user"))
+        .header("Authorization", bearer(&sys_token))
+        .json(&json!({
+            "id": tenant_admin_id,
+            "tenantId": tenant_id,
+            "email": "tenant.admin@thingsboard.org",
+            "authority": "TENANT_ADMIN",
+            "password": "reset-password",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    for (path, token) in [
+        (
+            "/api/auth/token/refresh",
+            old_pair["refreshToken"].as_str().unwrap(),
+        ),
+        ("/api/auth/user", old_pair["token"].as_str().unwrap()),
+    ] {
+        let request = if path == "/api/auth/token/refresh" {
+            client
+                .post(format!("{base}{path}"))
+                .json(&json!({ "refreshToken": token }))
+        } else {
+            client
+                .get(format!("{base}{path}"))
+                .header("Authorization", bearer(token))
+        };
+        let resp = request.send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+    login(
+        &client,
+        &base,
+        "tenant.admin@thingsboard.org",
+        "reset-password",
+    )
+    .await;
 }

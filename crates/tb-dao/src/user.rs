@@ -186,6 +186,89 @@ impl UserCredentialsDao {
         .map_err(TbError::db)
     }
 
+    pub async fn record_login_success(
+        &self,
+        user_id: Uuid,
+        last_login_ts: i64,
+        expected_password: &str,
+    ) -> TbResult<Option<UserCredentials>> {
+        sqlx::query_as::<_, UserCredentials>(
+            "UPDATE user_credentials SET failed_login_attempts=0, last_login_ts=$2 \
+             WHERE user_id=$1 AND enabled AND password=$3 RETURNING *",
+        )
+        .bind(user_id)
+        .bind(last_login_ts)
+        .bind(expected_password)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(TbError::db)
+    }
+
+    pub async fn record_login_failure(&self, user_id: Uuid) -> TbResult<i32> {
+        sqlx::query_scalar(
+            "UPDATE user_credentials SET failed_login_attempts=failed_login_attempts+1 \
+             WHERE user_id=$1 RETURNING failed_login_attempts",
+        )
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(TbError::db)
+    }
+
+    pub async fn reset_failed_login_attempts(&self, user_id: Uuid) -> TbResult<()> {
+        sqlx::query("UPDATE user_credentials SET failed_login_attempts=0 WHERE user_id=$1")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .map_err(TbError::db)?;
+        Ok(())
+    }
+
+    pub async fn update_password(
+        &self,
+        user_id: Uuid,
+        password: &str,
+        password_changed_ts: i64,
+        enable: bool,
+    ) -> TbResult<Option<UserCredentials>> {
+        sqlx::query_as::<_, UserCredentials>(
+            "UPDATE user_credentials SET password=$2, activate_token=NULL, reset_token=NULL, \
+             password_changed_ts=GREATEST(COALESCE(password_changed_ts,$3),$3), \
+             enabled=enabled OR $4 WHERE user_id=$1 RETURNING *",
+        )
+        .bind(user_id)
+        .bind(password)
+        .bind(password_changed_ts)
+        .bind(enable)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(TbError::db)
+    }
+
+    pub async fn upsert_password(
+        &self,
+        user_id: Uuid,
+        password: &str,
+        password_changed_ts: i64,
+    ) -> TbResult<UserCredentials> {
+        sqlx::query_as::<_, UserCredentials>(
+            "INSERT INTO user_credentials (id, created_time, user_id, enabled, password, \
+             activate_token, reset_token, failed_login_attempts, last_login_ts, password_changed_ts) \
+             VALUES ($1,$2,$3,true,$4,NULL,NULL,0,NULL,$5) \
+             ON CONFLICT (user_id) DO UPDATE SET password=$4, activate_token=NULL, reset_token=NULL, \
+             password_changed_ts=GREATEST(COALESCE(user_credentials.password_changed_ts,$5),$5), \
+             enabled=true RETURNING *",
+        )
+        .bind(Uuid::now_v7())
+        .bind(now_ms())
+        .bind(user_id)
+        .bind(password)
+        .bind(password_changed_ts)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(TbError::db)
+    }
+
     pub async fn find_by_user_id(&self, user_id: Uuid) -> TbResult<Option<UserCredentials>> {
         sqlx::query_as::<_, UserCredentials>("SELECT * FROM user_credentials WHERE user_id = $1")
             .bind(user_id)
