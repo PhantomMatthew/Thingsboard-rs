@@ -51,11 +51,21 @@ impl PageLink {
         }
     }
 
-    /// ILIKE 匹配模式（小写，配合 LOWER(column)）。
+    /// LIKE 子串匹配模式（小写，配合 LOWER(column)）。用户输入中的 `%`、`_`、`\`
+    /// 以 PostgreSQL LIKE 的默认转义符 `\` 转义，按字面匹配。
     pub fn search_pattern(&self) -> Option<String> {
-        self.text_search
-            .as_ref()
-            .map(|t| format!("%{}%", t.to_lowercase()))
+        self.text_search.as_ref().map(|text| {
+            let mut pattern = String::with_capacity(text.len() + 2);
+            pattern.push('%');
+            for c in text.to_lowercase().chars() {
+                if matches!(c, '%' | '_' | '\\') {
+                    pattern.push('\\');
+                }
+                pattern.push(c);
+            }
+            pattern.push('%');
+            pattern
+        })
     }
 }
 
@@ -104,6 +114,16 @@ mod tests {
         assert_eq!(link.sort_column(&["name", "title"]), "name");
         link.sort_property = Some("name; DROP TABLE tenant;--".into());
         assert_eq!(link.sort_column(&["name", "title"]), "created_time");
+    }
+
+    #[test]
+    fn search_pattern_escapes_like_wildcards() {
+        let mut link = PageLink::new(0, 10);
+        assert_eq!(link.search_pattern(), None);
+        link.text_search = Some("Rate_100%".into());
+        assert_eq!(link.search_pattern().unwrap(), "%rate\\_100\\%%");
+        link.text_search = Some("C:\\Temp".into());
+        assert_eq!(link.search_pattern().unwrap(), "%c:\\\\temp%");
     }
 
     #[test]

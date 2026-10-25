@@ -1,9 +1,13 @@
 //! tb-script：Rhai 脚本沙箱（规则引擎 filter/transform 节点用）。
-//! 编译结果按脚本内容缓存（容量 1000）；执行限制 max_operations=100_000。
+//! 编译结果按脚本内容缓存（容量 1000）；执行限制 max_operations=100_000，表达式深度
+//! 32（函数体内 16）、调用栈 16 层，与构建模式无关。
 //! Rhai 默认不带文件/系统 IO，本 crate 也不注册任何危险 API。
+//! `print`/`debug` 输出每行截断到 512 字符并转义控制字符，每个引擎每秒最多 20 行，
+//! 超出部分丢弃，并在下一条放行日志前以 warn 汇报丢弃条数。
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use rhai::{Dynamic, Engine, Scope};
 use serde_json::Value;
@@ -35,11 +39,89 @@ const MAX_STRING_SIZE: usize = 1024 * 1024;
 const MAX_ARRAY_SIZE: usize = 10_000;
 const MAX_MAP_SIZE: usize = 10_000;
 const MAX_NESTING_DEPTH: usize = 64;
+const MAX_EXPR_DEPTH: usize = 32;
+const MAX_FUNCTION_EXPR_DEPTH: usize = 16;
+const MAX_CALL_LEVELS: usize = 16;
 const CACHE_CAPACITY: u64 = 1000;
+const MAX_LOG_LINE_CHARS: usize = 512;
+const MAX_LOG_LINES_PER_SEC: u32 = 20;
+
+struct LogWindow {
+    started: Instant,
+    emitted: u32,
+    suppressed: u64,
+}
+
+struct ScriptLogLimiter {
+    window: Mutex<LogWindow>,
+}
+
+impl ScriptLogLimiter {
+    fn new() -> Self {
+        Self {
+            window: Mutex::new(LogWindow {
+                started: Instant::now(),
+                emitted: 0,
+                suppressed: 0,
+            }),
+        }
+    }
+
+    /// None 表示本行丢弃；Some(n) 表示放行，n 为此前累计丢弃的行数。
+    fn admit(&self, now: Instant) -> Option<u64> {
+        let mut window = self.window.lock().unwrap_or_else(PoisonError::into_inner);
+        if now.saturating_duration_since(window.started) >= Duration::from_secs(1) {
+            window.started = now;
+            window.emitted = 0;
+        }
+        if window.emitted >= MAX_LOG_LINES_PER_SEC {
+            window.suppressed += 1;
+            return None;
+        }
+        window.emitted += 1;
+        Some(std::mem::take(&mut window.suppressed))
+    }
+
+    #[cfg(test)]
+    fn suppressed(&self) -> u64 {
+        self.window
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .suppressed
+    }
+}
+
+fn sanitize_log_line(line: &str) -> String {
+    let mut out = String::with_capacity(line.len().min(MAX_LOG_LINE_CHARS));
+    let mut chars = line.chars();
+    for c in chars.by_ref().take(MAX_LOG_LINE_CHARS) {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    if chars.next().is_some() {
+        out.push_str("...[truncated]");
+    }
+    out
+}
+
+fn log_script_output(limiter: &ScriptLogLimiter, line: &str, emit: impl FnOnce(&str)) {
+    let Some(suppressed) = limiter.admit(Instant::now()) else {
+        return;
+    };
+    if suppressed > 0 {
+        tracing::warn!(target: "rhai", suppressed, "rhai print/debug output rate limited");
+    }
+    emit(&sanitize_log_line(line));
+}
 
 pub struct ScriptEngine {
     engine: Engine,
     cache: moka::sync::Cache<String, Arc<rhai::AST>>,
+    #[cfg(test)]
+    log_limiter: Arc<ScriptLogLimiter>,
 }
 
 impl Default for ScriptEngine {
@@ -55,18 +137,33 @@ impl ScriptEngine {
         engine.set_max_string_size(MAX_STRING_SIZE);
         engine.set_max_array_size(MAX_ARRAY_SIZE);
         engine.set_max_map_size(MAX_MAP_SIZE);
-        engine.on_print(|s| tracing::info!(target: "rhai", "{s}"));
-        engine.on_debug(|s, source, position| {
-            tracing::debug!(
-                target: "rhai",
-                source = source.unwrap_or("unknown"),
-                %position,
-                "{s}"
-            );
+        engine.set_max_expr_depths(MAX_EXPR_DEPTH, MAX_FUNCTION_EXPR_DEPTH);
+        engine.set_max_call_levels(MAX_CALL_LEVELS);
+        let log_limiter = Arc::new(ScriptLogLimiter::new());
+        let print_limiter = log_limiter.clone();
+        engine.on_print(move |s| {
+            log_script_output(
+                &print_limiter,
+                s,
+                |line| tracing::info!(target: "rhai", "{line}"),
+            )
+        });
+        let debug_limiter = log_limiter.clone();
+        engine.on_debug(move |s, source, position| {
+            log_script_output(&debug_limiter, s, |line| {
+                tracing::debug!(
+                    target: "rhai",
+                    source = source.unwrap_or("unknown"),
+                    %position,
+                    "{line}"
+                )
+            })
         });
         Self {
             engine,
             cache: moka::sync::Cache::new(CACHE_CAPACITY),
+            #[cfg(test)]
+            log_limiter,
         }
     }
 
@@ -482,6 +579,70 @@ mod tests {
         assert!(matches!(
             dynamic_to_json(&dynamic),
             Err(ScriptError::NestingTooDeep)
+        ));
+    }
+
+    #[test]
+    fn log_lines_are_truncated_and_control_characters_escaped() {
+        assert_eq!(
+            sanitize_log_line("温度\nforged line\u{1b}[31m"),
+            "温度\\nforged line\\u{1b}[31m"
+        );
+        let long = "界".repeat(MAX_LOG_LINE_CHARS + 1);
+        let sanitized = sanitize_log_line(&long);
+        assert!(sanitized.ends_with("...[truncated]"));
+        assert_eq!(
+            sanitized.chars().filter(|c| *c == '界').count(),
+            MAX_LOG_LINE_CHARS
+        );
+        assert_eq!(
+            sanitize_log_line(&"x".repeat(MAX_LOG_LINE_CHARS)).len(),
+            512
+        );
+    }
+
+    #[test]
+    fn log_limiter_caps_lines_per_window_and_reports_drops() {
+        let limiter = ScriptLogLimiter::new();
+        let start = Instant::now();
+        for _ in 0..MAX_LOG_LINES_PER_SEC {
+            assert_eq!(limiter.admit(start), Some(0));
+        }
+        assert_eq!(limiter.admit(start), None);
+        assert_eq!(limiter.admit(start + Duration::from_millis(999)), None);
+        assert_eq!(limiter.suppressed(), 2);
+        let next = start + Duration::from_secs(1);
+        assert_eq!(limiter.admit(next), Some(2), "next window reports drops");
+        assert_eq!(limiter.admit(next), Some(0));
+    }
+
+    #[test]
+    fn script_print_and_debug_share_the_rate_limit() {
+        let e = engine();
+        e.eval_value(
+            "for i in 0..500 { print(i); debug(i); } true",
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert!(e.log_limiter.suppressed() > 0);
+    }
+
+    #[test]
+    fn expression_and_call_depth_are_bounded() {
+        let e = engine();
+        let nested = |depth: usize| format!("{}1{}", "(".repeat(depth), ")".repeat(depth));
+        assert!(e.eval_value(&nested(10), &HashMap::new()).is_ok());
+        assert!(matches!(
+            e.eval_value(&nested(MAX_EXPR_DEPTH + 8), &HashMap::new()),
+            Err(ScriptError::Compile(_))
+        ));
+        let recursion = |depth: usize| {
+            format!("fn down(n) {{ if n == 0 {{ 0 }} else {{ down(n - 1) }} }} down({depth})")
+        };
+        assert!(e.eval_value(&recursion(8), &HashMap::new()).is_ok());
+        assert!(matches!(
+            e.eval_value(&recursion(MAX_CALL_LEVELS + 4), &HashMap::new()),
+            Err(ScriptError::Eval(_))
         ));
     }
 

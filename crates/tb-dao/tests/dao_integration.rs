@@ -268,6 +268,33 @@ async fn pagination_text_search() -> TbResult<()> {
     let page = device_dao.find_by_tenant_id(tenant.id, &link).await?;
     assert_eq!(page.total_elements, 6);
 
+    // 输入中的 LIKE 通配符与转义符按字面匹配
+    for name in ["Rate_100%", "RateX100Y", "path\\dir", "pathXdir"] {
+        device_dao
+            .save(&new_device(tenant.id, profile.id, name))
+            .await?;
+    }
+    for (search, expected) in [("rate_100%", "Rate_100%"), ("path\\dir", "path\\dir")] {
+        let mut link = PageLink::new(0, 10);
+        link.text_search = Some(search.into());
+        let page = device_dao.find_by_tenant_id(tenant.id, &link).await?;
+        let names = page
+            .data
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, [expected], "search {search:?}");
+    }
+    let mut link = PageLink::new(0, 10);
+    link.text_search = Some("%".into());
+    assert_eq!(
+        device_dao
+            .find_by_tenant_id(tenant.id, &link)
+            .await?
+            .total_elements,
+        1
+    );
+
     assert!(tenant_dao.delete_by_id(tenant.id).await?);
     Ok(())
 }

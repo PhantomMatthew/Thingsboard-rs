@@ -1,5 +1,6 @@
 //! tb-auth：用户认证（JWT/bcrypt）。同时作为库被 tb-core 引用。
 
+pub mod cors;
 pub mod extract;
 pub mod oauth2;
 pub mod password;

@@ -129,6 +129,7 @@ services:
       TB_ENV: production
       TB_JWT_SECRET: ${JWT_SECRET:?JWT_SECRET required}
       TB_SYSADMIN_PASSWORD: ${TB_SYSADMIN_PASSWORD:?TB_SYSADMIN_PASSWORD required}
+      TB_CORS_ALLOWED_ORIGINS: ${TB_CORS_ALLOWED_ORIGINS:-http://localhost:3000}
       RUST_LOG: ${RUST_LOG:-info}
     ports:
       - "8080:8080"
@@ -147,6 +148,7 @@ services:
       TB_HTTP_PORT: 8081
       TB_ENV: production
       TB_JWT_SECRET: ${JWT_SECRET:?JWT_SECRET required}
+      TB_CORS_ALLOWED_ORIGINS: ${TB_CORS_ALLOWED_ORIGINS:-http://localhost:3000}
       RUST_LOG: ${RUST_LOG:-info}
     ports:
       - "8081:8081"

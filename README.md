@@ -61,6 +61,7 @@ ThingsBoard IoT 平台的 Rust 重写版（微服务架构，非兼容重设计�
 | `TB_SYSADMIN_PASSWORD` | tb-core | `sysadmin`（仅开发） | 首次 seed 的管理员密码；生产必填、至少 12 字节 |
 | `TB_JWT_ACCESS_EXPIRATION_SEC` / `TB_JWT_REFRESH_EXPIRATION_SEC` | tb-auth | 900 / 604800 | token 有效期 |
 | `TB_OAUTH2_ALLOW_INSECURE_HTTP` | tb-core / tb-auth | false | 仅本地开发：允许 OAuth2 HTTP/内网端点；生产保持 false |
+| `TB_CORS_ALLOWED_ORIGINS` | tb-core / tb-auth | `http://localhost:3000` | 浏览器跨域允许来源，逗号分隔；两服务共用同一策略 |
 | `TB_REDIS_URL` | tb-core / tb-rule-engine / transport | `redis://localhost:16379` | latest 遥测缓存；transport 用于共享租户限流。口令写作 `redis://:<口令>@host:port`，TLS 用 `rediss://` |
 | `TB_KAFKA_SECURITY_PROTOCOL` | 全部 Kafka 客户端 | `plaintext` | `sasl_plaintext` / `ssl` / `sasl_ssl`；SASL 机制 `TB_KAFKA_SASL_MECHANISM` 默认 `PLAIN` |
 | `TB_KAFKA_SASL_USERNAME` / `TB_KAFKA_SASL_PASSWORD` | 全部 Kafka 客户端 | 空 | SASL 凭据 |

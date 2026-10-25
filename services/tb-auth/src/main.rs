@@ -5,7 +5,6 @@ use std::sync::Arc;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tb_auth::{AuthService, AuthState, JwtTokenFactory};
-use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 pub const DEFAULT_DATABASE_URL: &str =
@@ -41,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nest("/api/auth", tb_auth::router(auth_state.clone()))
         .nest("/api/oauth2", tb_auth::oauth2::router(auth_state))
         .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive());
+        .layer(tb_auth::cors::cors_layer());
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!(port, "tb-auth listening");
