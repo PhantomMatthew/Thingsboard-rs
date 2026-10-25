@@ -263,6 +263,7 @@ async fn handle(
                         session_id: session.session_id.clone(),
                         node_id: session.node_id.clone(),
                         is_gateway: session.is_gateway,
+                        via_gateway: !session.gateway_session_id.is_empty(),
                         sub_attributes: false,
                         sub_rpc: false,
                         last_seen_ms: 0,

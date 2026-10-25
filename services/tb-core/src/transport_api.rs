@@ -672,8 +672,27 @@ async fn validate_mqtt_basic(
     invalid_credentials()
 }
 
-/// 网关子设备 get-or-create：按 (tenant, name) 查；无则以默认档案 + 随机 ACCESS_TOKEN 创建，
-/// 并建 gateway→device "Created" relation（失败仅告警，不阻塞）。
+async fn existing_gateway_device(
+    state: &AppState,
+    gateway_id: Uuid,
+    device: Device,
+) -> TbResult<pb::DeviceInfoProto> {
+    state
+        .relation_dao
+        .find_relation(
+            gateway_id,
+            EntityType::Device,
+            device.id,
+            EntityType::Device,
+            "Created",
+        )
+        .await?
+        .ok_or_else(|| TbError::PermissionDenied("device is not bound to this gateway".into()))?;
+    Ok(device_proto(&device))
+}
+
+/// 网关子设备 get-or-create：已有设备必须已绑定当前网关；新设备同时创建
+/// gateway→device "Created" relation，关系保存失败时整次接入失败。
 async fn get_or_create_gateway_device(
     state: &AppState,
     r: &pb::GetOrCreateGatewayDeviceRequest,
@@ -682,12 +701,29 @@ async fn get_or_create_gateway_device(
         .map_err(|_| TbError::InvalidInput("bad gateway_id".into()))?;
     let tenant_id =
         Uuid::parse_str(&r.tenant_id).map_err(|_| TbError::InvalidInput("bad tenant_id".into()))?;
+    let gateway = state
+        .device_dao
+        .find_by_id(gateway_id)
+        .await?
+        .ok_or_else(|| TbError::PermissionDenied("gateway does not exist".into()))?;
+    if gateway.tenant_id != tenant_id
+        || gateway
+            .additional_info
+            .as_ref()
+            .and_then(|info| info.get("gateway"))
+            .and_then(|value| value.as_bool())
+            != Some(true)
+    {
+        return Err(TbError::PermissionDenied(
+            "gateway identity or tenant is invalid".into(),
+        ));
+    }
     if let Some(device) = state
         .device_dao
         .find_by_name(tenant_id, &r.device_name)
         .await?
     {
-        return Ok(device_proto(&device));
+        return existing_gateway_device(state, gateway_id, device).await;
     }
     let profile = crate::routes::device::ensure_default_device_profile(state, tenant_id).await?;
     let device = Device {
@@ -725,22 +761,26 @@ async fn get_or_create_gateway_device(
                 .find_by_name(tenant_id, &r.device_name)
                 .await?
             {
-                return Ok(device_proto(&existing));
+                return existing_gateway_device(state, gateway_id, existing).await;
             }
             return Err(e);
         }
     };
-    let relation = EntityRelation {
-        from_id: gateway_id,
-        from_type: EntityType::Device,
-        to_id: saved.id,
-        to_type: EntityType::Device,
-        relation_type_group: "COMMON".into(),
-        relation_type: "Created".into(),
-        additional_info: None,
-    };
-    if let Err(e) = state.relation_dao.save(&relation).await {
-        tracing::warn!("save gateway relation failed: {e}");
+    if let Err(e) = state
+        .relation_dao
+        .save(&EntityRelation {
+            from_id: gateway_id,
+            from_type: EntityType::Device,
+            to_id: saved.id,
+            to_type: EntityType::Device,
+            relation_type_group: "COMMON".into(),
+            relation_type: "Created".into(),
+            additional_info: None,
+        })
+        .await
+    {
+        state.device_dao.delete_by_id(saved.id).await?;
+        return Err(e);
     }
     Ok(device_proto(&saved))
 }

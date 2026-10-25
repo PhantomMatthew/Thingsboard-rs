@@ -23,6 +23,8 @@ pub struct SessionEntry {
     pub session_id: String,
     pub node_id: String,
     pub is_gateway: bool,
+    #[serde(default)]
+    pub via_gateway: bool,
     pub sub_attributes: bool,
     pub sub_rpc: bool,
     pub last_seen_ms: i64,
@@ -124,6 +126,7 @@ impl DeviceSessionRegistry {
                 session_id: session_id.to_string(),
                 node_id: node_id.to_string(),
                 is_gateway,
+                via_gateway: false,
                 sub_attributes: false,
                 sub_rpc: false,
                 last_seen_ms: now_ms(),
@@ -161,12 +164,12 @@ impl DeviceSessionRegistry {
         Ok(())
     }
 
-    /// 订阅了 RPC 的会话，优先非网关。
+    /// 订阅了 RPC 的会话，优先直连会话，再使用网关子设备会话。
     pub async fn rpc_session(&self, device_id: Uuid) -> TbResult<Option<SessionEntry>> {
         let sessions = self.any_sessions(device_id).await?;
         Ok(sessions
             .iter()
-            .find(|e| e.sub_rpc && !e.is_gateway)
+            .find(|e| e.sub_rpc && !e.via_gateway)
             .or_else(|| sessions.iter().find(|e| e.sub_rpc))
             .cloned())
     }
@@ -329,6 +332,7 @@ mod tests {
             session_id: session_id.into(),
             node_id: "n1".into(),
             is_gateway: gateway,
+            via_gateway: gateway,
             sub_attributes: false,
             sub_rpc: false,
             last_seen_ms: 0,

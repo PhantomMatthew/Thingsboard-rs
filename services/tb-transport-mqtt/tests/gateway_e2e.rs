@@ -243,6 +243,52 @@ async fn gateway_e2e() {
     })
     .await;
 
+    create_gateway(&client, &core, &admin_token, "gw-2", "GW2_TOKEN").await;
+    let resp = client
+        .post(format!("{core}/api/device"))
+        .header("Authorization", bearer(&admin_token))
+        .json(&json!({"name": "admin-unowned-device", "accessToken": "ADMIN_DEVICE_TOKEN"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let unowned: Value = resp.json().await.unwrap();
+    let unowned_id = unowned["id"].as_str().unwrap();
+    let other_gateway = connect_until_success(mqtt_addr, "gw-e2e-2", "GW2_TOKEN").await;
+    for device_name in ["gw-sub-1", "admin-unowned-device"] {
+        other_gateway
+            .client
+            .publish(
+                "v1/gateway/connect",
+                QoS::AtLeastOnce,
+                false,
+                json!({"device": device_name}).to_string(),
+            )
+            .await
+            .unwrap();
+    }
+    other_gateway
+        .client
+        .publish(
+            "v1/gateway/telemetry",
+            QoS::AtLeastOnce,
+            false,
+            json!({
+                "gw-sub-1": {"temperature": 99},
+                "admin-unowned-device": {"stolen": true}
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        latest_telemetry(&client, &core, &admin_token, &sub_id).await["temperature"][0]["value"],
+        42
+    );
+    assert!(latest_telemetry(&client, &core, &admin_token, unowned_id).await["stolen"].is_null());
+    other_gateway.client.disconnect().await.unwrap();
+
     // 子设备属性上行 → REST CLIENT_SCOPE 可见
     gw.client
         .publish(

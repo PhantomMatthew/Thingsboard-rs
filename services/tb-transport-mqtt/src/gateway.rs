@@ -90,7 +90,7 @@ async fn on_connect(state: &TransportState, session: &mut Session, payload: &[u8
         device_profile_id: device.device_profile_id.clone(),
         device_name: device.device_name.clone(),
         device_type: device.device_type.clone(),
-        is_gateway: true,
+        is_gateway: false,
         gateway_session_id: session.info.session_id.clone(),
     };
     let rpc_subscribed = session.gateway_rpc_qos.load(Ordering::Relaxed);
