@@ -255,6 +255,64 @@ async fn persistent_all_restores_after_engine_rebuild() {
 }
 
 #[tokio::test]
+async fn storage_failure_routes_to_failure_without_memory_buffering() {
+    let config = json!({"interval": 1, "strategy": "ALL", "outMsgType": "DEDUP_ALL"});
+    let test = setup(config.clone()).await;
+    let mut dedup = rule_node(test.chain_id, "action.deduplication", config);
+    dedup.id = test.dedup_node_id;
+    let checkpoint = rule_node(test.chain_id, "flow.checkpoint", json!({}));
+    let math = rule_node(
+        test.chain_id,
+        "action.math",
+        json!({"operation": "ADD", "fields": ["v"], "result_key": "v"}),
+    );
+    let (checkpoint_id, math_id) = (checkpoint.id, math.id);
+    RuleChainDao::new(test.pool.clone())
+        .save_nodes(
+            test.chain_id,
+            &[dedup, checkpoint, math],
+            &[
+                (test.dedup_node_id, checkpoint_id, "Success".into()),
+                (test.dedup_node_id, checkpoint_id, "Failure".into()),
+                (checkpoint_id, math_id, "Success".into()),
+            ],
+            Some(test.dedup_node_id),
+        )
+        .await
+        .unwrap();
+    let engine = engine(&test);
+    let now = chrono::Utc::now().timestamp_millis();
+    append(&test, &engine, &[msg(&test, 1, now)]).await;
+    assert!(test.producer.sent.lock().unwrap().is_empty());
+
+    sqlx::query("ALTER TABLE rule_node_dedup_msg RENAME TO rule_node_dedup_msg_offline")
+        .execute(&test.pool)
+        .await
+        .unwrap();
+    append(&test, &engine, &[msg(&test, 2, now + 1)]).await;
+    let failed = test.producer.drain();
+    assert_eq!(failed.len(), 1, "storage failure must surface on Failure");
+    assert_eq!(failed[0].data, json!({"v": 2}));
+    assert_eq!(failed[0].rule_node_id, Some(math_id));
+    sqlx::query("ALTER TABLE rule_node_dedup_msg_offline RENAME TO rule_node_dedup_msg")
+        .execute(&test.pool)
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    engine
+        .process_due_windows("after-outage", 10)
+        .await
+        .unwrap();
+    let sent = test.producer.drain();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].msg_type, "DEDUP_ALL");
+    let window = sent[0].data.as_array().unwrap();
+    assert_eq!(window.len(), 1, "failed message is not merged from memory");
+    assert_eq!(window[0]["msg"], json!({"v": 1}));
+}
+
+#[tokio::test]
 async fn concurrent_scanners_emit_once_and_retry_same_output() {
     let test = setup(json!({
         "interval": 1,
