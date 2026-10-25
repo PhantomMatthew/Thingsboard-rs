@@ -19,6 +19,7 @@ pub const KAFKA_BROKERS: &str = "localhost:29092";
 
 /// 返回 (tb-core REST base, mqtt 监听地址)。每个调用方独立测试库，可并行。
 pub async fn start_servers() -> (String, SocketAddr) {
+    unsafe { std::env::set_var("TB_CLAIM_ENABLED", "true") };
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             "tb_core=debug,tb_transport_api=debug,tb_transport_mqtt=debug,tb_queue=debug",

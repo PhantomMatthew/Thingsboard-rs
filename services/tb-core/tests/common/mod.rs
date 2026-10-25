@@ -25,6 +25,7 @@ pub async fn start_server_with_pool() -> (String, PgPool) {
 }
 
 pub async fn start_server_with_state() -> (String, PgPool, AppState) {
+    unsafe { std::env::set_var("TB_CLAIM_ENABLED", "true") };
     let admin = PgPoolOptions::new()
         .max_connections(1)
         .connect(ADMIN_URL)

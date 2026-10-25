@@ -10,6 +10,7 @@ use crate::AppState;
 pub const CLAIMING_ALLOWED_ATTRIBUTE: &str = "claimingAllowed";
 pub const CLAIMING_DATA_ATTRIBUTE: &str = "claimingData";
 const DEFAULT_CLAIM_DURATION_MS: i64 = 86_400_000;
+const DEFAULT_MAX_CLAIM_DURATION_MS: i64 = 86_400_000;
 
 #[derive(Debug)]
 pub enum ClaimResult {
@@ -34,6 +35,9 @@ pub async fn register(state: &AppState, msg: &ClaimDeviceMsg) -> TbResult<()> {
         .map_err(|_| TbError::InvalidInput("invalid claim tenant id".into()))?;
     let device_id = Uuid::parse_str(&session.device_id)
         .map_err(|_| TbError::InvalidInput("invalid claim device id".into()))?;
+    if msg.secret_key.trim().is_empty() {
+        return Ok(());
+    }
     let Some(device) = state.device_dao.find_by_id(device_id).await? else {
         return Ok(());
     };
@@ -48,7 +52,8 @@ pub async fn register(state: &AppState, msg: &ClaimDeviceMsg) -> TbResult<()> {
         msg.duration_ms
     } else {
         default_duration_ms()
-    };
+    }
+    .min(max_duration_ms());
     let data = ClaimingData {
         secret_key: msg.secret_key.clone(),
         expiration_time: chrono::Utc::now()
@@ -60,7 +65,6 @@ pub async fn register(state: &AppState, msg: &ClaimDeviceMsg) -> TbResult<()> {
     let _: Option<String> = redis::cmd("SET")
         .arg(redis_key(tenant_id, device_id))
         .arg(value)
-        .arg("NX")
         .arg("PX")
         .arg(duration_ms)
         .query_async(&mut redis)
@@ -79,6 +83,9 @@ pub async fn claim(
         clear_registration(state, device, true).await?;
         return Ok(ClaimResult::Claimed);
     }
+    if secret_key.trim().is_empty() {
+        return Ok(ClaimResult::Failure);
+    }
 
     let raw = match redis_claiming_data(state, device).await? {
         Some(data) => Some(data),
@@ -87,7 +94,7 @@ pub async fn claim(
     let data = match raw.as_deref().map(parse_claiming_data).transpose() {
         Ok(data) => data,
         Err(_) => {
-            clear_registration(state, device, true).await?;
+            clear_registration(state, device, false).await?;
             return Ok(ClaimResult::Failure);
         }
     };
@@ -103,10 +110,11 @@ pub async fn claim(
         }
         return Ok(ClaimResult::Failure);
     };
-    if data.expiration_time <= chrono::Utc::now().timestamp_millis()
-        || data.secret_key != secret_key
-    {
-        clear_registration(state, device, true).await?;
+    if data.expiration_time <= chrono::Utc::now().timestamp_millis() {
+        clear_registration(state, device, false).await?;
+        return Ok(ClaimResult::Failure);
+    }
+    if data.secret_key != secret_key {
         return Ok(ClaimResult::Failure);
     }
 
@@ -130,7 +138,7 @@ fn claiming_enabled() -> bool {
     std::env::var("TB_CLAIM_ENABLED")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 fn default_duration_ms() -> i64 {
@@ -139,6 +147,14 @@ fn default_duration_ms() -> i64 {
         .and_then(|value| value.parse::<i64>().ok())
         .filter(|duration| *duration > 0)
         .unwrap_or(DEFAULT_CLAIM_DURATION_MS)
+}
+
+fn max_duration_ms() -> i64 {
+    std::env::var("TB_CLAIM_MAX_DURATION_MS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|duration| *duration > 0)
+        .unwrap_or(DEFAULT_MAX_CLAIM_DURATION_MS)
 }
 
 async fn claiming_allowed(state: &AppState, device_id: Uuid) -> TbResult<bool> {

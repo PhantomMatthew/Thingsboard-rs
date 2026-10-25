@@ -72,7 +72,8 @@ ThingsBoard IoT 平台的 Rust 重写版（微服务架构，非兼容重设计�
 | `TB_MQTT_BIND` | tb-transport-mqtt | `0.0.0.0:1883` | MQTT 监听地址 |
 | `TB_MQTTS_BIND` | tb-transport-mqtt | 空（关闭） | MQTTS 监听地址，如 `0.0.0.0:8883` |
 | `TB_MQTT_TLS_CERT` / `TB_MQTT_TLS_KEY` | tb-transport-mqtt | 无 | MQTTS 服务端 PEM 证书/私钥；启用 TLS 时必填 |
-| `TB_CLAIM_ENABLED` / `TB_CLAIM_DURATION_MS` | tb-core | true / 86400000 | 是否默认允许设备认领及默认登记时长 |
+| `TB_CLAIM_ENABLED` | tb-core | false | 是否默认允许设备认领；`claimingAllowed=true` 可单设备开启 |
+| `TB_CLAIM_DURATION_MS` / `TB_CLAIM_MAX_DURATION_MS` | tb-core | 86400000 / 86400000 | 默认登记时长及设备可申请的最大时长 |
 | `TB_TRANSPORT_HTTP_PORT` | tb-transport-http | 8088 | HTTP transport 端口 |
 | `TB_COAP_BIND` | tb-transport-coap | `0.0.0.0:5683` | CoAP 监听地址 |
 | `TB_LWM2M_BIND` | tb-transport-lwm2m | `0.0.0.0:5685` | LwM2M UDP 监听地址 |

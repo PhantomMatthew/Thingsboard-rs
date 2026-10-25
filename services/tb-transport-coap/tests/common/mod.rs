@@ -19,6 +19,7 @@ pub const KAFKA_BROKERS: &str = "localhost:29092";
 
 /// 返回 (tb-core REST base, tb-transport-coap UDP addr)。每个调用方独立测试库。
 pub async fn start_servers() -> (String, SocketAddr) {
+    unsafe { std::env::set_var("TB_CLAIM_ENABLED", "true") };
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             "tb_core=debug,tb_transport_api=debug,tb_transport_coap=debug,tb_queue=debug",

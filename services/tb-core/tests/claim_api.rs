@@ -224,6 +224,21 @@ async fn claim_service_and_customer_api() {
             .customer_id
             .is_none()
     );
+    let preserved = state
+        .attributes_dao
+        .find(device_id, AttributeScope::ServerScope, None)
+        .await
+        .unwrap();
+    assert!(
+        preserved
+            .iter()
+            .any(|entry| entry.key == CLAIMING_ALLOWED_ATTRIBUTE)
+    );
+    assert!(
+        preserved
+            .iter()
+            .any(|entry| entry.key == CLAIMING_DATA_ATTRIBUTE)
+    );
 
     tb_core::claim::register(
         &state,
@@ -231,19 +246,11 @@ async fn claim_service_and_customer_api() {
     )
     .await
     .unwrap();
-    state
-        .attributes_dao
-        .save(
-            device_id,
-            AttributeScope::ServerScope,
-            &[KvEntry {
-                key: CLAIMING_ALLOWED_ATTRIBUTE.into(),
-                value: KvValue::Bool(true),
-            }],
-        )
-        .await
-        .unwrap();
     let response = customer_claim(&client, &base, &customer_a_token, "claim-success", "").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.text().await.unwrap(), "FAILURE");
+    let response =
+        customer_claim(&client, &base, &customer_a_token, "claim-success", "secret").await;
     assert_eq!(response.status(), StatusCode::OK);
     let claimed: Value = response.json().await.unwrap();
     assert_eq!(claimed["response"], "SUCCESS");
@@ -262,6 +269,37 @@ async fn claim_service_and_customer_api() {
     let response = customer_claim(&client, &base, &customer_b_token, "claim-success", "").await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(response.text().await.unwrap(), "CLAIMED");
+
+    let update = create_device(&client, &base, &admin_token, "claim-update").await;
+    let update_id = update["id"].as_str().unwrap();
+    tb_core::claim::register(
+        &state,
+        &claim_message(&tenant_id, update_id, "first", i64::MAX),
+    )
+    .await
+    .unwrap();
+    let mut redis = state.redis_manager().await.unwrap();
+    let ttl: i64 = redis::cmd("PTTL")
+        .arg(format!("claim:{tenant_id}:{update_id}"))
+        .query_async(&mut redis)
+        .await
+        .unwrap();
+    assert!(
+        ttl > 0 && ttl <= 86_400_000,
+        "claim TTL was not capped: {ttl}"
+    );
+    tb_core::claim::register(
+        &state,
+        &claim_message(&tenant_id, update_id, "second", 60_000),
+    )
+    .await
+    .unwrap();
+    let response = customer_claim(&client, &base, &customer_a_token, "claim-update", "first").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.text().await.unwrap(), "FAILURE");
+    let response =
+        customer_claim(&client, &base, &customer_a_token, "claim-update", "second").await;
+    assert_eq!(response.status(), StatusCode::OK);
 
     let expired = create_device(&client, &base, &admin_token, "claim-expired").await;
     let expired_id = expired["id"].as_str().unwrap();

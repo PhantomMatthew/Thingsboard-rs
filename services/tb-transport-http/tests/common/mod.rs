@@ -23,6 +23,7 @@ pub async fn start_servers() -> (String, String) {
 
 /// 同 start_servers，rate_limit > 0 时启用租户级限流（msg/s）。
 pub async fn start_servers_with_rate_limit(rate_limit: u32) -> (String, String) {
+    unsafe { std::env::set_var("TB_CLAIM_ENABLED", "true") };
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             "tb_core=debug,tb_transport_api=debug,tb_transport_http=debug,tb_queue=debug",
