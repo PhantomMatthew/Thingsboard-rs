@@ -4,8 +4,9 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose,
+    BasicConstraints, CertificateParams, CertificateRevocationListParams, DistinguishedName,
+    DnType, ExtendedKeyUsagePurpose, IsCa, KeyIdMethod, KeyPair, KeyUsagePurpose, RevocationReason,
+    RevokedCertParams, SerialNumber,
 };
 use rumqttc::{
     AsyncClient, ConnectReturnCode, ConnectionError, Event, MqttOptions, Packet, TlsConfiguration,
@@ -44,7 +45,8 @@ fn expired() -> TestCertificate {
     }
 }
 
-fn ca_signed_chain(common_name: &str) -> (String, TestCertificate) {
+/// 返回 (CA PEM, 客户端链, 吊销该叶子证书的 CRL PEM)。
+fn ca_signed_chain(common_name: &str) -> (String, TestCertificate, String) {
     let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
     ca_params.distinguished_name = DistinguishedName::new();
     ca_params
@@ -61,8 +63,24 @@ fn ca_signed_chain(common_name: &str) -> (String, TestCertificate) {
         .distinguished_name
         .push(DnType::CommonName, common_name);
     leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    leaf_params.serial_number = Some(SerialNumber::from(0x5001u64));
     let leaf_key = KeyPair::generate().unwrap();
     let leaf = leaf_params.signed_by(&leaf_key, &ca, &ca_key).unwrap();
+    let crl = CertificateRevocationListParams {
+        this_update: rcgen::date_time_ymd(2024, 1, 1),
+        next_update: rcgen::date_time_ymd(2099, 1, 1),
+        crl_number: SerialNumber::from(1u64),
+        issuing_distribution_point: None,
+        revoked_certs: vec![RevokedCertParams {
+            serial_number: SerialNumber::from(0x5001u64),
+            revocation_time: rcgen::date_time_ymd(2024, 1, 1),
+            reason_code: Some(RevocationReason::KeyCompromise),
+            invalidity_date: None,
+        }],
+        key_identifier_method: KeyIdMethod::Sha256,
+    }
+    .signed_by(&ca, &ca_key)
+    .unwrap();
     (
         ca.pem(),
         TestCertificate {
@@ -70,6 +88,7 @@ fn ca_signed_chain(common_name: &str) -> (String, TestCertificate) {
             key_pem: leaf_key.serialize_pem(),
             der: leaf.der().to_vec(),
         },
+        crl.pem().unwrap(),
     )
 }
 
@@ -247,25 +266,27 @@ async fn mqtts_x509_chain_auto_provisions_with_full_tls_chain() {
     let http = reqwest::Client::builder().no_proxy().build().unwrap();
     let (core, _) = start_servers().await;
     let (admin, _) = setup_tenant_admin(&http, &core, "MQTTS Chain", "mqtts-chain@tb.io").await;
-    let (ca_pem, client) = ca_signed_chain("mqtt-chain-device");
+    let (ca_pem, client, revoking_crl) = ca_signed_chain("mqtt-chain-device");
+    let mut profile = json!({
+        "name": "MQTT X509 chain",
+        "provisionType": "X509_CERTIFICATE_CHAIN",
+        "profileData": {
+            "provisionConfiguration": {
+                "certificate": ca_pem,
+                "certificateRegExPattern": "^(.*)$",
+                "allowCreateNewDevicesByX509Certificate": true
+            }
+        }
+    });
     let response = http
         .post(format!("{core}/api/deviceProfile"))
         .header("Authorization", bearer(&admin))
-        .json(&json!({
-            "name": "MQTT X509 chain",
-            "provisionType": "X509_CERTIFICATE_CHAIN",
-            "profileData": {
-                "provisionConfiguration": {
-                    "certificate": ca_pem,
-                    "certificateRegExPattern": "^(.*)$",
-                    "allowCreateNewDevicesByX509Certificate": true
-                }
-            }
-        }))
+        .json(&profile)
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::OK);
+    profile["id"] = response.json::<Value>().await.unwrap()["id"].clone();
 
     let server = self_signed("127.0.0.1");
     let mqtts_addr = start_mqtts(&server).await;
@@ -309,5 +330,34 @@ async fn mqtts_x509_chain_auto_provisions_with_full_tls_chain() {
         tb_common::x509::x509_credential_from_der(&client.der)
             .unwrap()
             .certificate_base64
+    );
+
+    connect_until_success(tls_options(
+        "chain-reconnect",
+        mqtts_addr.port(),
+        &server,
+        Some(&client),
+    ))
+    .await;
+    profile["profileData"]["provisionConfiguration"]["certificateRevocationList"] =
+        Value::String(revoking_crl);
+    let response = http
+        .post(format!("{core}/api/deviceProfile"))
+        .header("Authorization", bearer(&admin))
+        .json(&profile)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        connack(tls_options(
+            "chain-revoked",
+            mqtts_addr.port(),
+            &server,
+            Some(&client)
+        ))
+        .await,
+        Some(ConnectReturnCode::BadUserNamePassword),
+        "revoked chain is rejected for an already provisioned device"
     );
 }

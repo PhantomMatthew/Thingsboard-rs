@@ -9,6 +9,8 @@ use crate::{TbError, TbResult};
 pub const X509_CERTIFICATE_CHAIN: &str = "X509_CERTIFICATE_CHAIN";
 pub const MAX_X509_CHAIN_CERTIFICATES: usize = 8;
 pub const MAX_X509_CHAIN_BYTES: usize = 64 * 1024;
+pub const MAX_X509_CRLS: usize = 16;
+pub const MAX_X509_CRL_BYTES: usize = 256 * 1024;
 
 #[derive(Debug)]
 pub struct X509ChainProvisionConfiguration {
@@ -16,6 +18,8 @@ pub struct X509ChainProvisionConfiguration {
     pub certificate_regex: Regex,
     pub allow_create_new_devices: bool,
     pub provision_device_key: String,
+    /// `certificateRevocationList`（PEM，可含多个 CRL）解码后的 DER。
+    pub crls_der: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,12 +130,62 @@ pub fn x509_chain_provision_configuration(
     let certificate_der = STANDARD
         .decode(&certificate.certificate_base64)
         .map_err(|e| TbError::InvalidInput(format!("invalid normalized X509 certificate: {e}")))?;
+    let crls_der = match configuration.get("certificateRevocationList") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::String(pem)) => parse_x509_crls(pem)?,
+        Some(_) => {
+            return Err(TbError::InvalidInput(
+                "certificateRevocationList must be a PEM string".into(),
+            ));
+        }
+    };
     Ok(X509ChainProvisionConfiguration {
         provision_device_key: certificate.credentials_id,
         certificate_der,
         certificate_regex,
         allow_create_new_devices,
+        crls_der,
     })
+}
+
+/// 解析 PEM 中全部 `X509 CRL` 块；空串表示不配置。
+pub fn parse_x509_crls(pem: &str) -> TbResult<Vec<Vec<u8>>> {
+    const BEGIN: &str = "-----BEGIN X509 CRL-----";
+    const END: &str = "-----END X509 CRL-----";
+    let mut crls = Vec::new();
+    let mut total_bytes = 0usize;
+    let mut rest = pem.trim();
+    while !rest.is_empty() {
+        let body = rest
+            .strip_prefix(BEGIN)
+            .ok_or_else(|| TbError::InvalidInput("certificateRevocationList must be PEM".into()))?;
+        let (body, tail) = body.split_once(END).ok_or_else(|| {
+            TbError::InvalidInput("certificateRevocationList PEM block is not terminated".into())
+        })?;
+        let der = STANDARD
+            .decode(body.split_whitespace().collect::<String>())
+            .map_err(|_| {
+                TbError::InvalidInput("invalid certificateRevocationList base64".into())
+            })?;
+        match x509_parser::parse_x509_crl(&der) {
+            Ok(([], _)) => {}
+            _ => {
+                return Err(TbError::InvalidInput(
+                    "invalid X509 certificate revocation list".into(),
+                ));
+            }
+        }
+        total_bytes += der.len();
+        crls.push(der);
+        if crls.len() > MAX_X509_CRLS || total_bytes > MAX_X509_CRL_BYTES {
+            return Err(TbError::InvalidInput(format!(
+                "certificateRevocationList allows at most {MAX_X509_CRLS} CRLs \
+                 and {MAX_X509_CRL_BYTES} bytes"
+            )));
+        }
+        rest = tail.trim_start();
+    }
+    Ok(crls)
 }
 
 pub fn normalize_x509_chain_profile(
@@ -225,6 +279,66 @@ mod tests {
             profile["provisionConfiguration"]["certificateRegExPattern"] = Value::from(pattern);
             assert!(normalize_x509_chain_profile(X509_CERTIFICATE_CHAIN, &mut profile).is_err());
         }
+    }
+
+    fn signed_crl() -> rcgen::CertificateRevocationList {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let key = rcgen::KeyPair::generate().unwrap();
+        let ca = params.self_signed(&key).unwrap();
+        rcgen::CertificateRevocationListParams {
+            this_update: rcgen::date_time_ymd(2024, 1, 1),
+            next_update: rcgen::date_time_ymd(2099, 1, 1),
+            crl_number: rcgen::SerialNumber::from(1u64),
+            issuing_distribution_point: None,
+            revoked_certs: vec![rcgen::RevokedCertParams {
+                serial_number: rcgen::SerialNumber::from(42u64),
+                revocation_time: rcgen::date_time_ymd(2024, 1, 1),
+                reason_code: Some(rcgen::RevocationReason::KeyCompromise),
+                invalidity_date: None,
+            }],
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        }
+        .signed_by(&ca, &key)
+        .unwrap()
+    }
+
+    #[test]
+    fn crl_pem_blocks_are_parsed_and_validated() {
+        let crl = signed_crl();
+        let pem = crl.pem().unwrap();
+        assert_eq!(parse_x509_crls("").unwrap(), Vec::<Vec<u8>>::new());
+        assert_eq!(parse_x509_crls(&pem).unwrap(), vec![crl.der().to_vec()]);
+        assert_eq!(
+            parse_x509_crls(&format!("{pem}\r\n{pem}")).unwrap().len(),
+            2
+        );
+        assert!(parse_x509_crls(&pem.replace("-----END X509 CRL-----", "")).is_err());
+        assert!(parse_x509_crls("not-a-crl").is_err());
+        let cert = rcgen::generate_simple_self_signed(["ca.example.com".into()]).unwrap();
+        let wrong_type = cert.cert.pem().replace("CERTIFICATE-----", "X509 CRL-----");
+        assert!(parse_x509_crls(&wrong_type).is_err());
+        assert!(parse_x509_crls(&pem.repeat(MAX_X509_CRLS + 1)).is_err());
+    }
+
+    #[test]
+    fn chain_profile_accepts_optional_crl() {
+        let cert = rcgen::generate_simple_self_signed(["ca.example.com".into()]).unwrap();
+        let mut profile = serde_json::json!({
+            "provisionConfiguration": {
+                "certificate": cert.cert.pem(),
+                "certificateRegExPattern": "(.*)",
+                "certificateRevocationList": signed_crl().pem().unwrap()
+            }
+        });
+        let parsed = x509_chain_provision_configuration(&profile).unwrap();
+        assert_eq!(parsed.crls_der.len(), 1);
+        profile["provisionConfiguration"]["certificateRevocationList"] = Value::from(7);
+        assert!(x509_chain_provision_configuration(&profile).is_err());
     }
 
     #[test]

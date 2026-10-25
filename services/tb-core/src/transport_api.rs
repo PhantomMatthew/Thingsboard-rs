@@ -13,7 +13,10 @@ use tb_proto::transport as pb;
 use tb_queue::topics::TbTopic;
 use tb_queue::{KafkaQueueProducer, QueueConsumer, QueueProducer as _, StreamQueueConsumer};
 use uuid::Uuid;
-use webpki::{EndEntityCert, KeyUsage, anchor_from_trusted_cert};
+use webpki::{
+    BorrowedCertRevocationList, CertRevocationList, EndEntityCert, ExpirationPolicy, KeyUsage,
+    RevocationCheckDepth, RevocationOptionsBuilder, UnknownStatusPolicy, anchor_from_trusted_cert,
+};
 
 use crate::AppState;
 
@@ -412,19 +415,64 @@ async fn validate_token(state: &AppState, token: &str) -> pb::ValidateCredential
     build_valid_response(state, &credentials).await
 }
 
-async fn validate_x509(state: &AppState, cert_hash: &str) -> pb::ValidateCredentialsResponse {
+/// 仅凭证书哈希校验（钉扎）。X509 链档案下的设备必须出示完整链，交由
+/// `validate_or_create_x509` 校验 CA 与吊销列表。
+pub async fn validate_x509(state: &AppState, cert_hash: &str) -> pb::ValidateCredentialsResponse {
     let Some(credentials) = find_credentials(state, cert_hash).await else {
         return invalid_credentials();
     };
     if credentials.credentials_type != CredentialsType::X509Certificate {
         return invalid_credentials();
     }
-    build_valid_response(state, &credentials).await
+    match device_chain_configuration(state, credentials.device_id).await {
+        Ok(None) => build_valid_response(state, &credentials).await,
+        Ok(Some(_)) | Err(_) => invalid_credentials(),
+    }
+}
+
+/// 设备所属档案为 X509 链档案时返回其配置；档案配置无法解析视为错误（拒绝认证）。
+async fn device_chain_configuration(
+    state: &AppState,
+    device_id: Uuid,
+) -> TbResult<Option<tb_common::x509::X509ChainProvisionConfiguration>> {
+    let device = state
+        .device_dao
+        .find_by_id(device_id)
+        .await?
+        .ok_or_else(|| TbError::NotFound(format!("device {device_id}")))?;
+    let profile = state
+        .device_profile_dao
+        .find_by_id(device.device_profile_id)
+        .await?
+        .ok_or_else(|| TbError::NotFound(format!("device profile {}", device.device_profile_id)))?;
+    if profile.provision_type != tb_common::x509::X509_CERTIFICATE_CHAIN {
+        return Ok(None);
+    }
+    tb_common::x509::x509_chain_provision_configuration(&profile.profile_data).map(Some)
+}
+
+/// 链尾必须是档案 CA，且叶子经中间证书验证到该 CA，链上任一证书不得被档案 CRL 吊销。
+fn chain_matches_profile(
+    chain: &[Vec<u8>],
+    configuration: &tb_common::x509::X509ChainProvisionConfiguration,
+) -> bool {
+    let tail_matches = tb_common::x509::x509_cert_hash_from_der(&chain[chain.len() - 1])
+        .is_ok_and(|hash| hash == configuration.provision_device_key);
+    tail_matches
+        && verify_x509_client_chain(
+            chain,
+            &configuration.certificate_der,
+            &configuration.crls_der,
+            UnixTime::now(),
+        )
+        .inspect_err(|e| tracing::debug!("X509 client path rejected: {e}"))
+        .is_ok()
 }
 
 fn verify_x509_client_chain(
     chain: &[Vec<u8>],
     trusted_certificate: &[u8],
+    crls_der: &[Vec<u8>],
     time: UnixTime,
 ) -> Result<(), webpki::Error> {
     if chain.len() < 2 {
@@ -438,13 +486,28 @@ fn verify_x509_client_chain(
         .iter()
         .map(|certificate| CertificateDer::from(certificate.as_slice()))
         .collect::<Vec<_>>();
+    let crls = crls_der
+        .iter()
+        .map(|der| BorrowedCertRevocationList::from_der(der).map(CertRevocationList::from))
+        .collect::<Result<Vec<_>, _>>()?;
+    let crl_refs = crls.iter().collect::<Vec<_>>();
+    // 未覆盖到的签发者放行；CRL 过期仍按其中条目吊销，不因过期拒绝全部设备。
+    let revocation = RevocationOptionsBuilder::new(&crl_refs)
+        .ok()
+        .map(|builder| {
+            builder
+                .with_depth(RevocationCheckDepth::Chain)
+                .with_status_policy(UnknownStatusPolicy::Allow)
+                .with_expiration_policy(ExpirationPolicy::Ignore)
+                .build()
+        });
     leaf.verify_for_usage(
         webpki::ALL_VERIFICATION_ALGS,
         std::slice::from_ref(&trust_anchor),
         &intermediates,
         time,
         KeyUsage::client_auth(),
-        None,
+        revocation,
         Some(&|path: &webpki::VerifiedPath<'_>| {
             if path.intermediate_certificates().count() == intermediates.len() {
                 Ok(())
@@ -535,7 +598,17 @@ pub async fn validate_or_create_x509(
         if credentials.credentials_type != CredentialsType::X509Certificate {
             return invalid_credentials();
         }
-        return build_valid_response(state, &credentials).await;
+        return match device_chain_configuration(state, credentials.device_id).await {
+            Ok(None) => build_valid_response(state, &credentials).await,
+            Ok(Some(configuration)) if chain_matches_profile(chain, &configuration) => {
+                build_valid_response(state, &credentials).await
+            }
+            Ok(Some(_)) => invalid_credentials(),
+            Err(e) => {
+                tracing::warn!(device_id = %credentials.device_id, "X509 profile check failed: {e}");
+                invalid_credentials()
+            }
+        };
     }
     let chain_tail_hash = match tb_common::x509::x509_cert_hash_from_der(&chain[chain.len() - 1]) {
         Ok(hash) => hash,
@@ -562,9 +635,8 @@ pub async fn validate_or_create_x509(
             }
             _ => return invalid_credentials(),
         };
-    if let Err(e) = verify_x509_client_chain(chain, &configuration.certificate_der, UnixTime::now())
-    {
-        tracing::debug!(profile_id = %profile.id, "X509 client path rejected: {e}");
+    if !chain_matches_profile(chain, &configuration) {
+        tracing::debug!(profile_id = %profile.id, "X509 client chain rejected");
         return invalid_credentials();
     }
     let device_name = match x509_device_name(&chain[0], &configuration.certificate_regex) {
@@ -1111,12 +1183,17 @@ mod tests {
         let leaf = test_leaf(&ca, "device-1", false);
         let chain = vec![leaf.clone(), ca.certificate.der().to_vec()];
         assert!(
-            verify_x509_client_chain(&chain, ca.certificate.der().as_ref(), UnixTime::now())
+            verify_x509_client_chain(&chain, ca.certificate.der().as_ref(), &[], UnixTime::now())
                 .is_ok()
         );
         assert!(
-            verify_x509_client_chain(&chain, other_ca.certificate.der().as_ref(), UnixTime::now())
-                .is_err()
+            verify_x509_client_chain(
+                &chain,
+                other_ca.certificate.der().as_ref(),
+                &[],
+                UnixTime::now()
+            )
+            .is_err()
         );
         let unrelated = vec![
             leaf.clone(),
@@ -1124,13 +1201,19 @@ mod tests {
             ca.certificate.der().to_vec(),
         ];
         assert!(
-            verify_x509_client_chain(&unrelated, ca.certificate.der().as_ref(), UnixTime::now())
-                .is_err()
+            verify_x509_client_chain(
+                &unrelated,
+                ca.certificate.der().as_ref(),
+                &[],
+                UnixTime::now()
+            )
+            .is_err()
         );
         assert!(
             verify_x509_client_chain(
                 std::slice::from_ref(&leaf),
                 ca.certificate.der().as_ref(),
+                &[],
                 UnixTime::now()
             )
             .is_err()
@@ -1141,8 +1224,13 @@ mod tests {
             ca.certificate.der().to_vec(),
         ];
         assert!(
-            verify_x509_client_chain(&expired, ca.certificate.der().as_ref(), UnixTime::now())
-                .is_err()
+            verify_x509_client_chain(
+                &expired,
+                ca.certificate.der().as_ref(),
+                &[],
+                UnixTime::now()
+            )
+            .is_err()
         );
 
         let mut tampered = leaf;
@@ -1150,8 +1238,88 @@ mod tests {
         tampered[last] ^= 1;
         let tampered = vec![tampered, ca.certificate.der().to_vec()];
         assert!(
-            verify_x509_client_chain(&tampered, ca.certificate.der().as_ref(), UnixTime::now())
-                .is_err()
+            verify_x509_client_chain(
+                &tampered,
+                ca.certificate.der().as_ref(),
+                &[],
+                UnixTime::now()
+            )
+            .is_err()
+        );
+    }
+
+    fn test_crl(
+        issuer: &TestCa,
+        signing_key: &rcgen::KeyPair,
+        revoked: &[Vec<u8>],
+        next_update_year: i32,
+    ) -> Vec<u8> {
+        rcgen::CertificateRevocationListParams {
+            this_update: rcgen::date_time_ymd(2020, 1, 1),
+            next_update: rcgen::date_time_ymd(next_update_year, 1, 1),
+            crl_number: rcgen::SerialNumber::from(1u64),
+            issuing_distribution_point: None,
+            revoked_certs: revoked
+                .iter()
+                .map(|der| {
+                    let (_, cert) = x509_parser::parse_x509_certificate(der).unwrap();
+                    rcgen::RevokedCertParams {
+                        serial_number: rcgen::SerialNumber::from_slice(cert.raw_serial()),
+                        revocation_time: rcgen::date_time_ymd(2020, 1, 1),
+                        reason_code: None,
+                        invalidity_date: None,
+                    }
+                })
+                .collect(),
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        }
+        .signed_by(&issuer.certificate, signing_key)
+        .unwrap()
+        .der()
+        .to_vec()
+    }
+
+    #[test]
+    fn webpki_client_auth_path_applies_crl_policy() {
+        let ca = test_ca("root");
+        let other_ca = test_ca("other-root");
+        let revoked = test_leaf(&ca, "revoked", false);
+        let kept = test_leaf(&ca, "kept", false);
+        let ca_der = ca.certificate.der().to_vec();
+        let verify = |leaf: &[u8], crls: &[Vec<u8>]| {
+            verify_x509_client_chain(
+                &[leaf.to_vec(), ca_der.clone()],
+                &ca_der,
+                crls,
+                UnixTime::now(),
+            )
+        };
+        let crl = test_crl(&ca, &ca.key, std::slice::from_ref(&revoked), 2099);
+        assert!(matches!(
+            verify(&revoked, std::slice::from_ref(&crl)),
+            Err(webpki::Error::CertRevoked)
+        ));
+        assert!(verify(&kept, std::slice::from_ref(&crl)).is_ok());
+
+        let expired_crl = test_crl(&ca, &ca.key, std::slice::from_ref(&revoked), 2021);
+        assert!(
+            verify(&revoked, &[expired_crl]).is_err(),
+            "expired CRL entries still revoke"
+        );
+        let unrelated = test_crl(
+            &other_ca,
+            &other_ca.key,
+            std::slice::from_ref(&revoked),
+            2099,
+        );
+        assert!(
+            verify(&revoked, &[unrelated]).is_ok(),
+            "issuers without a CRL are not rejected"
+        );
+        let forged = test_crl(&ca, &other_ca.key, &[], 2099);
+        assert!(
+            verify(&kept, &[forged]).is_err(),
+            "CRL with an invalid signature is never trusted"
         );
     }
 

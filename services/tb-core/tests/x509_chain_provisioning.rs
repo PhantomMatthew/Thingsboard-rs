@@ -1,13 +1,21 @@
 mod common;
 
+use std::time::Duration;
+
+use bytes::Bytes;
 use common::*;
+use prost::Message as _;
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
-    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
+    BasicConstraints, Certificate, CertificateParams, CertificateRevocationListParams,
+    DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, KeyIdMethod, KeyPair,
+    KeyUsagePurpose, RevocationReason, RevokedCertParams, SerialNumber,
 };
 use reqwest::StatusCode;
 use serde_json::{Value, json};
+use tb_core::device_session::SessionEntry;
+use tb_proto::core::{ToTransportMsg, to_transport_msg};
 use tb_proto::transport::ValidateOrCreateX509Request;
+use tb_queue::{KafkaQueueProducer, QueueConsumer, QueueProducer, StreamQueueConsumer, TbTopic};
 use uuid::Uuid;
 
 struct TestCa {
@@ -49,6 +57,61 @@ fn leaf(ca: &TestCa, common_name: &str, expired: bool) -> Vec<u8> {
 
 fn chain(ca: &TestCa, common_name: &str) -> Vec<Vec<u8>> {
     vec![leaf(ca, common_name, false), ca.certificate.der().to_vec()]
+}
+
+fn intermediate(root: &TestCa, common_name: &str, serial: u64) -> TestCa {
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.distinguished_name = DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(DnType::CommonName, common_name);
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    params.serial_number = Some(SerialNumber::from(serial));
+    let key = KeyPair::generate().unwrap();
+    let certificate = params
+        .signed_by(&key, &root.certificate, &root.key)
+        .unwrap();
+    TestCa { certificate, key }
+}
+
+fn serial_leaf(issuer: &TestCa, common_name: &str, serial: u64) -> Vec<u8> {
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.distinguished_name = DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(DnType::CommonName, common_name);
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    params.serial_number = Some(SerialNumber::from(serial));
+    let key = KeyPair::generate().unwrap();
+    params
+        .signed_by(&key, &issuer.certificate, &issuer.key)
+        .unwrap()
+        .der()
+        .to_vec()
+}
+
+fn crl_pem(issuer: &TestCa, revoked_serials: &[u64]) -> String {
+    CertificateRevocationListParams {
+        this_update: rcgen::date_time_ymd(2024, 1, 1),
+        next_update: rcgen::date_time_ymd(2099, 1, 1),
+        crl_number: SerialNumber::from(1u64),
+        issuing_distribution_point: None,
+        revoked_certs: revoked_serials
+            .iter()
+            .map(|serial| RevokedCertParams {
+                serial_number: SerialNumber::from(*serial),
+                revocation_time: rcgen::date_time_ymd(2024, 1, 1),
+                reason_code: Some(RevocationReason::KeyCompromise),
+                invalidity_date: None,
+            })
+            .collect(),
+        key_identifier_method: KeyIdMethod::Sha256,
+    }
+    .signed_by(&issuer.certificate, &issuer.key)
+    .unwrap()
+    .pem()
+    .unwrap()
 }
 
 fn request(chain: Vec<Vec<u8>>) -> ValidateOrCreateX509Request {
@@ -309,5 +372,179 @@ async fn x509_chain_provisioning_security_rotation_and_concurrency() {
     assert_eq!(
         pinned.credentials_body,
         pinned_credential.certificate_base64
+    );
+    assert!(
+        tb_core::transport_api::validate_x509(&state, &pinned_credential.credentials_id)
+            .await
+            .valid,
+        "devices outside chain profiles keep hash-only authentication"
+    );
+}
+
+#[tokio::test]
+async fn x509_chain_crl_revokes_existing_devices_and_closes_sessions() {
+    let _guard = INTEGRATION_LOCK.lock().await;
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let (core, _pool, state) = start_server_with_state().await;
+    let (admin, _) = setup_tenant_admin(&http, &core, "X509 CRL", "x509-crl@tb.io").await;
+
+    let root = ca("crl-root");
+    let revoked_issuer = intermediate(&root, "crl-revoked-intermediate", 0x2001);
+    let kept_issuer = intermediate(&root, "crl-kept-intermediate", 0x2002);
+    let root_der = root.certificate.der().to_vec();
+    let revoked_chain = vec![
+        serial_leaf(&root, "revoked-device", 0x1001),
+        root_der.clone(),
+    ];
+    let kept_chain = vec![serial_leaf(&root, "kept-device", 0x1002), root_der.clone()];
+    let revoked_issuer_chain = vec![
+        serial_leaf(&revoked_issuer, "revoked-issuer-device", 0x1003),
+        revoked_issuer.certificate.der().to_vec(),
+        root_der.clone(),
+    ];
+    let kept_issuer_chain = vec![
+        serial_leaf(&kept_issuer, "kept-issuer-device", 0x1004),
+        kept_issuer.certificate.der().to_vec(),
+        root_der.clone(),
+    ];
+
+    let profile = save_profile(
+        &http,
+        &core,
+        &admin,
+        profile_body(None, "crl", &root, "(.*)", true),
+    )
+    .await;
+    let profile_id = Uuid::parse_str(profile["id"].as_str().unwrap()).unwrap();
+    let mut revoked_device_id = None;
+    for chain in [
+        &revoked_chain,
+        &kept_chain,
+        &revoked_issuer_chain,
+        &kept_issuer_chain,
+    ] {
+        let response =
+            tb_core::transport_api::validate_or_create_x509(&state, &request(chain.clone())).await;
+        assert!(
+            response.valid,
+            "chain is valid before the CRL is configured"
+        );
+        revoked_device_id.get_or_insert(response.device.unwrap().device_id);
+    }
+    let revoked_device_id = Uuid::parse_str(&revoked_device_id.unwrap()).unwrap();
+    let revoked_credential = tb_common::x509::x509_credential_from_der(&revoked_chain[0]).unwrap();
+    assert!(
+        !tb_core::transport_api::validate_x509(&state, &revoked_credential.credentials_id)
+            .await
+            .valid,
+        "chain profile devices must present the full chain"
+    );
+
+    let node_id = format!("x509-crl-{}", Uuid::now_v7().simple());
+    let session_id = Uuid::now_v7().to_string();
+    state
+        .device_sessions
+        .open_session(
+            revoked_device_id,
+            SessionEntry {
+                session_id: session_id.clone(),
+                node_id: node_id.clone(),
+                is_gateway: false,
+                via_gateway: false,
+                sub_attributes: false,
+                sub_rpc: false,
+                last_seen_ms: 0,
+            },
+        )
+        .await
+        .unwrap();
+    let brokers = std::env::var("TB_KAFKA_BROKERS").unwrap_or_else(|_| "localhost:29092".into());
+    let topic = TbTopic::transport_notifications(&node_id);
+    KafkaQueueProducer::new(&brokers, "x509-crl-test")
+        .unwrap()
+        .send(&topic, "warmup", Bytes::new())
+        .await
+        .unwrap();
+    let mut notifications = StreamQueueConsumer::new_from_beginning(
+        &brokers,
+        &format!("x509-crl-test-{}", Uuid::now_v7().simple()),
+        &[topic.as_str()],
+    )
+    .unwrap();
+
+    let mut body = profile_body(Some(profile_id), "crl", &root, "(.*)", true);
+    body["profileData"]["provisionConfiguration"]["certificateRevocationList"] =
+        Value::String(crl_pem(&root, &[0x1001, 0x2001]));
+    save_profile(&http, &core, &admin, body.clone()).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let msg = tokio::time::timeout_at(deadline, notifications.recv())
+            .await
+            .expect("session close notification after CRL update")
+            .unwrap();
+        if msg.key.as_deref() != Some(session_id.as_bytes()) {
+            continue;
+        }
+        let notification = ToTransportMsg::decode(&msg.payload[..]).unwrap();
+        assert!(matches!(
+            notification.msg,
+            Some(to_transport_msg::Msg::SessionCloseNotification(_))
+        ));
+        break;
+    }
+
+    let validate = |chain: &Vec<Vec<u8>>| {
+        let state = state.clone();
+        let request = request(chain.clone());
+        async move {
+            tb_core::transport_api::validate_or_create_x509(&state, &request)
+                .await
+                .valid
+        }
+    };
+    assert!(!validate(&revoked_chain).await, "revoked leaf is rejected");
+    assert!(
+        !validate(&revoked_issuer_chain).await,
+        "leaf under a revoked intermediate is rejected"
+    );
+    assert!(
+        !validate(&vec![
+            serial_leaf(&revoked_issuer, "new-under-revoked", 0x1005),
+            revoked_issuer.certificate.der().to_vec(),
+            root_der.clone(),
+        ])
+        .await,
+        "revoked intermediate cannot provision new devices"
+    );
+    assert!(validate(&kept_chain).await, "non-revoked leaf stays valid");
+    assert!(
+        validate(&kept_issuer_chain).await,
+        "issuers without a CRL entry stay valid"
+    );
+
+    body["profileData"]["provisionConfiguration"]["certificateRevocationList"] =
+        Value::String("-----BEGIN X509 CRL-----\nAAAA\n-----END X509 CRL-----\n".into());
+    let invalid = http
+        .post(format!("{core}/api/deviceProfile"))
+        .header("Authorization", bearer(&admin))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        !validate(&revoked_chain).await,
+        "rejected save keeps the CRL"
+    );
+
+    body["profileData"]["provisionConfiguration"]
+        .as_object_mut()
+        .unwrap()
+        .remove("certificateRevocationList");
+    save_profile(&http, &core, &admin, body).await;
+    assert!(
+        validate(&revoked_chain).await,
+        "removing the CRL restores access"
     );
 }

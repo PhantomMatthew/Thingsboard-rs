@@ -91,7 +91,7 @@ ThingsBoard IoT 平台的 Rust 重写版（微服务架构，非兼容重设计�
 | `TB_TS_TTL_DAYS` / `TB_DEBUG_EVENT_TTL_DAYS` / `TB_ALARM_TTL_DAYS` / `TB_DEDUP_WINDOW_TTL_DAYS` / `TB_DELAY_TASK_TTL_DAYS` | tb-housekeeper | 0 / 7 / 0 / 7 / 7 | 各类数据保留天数（0=不清理；规则任务仅清终态） |
 | `TB_ENTITY_TOMBSTONE_RETENTION_HOURS` | tb-housekeeper | 24 | 已删实体墓碑保留时长（最小 1）；保留期内每轮清理删除后迟到写入的遥测、属性、告警、关系等 |
 
-MQTTS 客户端证书为可选项。支持设备绑定的 SHA3-256 pinned certificate，以及按租户设备档案配置的私有 CA 证书链校验和设备自动 provisioning；未提供证书时仍可使用 access token 或 MQTT basic。
+MQTTS 客户端证书为可选项。支持设备绑定的 SHA3-256 pinned certificate，以及按租户设备档案配置的私有 CA 证书链校验和设备自动 provisioning；未提供证书时仍可使用 access token 或 MQTT basic。证书链档案可配置 CRL（`certificateRevocationList`），档案内设备每次连接都重新校验 CA 与 CRL，CA 或 CRL 变化时断开该档案的设备会话；pinned 证书通过删除或更换设备凭证吊销。详见 `docs/API.md`。
 
 SNMP 当前支持 v2c 主动 GET 周期采集和设备发现（分页拉取全部设备并按 `TB_SNMP_DISCOVERY_INTERVAL_SEC` 周期刷新），不支持 v3、Trap/Inform 或 SET；多个 SNMP 实例之间不分片，每个实例都会轮询全部 SNMP 设备。LwM2M 当前支持 NoSec 注册/更新/注销、Read、TLV 和 SINGLE Observe，不支持 DTLS、Bootstrap、Composite Observe、固件 OTA 或下行 Write/Execute。LwM2M 资源类型使用显式内置对象模型，未建模资源会拒绝而不会按长度猜测。二者均通过 transport-api 校验设备档案和凭证，并经 core 写入遥测与属性。
 

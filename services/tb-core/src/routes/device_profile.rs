@@ -126,6 +126,9 @@ async fn save_profile(
                 crate::ota::spawn_profile_sync(&state, saved.id, kind, before);
             }
         }
+        if x509_trust(previous) != x509_trust(&saved) {
+            spawn_close_profile_sessions(&state, saved.id);
+        }
     }
     audit(
         &state,
@@ -136,6 +139,41 @@ async fn save_profile(
         "SUCCESS",
     );
     Ok(Json(saved))
+}
+
+/// X509 链档案的信任配置（CA 哈希 + CRL）；非链档案为 None。
+fn x509_trust(profile: &DeviceProfile) -> Option<(String, Vec<Vec<u8>>)> {
+    if profile.provision_type != tb_common::x509::X509_CERTIFICATE_CHAIN {
+        return None;
+    }
+    tb_common::x509::x509_chain_provision_configuration(&profile.profile_data)
+        .ok()
+        .map(|configuration| (configuration.provision_device_key, configuration.crls_der))
+}
+
+/// CA 或吊销列表变化后断开该档案全部设备会话，重连时按新配置重新校验证书链。
+fn spawn_close_profile_sessions(state: &AppState, profile_id: Uuid) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let device_ids = match state.device_dao.find_ids_by_profile_id(profile_id).await {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::warn!(%profile_id, "list devices for X509 trust update failed: {e}");
+                return;
+            }
+        };
+        for device_id in device_ids {
+            if let Err(e) = crate::routes::device::close_device_sessions(
+                &state,
+                device_id,
+                "device profile X509 trust updated",
+            )
+            .await
+            {
+                tracing::warn!(%device_id, "close session after X509 trust update failed: {e}");
+            }
+        }
+    });
 }
 
 async fn get_profile(

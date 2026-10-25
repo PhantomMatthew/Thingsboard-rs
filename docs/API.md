@@ -162,6 +162,14 @@ shared 属性 `{fw,sw}_title/version/tag/size/checksum_algorithm/checksum`；解
 SHA3-256 自动生成 `provisionDeviceKey`，调用方提供的同名字段不会被信任。
 
 MQTTS 客户端须发送 leaf 在前、CA 在尾的完整 DER 链（含中间 CA），最多 8 张、合计
-64 KiB。已有 pinned leaf 凭证优先；否则仅在链尾唯一匹配 chain profile、完整
-`client_auth` 路径验证及 CN 正则均通过时认证。自动创建开启时才允许新设备；同 profile
-可轮换 X509 leaf，跨 profile 或设备已有其他类型凭证会被拒绝。
+64 KiB。不属于 chain profile 的设备按 pinned leaf 凭证认证；否则仅在链尾唯一匹配 chain
+profile、完整 `client_auth` 路径验证及 CN 正则均通过时认证。自动创建开启时才允许新设备；
+同 profile 可轮换 X509 leaf，跨 profile 或设备已有其他类型凭证会被拒绝。
+
+吊销：`provisionConfiguration.certificateRevocationList` 可选，填 PEM 格式 CRL（可拼接多个
+`-----BEGIN X509 CRL-----` 块，最多 16 个、合计 256 KiB），保存时校验格式，非法返回 400。
+链上每张证书（leaf 与中间 CA）都按 CRL 检查，签名须来自对应签发者；没有对应 CRL 的签发者
+放行，CRL 过期后仍按其中条目吊销。chain profile 下的设备即使已有凭证，每次连接也要出示
+完整链并重新校验 CA 与 CRL，仅凭证书哈希不能认证。CA 或 CRL 变化时，core 会通知传输层断开
+该档案全部设备的会话，设备重连时按新配置校验。pinned（非 chain profile）证书没有 CRL，
+需通过删除或更换设备凭证吊销。
