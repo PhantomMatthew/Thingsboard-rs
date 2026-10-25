@@ -9,7 +9,7 @@ use serde_json::Value;
 use tb_auth::{ApiError, AuthUser};
 use tb_common::{EntityType, TbError};
 use tb_dao::models::{Authority, Customer};
-use tb_dao::{PageData, PageLink};
+use tb_dao::{PageData, PageLink, entity_cleanup};
 use uuid::Uuid;
 
 use crate::AppState;
@@ -108,7 +108,16 @@ async fn delete_customer(
     require_authority(&user, &[Authority::TenantAdmin])?;
     let customer = load_customer(&state, id).await?;
     check_tenant_scope(&user, customer.tenant_id)?;
-    state.customer_dao.delete_by_id(id).await?;
+    let mut tx = state.pool.begin().await.map_err(TbError::db)?;
+    let entity_ids = entity_cleanup::customer_entity_ids(&mut tx, id).await?;
+    entity_cleanup::purge_deleted_entities(&mut tx, customer.tenant_id, &entity_ids).await?;
+    entity_cleanup::detach_customer(&mut tx, id).await?;
+    state.customer_dao.delete_by_id_in(&mut tx, id).await?;
+    tx.commit().await.map_err(TbError::db)?;
+    for entity_id in entity_ids {
+        crate::telemetry_cache::invalidate_latest(&state, entity_id).await;
+    }
+    crate::edqs::publish_tenant_resync(&state, customer.tenant_id);
     audit(
         &state,
         &user,

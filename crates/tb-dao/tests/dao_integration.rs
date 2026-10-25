@@ -873,6 +873,148 @@ async fn ota_bindings_track_references_and_inheriting_devices() -> TbResult<()> 
     Ok(())
 }
 
+async fn seed_entity_rows(pool: &sqlx::PgPool, tenant_id: Uuid, entity_id: Uuid, peer: Uuid) {
+    let keys = tb_dao::KeyDictionaryDao::new(pool.clone());
+    tb_dao::TimeseriesDao::new(pool.clone(), keys.clone())
+        .save(entity_id, &[point("cleanup_temp", 1000, 1)])
+        .await
+        .unwrap();
+    tb_dao::AttributesDao::new(pool.clone(), keys)
+        .save(
+            entity_id,
+            tb_common::AttributeScope::ServerScope,
+            &[tb_common::KvEntry {
+                key: "cleanup_attr".into(),
+                value: tb_common::KvValue::Bool(true),
+            }],
+        )
+        .await
+        .unwrap();
+    for sql in [
+        "INSERT INTO alarm (id, created_time, tenant_id, originator_id, originator_type, type, \
+         severity, status, start_ts, end_ts) \
+         VALUES (gen_random_uuid(), 0, $1, $2, 'DEVICE', 'cleanup', 'MINOR', 'ACTIVE_UNACK', 0, 0)",
+        "INSERT INTO relation (from_id, from_type, to_id, to_type, relation_type) \
+         VALUES ($2, 'DEVICE', $3, 'ASSET', 'Contains')",
+        "INSERT INTO relation (from_id, from_type, to_id, to_type, relation_type) \
+         VALUES ($3, 'ASSET', $2, 'DEVICE', 'Contains')",
+        "INSERT INTO calculated_field (id, created_time, tenant_id, entity_id, name, configuration) \
+         VALUES (gen_random_uuid(), 0, $1, $2, gen_random_uuid()::text, '{}'::jsonb)",
+        "INSERT INTO rule_node_dedup_window (id, tenant_id, rule_chain_id, rule_node_id, \
+         originator_id, strategy, out_msg_type, queue_name, max_retries, state, expires_at, \
+         updated_at) VALUES (gen_random_uuid(), $1, gen_random_uuid(), gen_random_uuid(), $2, \
+         'FIRST', '', 'Main', 3, 'DONE', 0, 0)",
+    ] {
+        sqlx::query(sql)
+            .bind(tenant_id)
+            .bind(entity_id)
+            .bind(peer)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+}
+
+async fn entity_row_count(pool: &sqlx::PgPool, entity_id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM ts_kv WHERE entity_id = $1) \
+         + (SELECT COUNT(*) FROM ts_kv_latest WHERE entity_id = $1) \
+         + (SELECT COUNT(*) FROM attribute_kv WHERE entity_id = $1) \
+         + (SELECT COUNT(*) FROM alarm WHERE originator_id = $1) \
+         + (SELECT COUNT(*) FROM relation WHERE from_id = $1 OR to_id = $1) \
+         + (SELECT COUNT(*) FROM calculated_field WHERE entity_id = $1) \
+         + (SELECT COUNT(*) FROM rule_node_dedup_window WHERE originator_id = $1)",
+    )
+    .bind(entity_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn tombstone_count(pool: &sqlx::PgPool, ids: &[Uuid]) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM entity_tombstone WHERE entity_id = ANY($1)")
+        .bind(ids)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn entity_cleanup_purges_data_and_sweeps_late_writes() -> TbResult<()> {
+    use tb_dao::entity_cleanup;
+
+    let pool = setup().await;
+    let tenant_dao = TenantDao::new(pool.clone());
+    let profile_dao = DeviceProfileDao::new(pool.clone());
+    let device_dao = DeviceDao::new(pool.clone());
+    let tenant = tenant_dao.save(&new_tenant(&uniq("cleanup"))).await?;
+    let profile = profile_dao
+        .save(&new_device_profile(tenant.id, &uniq("profile"), false))
+        .await?;
+    let device = device_dao
+        .save(&new_device(tenant.id, profile.id, &uniq("device")))
+        .await?;
+    assert!(matches!(
+        profile_dao.delete_by_id(profile.id).await,
+        Err(tb_common::TbError::Conflict(_))
+    ));
+
+    let peer = Uuid::now_v7();
+    let deleted = [device.id, Uuid::now_v7(), Uuid::now_v7()];
+    for id in deleted {
+        seed_entity_rows(&pool, tenant.id, id, peer).await;
+        assert_eq!(entity_row_count(&pool, id).await, 8);
+    }
+    sqlx::query(
+        "INSERT INTO relation (from_id, from_type, to_id, to_type, relation_type) \
+         VALUES ($1, 'ASSET', $2, 'ASSET', 'Contains')",
+    )
+    .bind(peer)
+    .bind(Uuid::now_v7())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut tx = pool.begin().await.unwrap();
+    entity_cleanup::purge_deleted_entities(&mut tx, tenant.id, &deleted).await?;
+    assert!(device_dao.delete_by_id_in(&mut tx, device.id).await?);
+    tx.commit().await.unwrap();
+    for id in deleted {
+        assert_eq!(entity_row_count(&pool, id).await, 0);
+    }
+    assert_eq!(entity_row_count(&pool, peer).await, 1);
+    assert_eq!(tombstone_count(&pool, &deleted).await, 3);
+
+    for id in deleted {
+        seed_entity_rows(&pool, tenant.id, id, peer).await;
+    }
+    let sweep = entity_cleanup::sweep_tombstones(&pool, 0, 1).await?;
+    assert!(sweep.purged_rows >= 24, "{sweep:?}");
+    for id in deleted {
+        assert_eq!(entity_row_count(&pool, id).await, 0);
+    }
+    assert_eq!(entity_row_count(&pool, peer).await, 1);
+    assert_eq!(tombstone_count(&pool, &deleted).await, 3);
+
+    sqlx::query("UPDATE entity_tombstone SET deleted_at = 1 WHERE entity_id = ANY($1)")
+        .bind(&deleted[..])
+        .execute(&pool)
+        .await
+        .unwrap();
+    let sweep = entity_cleanup::sweep_tombstones(&pool, 2, 1000).await?;
+    assert!(sweep.expired >= 3, "{sweep:?}");
+    assert_eq!(tombstone_count(&pool, &deleted).await, 0);
+
+    assert!(profile_dao.delete_by_id(profile.id).await?);
+    sqlx::query("DELETE FROM relation WHERE from_id = $1")
+        .bind(peer)
+        .execute(&pool)
+        .await
+        .unwrap();
+    tenant_dao.delete_by_id(tenant.id).await?;
+    Ok(())
+}
+
 fn point(key: &str, ts: i64, value: i64) -> tb_common::TsKvEntry {
     tb_common::TsKvEntry {
         ts,

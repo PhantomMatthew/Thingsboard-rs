@@ -24,8 +24,12 @@ use crate::ota::OtaKind;
 use crate::routes::PageQuery;
 use crate::routes::customer::load_customer;
 
-async fn close_device_sessions(state: &AppState, device: &Device, reason: &str) -> TbResult<()> {
-    let sessions = state.device_sessions.any_sessions(device.id).await?;
+pub(crate) async fn close_device_sessions(
+    state: &AppState,
+    device_id: Uuid,
+    reason: &str,
+) -> TbResult<()> {
+    let sessions = state.device_sessions.any_sessions(device_id).await?;
     if sessions.is_empty() {
         return Ok(());
     }
@@ -33,7 +37,7 @@ async fn close_device_sessions(state: &AppState, device: &Device, reason: &str) 
     for session in &sessions {
         let msg = core_pb::ToTransportMsg {
             session_id: session.session_id.clone(),
-            entity_id: device.id.to_string(),
+            entity_id: device_id.to_string(),
             msg: Some(core_pb::to_transport_msg::Msg::SessionCloseNotification(
                 core_pb::SessionCloseNotification {
                     reason: reason.into(),
@@ -49,7 +53,7 @@ async fn close_device_sessions(state: &AppState, device: &Device, reason: &str) 
             .await
             .map_err(TbError::internal)?;
     }
-    state.device_sessions.take_sessions(device.id).await?;
+    state.device_sessions.take_sessions(device_id).await?;
     Ok(())
 }
 
@@ -297,7 +301,7 @@ async fn save_device(
         }
     }
     if !is_new && rotate_credentials {
-        close_device_sessions(&state, &saved, "device credentials updated").await?;
+        close_device_sessions(&state, saved.id, "device credentials updated").await?;
     }
     Ok(Json(saved))
 }
@@ -321,17 +325,11 @@ async fn delete_device(
     let device = load_device(&state, id).await?;
     check_tenant_scope(&user, device.tenant_id)?;
     let mut tx = state.pool.begin().await.map_err(TbError::db)?;
-    state.timeseries_dao.delete_by_entity(&mut tx, id).await?;
-    state.attributes_dao.delete_by_entity(&mut tx, id).await?;
-    state.alarm_dao.delete_by_entity(&mut tx, id).await?;
-    state
-        .calculated_field_dao
-        .delete_by_entity(&mut tx, id)
-        .await?;
+    tb_dao::entity_cleanup::purge_deleted_entities(&mut tx, device.tenant_id, &[id]).await?;
     state.device_dao.delete_by_id_in(&mut tx, id).await?;
     tx.commit().await.map_err(TbError::db)?;
     crate::telemetry_cache::invalidate_latest(&state, id).await;
-    close_device_sessions(&state, &device, "device deleted").await?;
+    close_device_sessions(&state, id, "device deleted").await?;
     audit(
         &state,
         &user,
@@ -469,7 +467,7 @@ async fn save_device_credentials(
         credentials.id = Uuid::now_v7();
     }
     let saved = state.device_credentials_dao.save(&credentials).await?;
-    close_device_sessions(&state, &device, "device credentials updated").await?;
+    close_device_sessions(&state, device.id, "device credentials updated").await?;
     Ok(Json(saved))
 }
 

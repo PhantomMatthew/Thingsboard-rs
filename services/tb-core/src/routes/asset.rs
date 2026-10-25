@@ -149,13 +149,7 @@ async fn delete_asset(
     let asset = load_asset(&state, id).await?;
     check_tenant_scope(&user, asset.tenant_id)?;
     let mut tx = state.pool.begin().await.map_err(TbError::db)?;
-    state.timeseries_dao.delete_by_entity(&mut tx, id).await?;
-    state.attributes_dao.delete_by_entity(&mut tx, id).await?;
-    state.alarm_dao.delete_by_entity(&mut tx, id).await?;
-    state
-        .calculated_field_dao
-        .delete_by_entity(&mut tx, id)
-        .await?;
+    tb_dao::entity_cleanup::purge_deleted_entities(&mut tx, asset.tenant_id, &[id]).await?;
     state.asset_dao.delete_by_id_in(&mut tx, id).await?;
     tx.commit().await.map_err(TbError::db)?;
     crate::telemetry_cache::invalidate_latest(&state, id).await;

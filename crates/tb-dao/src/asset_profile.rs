@@ -64,7 +64,7 @@ impl AssetProfileDao {
             .bind(id)
             .execute(&self.pool)
             .await
-            .map_err(TbError::db)?;
+            .map_err(|e| crate::referenced_error(e, "asset profile is referenced by assets"))?;
         Ok(res.rows_affected() > 0)
     }
 

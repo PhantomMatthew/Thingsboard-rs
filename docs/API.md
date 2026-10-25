@@ -53,8 +53,15 @@
 | POST/DELETE | /api/asset/{assetId}/assign/{customerId} | TA | 分配/回收资产 |
 | POST | /api/deviceProfile / /api/assetProfile | TA | 创建/更新配置 |
 | GET | /api/deviceProfile/default / /api/assetProfile/default | TA | 默认配置 |
-| GET/DELETE | /api/deviceProfile/{id} / /api/assetProfile/{id} | TA | 查/删配置 |
+| GET/DELETE | /api/deviceProfile/{id} / /api/assetProfile/{id} | TA | 查/删配置（仍被设备、资产或 OTA 包引用时 409） |
 | GET | /api/deviceProfiles / /api/assetProfiles | TA | 配置分页 |
+
+删除租户、客户、用户、设备或资产时，在同一事务内删除这些实体名下的遥测（含 latest）、属性、告警、
+关系（两端）、计算字段和规则去重窗口。删除客户时，其用户随之删除，名下设备与资产改为未分配，
+告警上的客户归属清空，并让 EDQS 重载该租户。删除租户时还会清理租户级告警、计算字段、规则调试事件、
+去重窗口、延迟任务和租户 OAuth2 客户端，提交后在后台关闭该租户全部设备会话。被删实体写入
+`entity_tombstone`，housekeeper 在 `TB_ENTITY_TOMBSTONE_RETENTION_HOURS` 内每轮再清理一次，
+用于处理删除后迟到的写入（传输侧 60 秒凭证缓存、队列积压）。
 
 ## 遥测与属性
 

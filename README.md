@@ -82,6 +82,7 @@ ThingsBoard IoT 平台的 Rust 重写版（微服务架构，非兼容重设计�
 | `TB_EDQS_RECONCILE_INTERVAL_SECS` | tb-edqs | 600 | 从 PostgreSQL 重载全部租户的对账周期（0=关闭）；增量丢失时另有按租户重同步 |
 | `TB_HOUSEKEEPER_INTERVAL_SEC` | tb-housekeeper | 3600 | 清理周期 |
 | `TB_TS_TTL_DAYS` / `TB_DEBUG_EVENT_TTL_DAYS` / `TB_ALARM_TTL_DAYS` / `TB_DEDUP_WINDOW_TTL_DAYS` / `TB_DELAY_TASK_TTL_DAYS` | tb-housekeeper | 0 / 7 / 0 / 7 / 7 | 各类数据保留天数（0=不清理；规则任务仅清终态） |
+| `TB_ENTITY_TOMBSTONE_RETENTION_HOURS` | tb-housekeeper | 24 | 已删实体墓碑保留时长（最小 1）；保留期内每轮清理删除后迟到写入的遥测、属性、告警、关系等 |
 
 MQTTS 客户端证书为可选项。支持设备绑定的 SHA3-256 pinned certificate，以及按租户设备档案配置的私有 CA 证书链校验和设备自动 provisioning；未提供证书时仍可使用 access token 或 MQTT basic。
 

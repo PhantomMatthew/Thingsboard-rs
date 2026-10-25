@@ -104,7 +104,12 @@ impl DeviceProfileDao {
             .bind(id)
             .execute(&self.pool)
             .await
-            .map_err(TbError::db)?;
+            .map_err(|e| {
+                crate::referenced_error(
+                    e,
+                    "device profile is referenced by devices or OTA packages",
+                )
+            })?;
         Ok(res.rows_affected() > 0)
     }
 

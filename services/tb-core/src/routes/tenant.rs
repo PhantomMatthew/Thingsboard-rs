@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tb_auth::{ApiError, AuthUser};
 use tb_common::{EntityType, TbError};
+use tb_dao::entity_cleanup::TenantEntities;
 use tb_dao::models::{Authority, Tenant};
 use tb_dao::{PageData, PageLink};
 use uuid::Uuid;
@@ -16,6 +17,7 @@ use crate::AppState;
 use crate::audit::audit;
 use crate::auth_middleware::require_authority;
 use crate::routes::PageQuery;
+use crate::routes::device::close_device_sessions;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -115,20 +117,42 @@ async fn delete_tenant(
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
     require_authority(&user, &[Authority::SysAdmin])?;
-    let existing = state.tenant_dao.find_by_id(id).await?;
-    if !state.tenant_dao.delete_by_id(id).await? {
+    let existing = state
+        .tenant_dao
+        .find_by_id(id)
+        .await?
+        .ok_or_else(|| TbError::NotFound(format!("tenant {id}")))?;
+    let mut tx = state.pool.begin().await.map_err(TbError::db)?;
+    let entities = tb_dao::entity_cleanup::purge_tenant_data(&mut tx, id).await?;
+    if !state.tenant_dao.delete_by_id_in(&mut tx, id).await? {
         return Err(TbError::NotFound(format!("tenant {id}")).into());
     }
+    tx.commit().await.map_err(TbError::db)?;
+    spawn_runtime_cleanup(state.clone(), entities);
     crate::edqs::publish_tenant_delete(&state, id);
     audit(
         &state,
         &user,
-        existing.map(|t| (t.id, EntityType::Tenant, t.title)),
+        Some((existing.id, EntityType::Tenant, existing.title)),
         "DELETED",
         None,
         "SUCCESS",
     );
     Ok(StatusCode::OK)
+}
+
+/// 提交后关闭租户设备会话并清 Redis latest 缓存；设备可能很多，不阻塞请求。
+fn spawn_runtime_cleanup(state: AppState, entities: TenantEntities) {
+    tokio::spawn(async move {
+        for device_id in entities.device_ids {
+            if let Err(e) = close_device_sessions(&state, device_id, "tenant deleted").await {
+                tracing::warn!(%device_id, "close sessions after tenant delete failed: {e}");
+            }
+        }
+        for entity_id in entities.entity_ids {
+            crate::telemetry_cache::invalidate_latest(&state, entity_id).await;
+        }
+    });
 }
 
 async fn list_tenants(

@@ -81,19 +81,6 @@ impl AlarmDao {
         Ok(res.rows_affected() > 0)
     }
 
-    pub async fn delete_by_entity(
-        &self,
-        tx: &mut sqlx::PgConnection,
-        entity_id: Uuid,
-    ) -> TbResult<()> {
-        sqlx::query("DELETE FROM alarm WHERE originator_id = $1")
-            .bind(entity_id)
-            .execute(tx)
-            .await
-            .map_err(TbError::db)?;
-        Ok(())
-    }
-
     pub async fn find_latest_by_originator(&self, originator_id: Uuid) -> TbResult<Option<Alarm>> {
         sqlx::query_as::<_, Alarm>(
             "SELECT * FROM alarm WHERE originator_id = $1 ORDER BY created_time DESC LIMIT 1",

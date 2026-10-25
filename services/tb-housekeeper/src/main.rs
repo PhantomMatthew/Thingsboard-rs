@@ -7,6 +7,7 @@
 //! - TB_DEBUG_EVENT_TTL_DAYS（默认 7）
 //! - TB_ALARM_TTL_DAYS（默认 0=不清理；仅清 CLEARED_* 且 clear_ts 早于阈值的告警）
 //! - TB_DEDUP_WINDOW_TTL_DAYS / TB_DELAY_TASK_TTL_DAYS（默认 7；仅清终态任务）
+//! - TB_ENTITY_TOMBSTONE_RETENTION_HOURS（默认 24，最小 1；保留期内每轮清理已删实体的迟到写入）
 
 use std::time::Duration;
 
@@ -15,6 +16,8 @@ use sqlx::postgres::PgPoolOptions;
 
 const DEFAULT_DATABASE_URL: &str = "postgres://thingsboard:thingsboard@localhost:5433/thingsboard";
 const DAY_MS: i64 = 24 * 3600 * 1000;
+const HOUR_MS: i64 = 3600 * 1000;
+const TOMBSTONE_BATCH_SIZE: i64 = 1000;
 
 struct Config {
     database_url: String,
@@ -24,6 +27,7 @@ struct Config {
     alarm_ttl_days: i64,
     dedup_window_ttl_days: i64,
     delay_task_ttl_days: i64,
+    tombstone_retention_hours: i64,
 }
 
 impl Config {
@@ -45,6 +49,7 @@ impl Config {
             alarm_ttl_days: env_i64("TB_ALARM_TTL_DAYS", 0),
             dedup_window_ttl_days: env_i64("TB_DEDUP_WINDOW_TTL_DAYS", 7),
             delay_task_ttl_days: env_i64("TB_DELAY_TASK_TTL_DAYS", 7),
+            tombstone_retention_hours: env_i64("TB_ENTITY_TOMBSTONE_RETENTION_HOURS", 24).max(1),
         }
     }
 }
@@ -105,12 +110,27 @@ async fn cleanup_round(config: &Config, pool: &PgPool) -> (u64, u64, u64, u64, u
             Err(e) => tracing::error!("delayed task cleanup failed: {e}"),
         }
     }
+    let tombstones = match tb_dao::entity_cleanup::sweep_tombstones(
+        pool,
+        now.saturating_sub(config.tombstone_retention_hours.saturating_mul(HOUR_MS)),
+        TOMBSTONE_BATCH_SIZE,
+    )
+    .await
+    {
+        Ok(sweep) => sweep,
+        Err(e) => {
+            tracing::error!("entity tombstone sweep failed: {e}");
+            Default::default()
+        }
+    };
     tracing::info!(
         ts_kv_deleted = ts_deleted,
         debug_event_deleted = debug_deleted,
         alarm_deleted = alarm_deleted,
         dedup_window_deleted = dedup_deleted,
         delay_task_deleted = delay_deleted,
+        tombstone_purged_rows = tombstones.purged_rows,
+        tombstone_expired = tombstones.expired,
         "housekeeper round done"
     );
     (
@@ -151,6 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         alarm_ttl_days = config.alarm_ttl_days,
         dedup_window_ttl_days = config.dedup_window_ttl_days,
         delay_task_ttl_days = config.delay_task_ttl_days,
+        tombstone_retention_hours = config.tombstone_retention_hours,
         "tb-housekeeper started"
     );
     run(config, pool).await;

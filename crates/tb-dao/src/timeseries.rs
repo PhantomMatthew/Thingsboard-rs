@@ -126,24 +126,6 @@ impl TimeseriesDao {
         Ok(())
     }
 
-    pub async fn delete_by_entity(
-        &self,
-        tx: &mut sqlx::PgConnection,
-        entity_id: Uuid,
-    ) -> TbResult<()> {
-        sqlx::query("DELETE FROM ts_kv_latest WHERE entity_id = $1")
-            .bind(entity_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(TbError::db)?;
-        sqlx::query("DELETE FROM ts_kv WHERE entity_id = $1")
-            .bind(entity_id)
-            .execute(tx)
-            .await
-            .map_err(TbError::db)?;
-        Ok(())
-    }
-
     /// 最新值；keys 为 None 时返回该实体全部 key。
     pub async fn find_latest(
         &self,

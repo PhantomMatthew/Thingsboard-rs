@@ -363,6 +363,15 @@ pub fn publish_tenant_delete(state: &AppState, tenant_id: Uuid) {
     publish(state, tenant_id, tenant_delete_event(tenant_id));
 }
 
+/// 批量变更（如删除客户使其设备/资产的 customer_id 被外键置空）后让 EDQS 从数据库重载该租户。
+pub fn publish_tenant_resync(state: &AppState, tenant_id: Uuid) {
+    publish(
+        state,
+        tenant_id,
+        tb_queue::edqs::tenant_resync_event(tenant_id),
+    );
+}
+
 pub async fn load_tenant_repo(pool: &PgPool, tenant_id: Uuid) -> TbResult<TenantRepo> {
     tb_edqs::snapshot::load_tenant_repo(pool, tenant_id).await
 }

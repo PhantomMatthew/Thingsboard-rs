@@ -68,6 +68,15 @@ impl TenantDao {
         Ok(res.rows_affected() > 0)
     }
 
+    pub async fn delete_by_id_in(&self, tx: &mut sqlx::PgConnection, id: Uuid) -> TbResult<bool> {
+        let res = sqlx::query("DELETE FROM tenant WHERE id = $1")
+            .bind(id)
+            .execute(tx)
+            .await
+            .map_err(TbError::db)?;
+        Ok(res.rows_affected() > 0)
+    }
+
     pub async fn find_all_ids(&self) -> TbResult<Vec<Uuid>> {
         sqlx::query_scalar("SELECT id FROM tenant ORDER BY id")
             .fetch_all(&self.pool)

@@ -12,6 +12,7 @@ pub mod dashboard;
 pub mod device;
 pub mod device_credentials;
 pub mod device_profile;
+pub mod entity_cleanup;
 pub mod key_dictionary;
 pub mod kv_columns;
 pub mod models;
@@ -75,6 +76,16 @@ pub fn is_transient_error(err: &tb_common::TbError) -> bool {
             | sqlx::Error::WorkerCrashed,
         ) => true,
         _ => false,
+    }
+}
+
+/// 仍被外键引用（23503）时返回 Conflict，其余按数据库错误处理。
+pub(crate) fn referenced_error(err: sqlx::Error, message: &str) -> tb_common::TbError {
+    match &err {
+        sqlx::Error::Database(e) if e.code().as_deref() == Some("23503") => {
+            tb_common::TbError::Conflict(message.into())
+        }
+        _ => tb_common::TbError::db(err),
     }
 }
 

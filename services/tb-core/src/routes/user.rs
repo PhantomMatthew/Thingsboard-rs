@@ -161,7 +161,11 @@ async fn delete_user(
     require_authority(&user, &[Authority::SysAdmin, Authority::TenantAdmin])?;
     let target = load_user(&state, id).await?;
     check_tenant_scope(&user, target.tenant_id)?;
-    state.user_dao.delete_by_id(id).await?;
+    let mut tx = state.pool.begin().await.map_err(TbError::db)?;
+    tb_dao::entity_cleanup::purge_deleted_entities(&mut tx, target.tenant_id, &[id]).await?;
+    state.user_dao.delete_by_id_in(&mut tx, id).await?;
+    tx.commit().await.map_err(TbError::db)?;
+    crate::telemetry_cache::invalidate_latest(&state, id).await;
     audit(
         &state,
         &user,

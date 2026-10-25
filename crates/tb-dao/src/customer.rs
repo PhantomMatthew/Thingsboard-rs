@@ -67,6 +67,15 @@ impl CustomerDao {
         Ok(res.rows_affected() > 0)
     }
 
+    pub async fn delete_by_id_in(&self, tx: &mut sqlx::PgConnection, id: Uuid) -> TbResult<bool> {
+        let res = sqlx::query("DELETE FROM customer WHERE id = $1")
+            .bind(id)
+            .execute(tx)
+            .await
+            .map_err(TbError::db)?;
+        Ok(res.rows_affected() > 0)
+    }
+
     pub async fn find_by_tenant_id(
         &self,
         tenant_id: Uuid,

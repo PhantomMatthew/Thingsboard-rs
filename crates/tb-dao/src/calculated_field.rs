@@ -103,17 +103,4 @@ impl CalculatedFieldDao {
             .map_err(TbError::db)?;
         Ok(res.rows_affected() > 0)
     }
-
-    pub async fn delete_by_entity(
-        &self,
-        tx: &mut sqlx::PgConnection,
-        entity_id: Uuid,
-    ) -> TbResult<()> {
-        sqlx::query("DELETE FROM calculated_field WHERE entity_id = $1")
-            .bind(entity_id)
-            .execute(tx)
-            .await
-            .map_err(TbError::db)?;
-        Ok(())
-    }
 }
