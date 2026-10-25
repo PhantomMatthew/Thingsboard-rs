@@ -103,6 +103,9 @@ services:
       TB_KAFKA_BROKERS: kafka:9092
       TB_REDIS_URL: redis://redis:6379
       TB_RE_QUEUE: Main
+      TB_RE_ALLOWED_HOSTS: ${TB_RE_ALLOWED_HOSTS:-}
+      TB_RE_ALLOW_PRIVATE_NETWORK: ${TB_RE_ALLOW_PRIVATE_NETWORK:-false}
+      TB_RE_KAFKA_ALLOWED_TOPIC_PREFIXES: ${TB_RE_KAFKA_ALLOWED_TOPIC_PREFIXES:-}
       RUST_LOG: ${RUST_LOG:-info}
     depends_on:
       postgres: { condition: service_healthy }

@@ -33,6 +33,31 @@ use tb_rule_engine::nodes::{
 use tb_rule_engine::{ChainLoader, Node, NodeContext, chain};
 use uuid::Uuid;
 
+struct EnvGuard {
+    name: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvGuard {
+    fn set(name: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(name);
+        unsafe { std::env::set_var(name, value) };
+        Self { name, previous }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(value) = &self.previous {
+                std::env::set_var(self.name, value);
+            } else {
+                std::env::remove_var(self.name);
+            }
+        }
+    }
+}
+
 async fn setup() -> PgPool {
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://thingsboard:thingsboard@localhost:5433/thingsboard".into());
@@ -930,6 +955,8 @@ async fn rest_call_against_local_server() {
     use axum::extract::Path;
     use axum::routing::{get, post};
 
+    let _allowed = EnvGuard::set("TB_RE_ALLOWED_HOSTS", "127.0.0.1");
+    let _private = EnvGuard::set("TB_RE_ALLOW_PRIVATE_NETWORK", "true");
     let pool = setup().await;
     let ctx = ctx(&pool);
 
@@ -1021,6 +1048,7 @@ async fn rest_call_against_local_server() {
 
 #[tokio::test]
 async fn external_kafka_publishes_msg_json() {
+    let _prefixes = EnvGuard::set("TB_RE_KAFKA_ALLOWED_TOPIC_PREFIXES", "tb-ext-kafka-test");
     let pool = setup().await;
     let ctx = ctx(&pool);
     let topic = uniq("tb-ext-kafka-test");
@@ -1057,6 +1085,8 @@ async fn external_kafka_publishes_msg_json() {
 #[tokio::test]
 #[ignore = "requires local mqtt broker"]
 async fn external_mqtt_publishes() {
+    let _allowed = EnvGuard::set("TB_RE_ALLOWED_HOSTS", "localhost");
+    let _private = EnvGuard::set("TB_RE_ALLOW_PRIVATE_NETWORK", "true");
     let pool = setup().await;
     let ctx = ctx(&pool);
     let node = tb_rule_engine::nodes::MqttNode::new(&json!({

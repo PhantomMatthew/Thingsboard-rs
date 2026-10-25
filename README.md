@@ -66,6 +66,9 @@ ThingsBoard IoT 平台的 Rust 重写版（微服务架构，非兼容重设计�
 | `TB_EDQS_API_KEY` | tb-core / tb-edqs | 空 | 内部 API 密钥，生产必须配置且两服务一致 |
 | `TB_INGEST_ENABLED` | tb-core | false | 开启旧直通遥测落库（Phase 4 起由 rule-engine 接管，默认关） |
 | `TB_RE_QUEUE` | tb-rule-engine | `Main` | 消费的规则引擎队列名 |
+| `TB_RE_ALLOWED_HOSTS` | tb-rule-engine | 空（全部拒绝） | REST/MQTT 出站精确主机白名单，逗号分隔 |
+| `TB_RE_ALLOW_PRIVATE_NETWORK` | tb-rule-engine | false | 是否允许出站访问环回、私网、链路本地地址；仅显式内网场景开启 |
+| `TB_RE_KAFKA_ALLOWED_TOPIC_PREFIXES` | tb-rule-engine | 空（全部拒绝） | external.kafka 可写 topic 前缀，逗号分隔 |
 | `TB_MQTT_BIND` | tb-transport-mqtt | `0.0.0.0:1883` | MQTT 监听地址 |
 | `TB_MQTTS_BIND` | tb-transport-mqtt | 空（关闭） | MQTTS 监听地址，如 `0.0.0.0:8883` |
 | `TB_MQTT_TLS_CERT` / `TB_MQTT_TLS_KEY` | tb-transport-mqtt | 无 | MQTTS 服务端 PEM 证书/私钥；启用 TLS 时必填 |
