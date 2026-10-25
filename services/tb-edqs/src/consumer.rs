@@ -1,16 +1,21 @@
 //! Kafka 事件消费：earliest + 手动提交；连续错误后指数退避重建 consumer。
+//! 租户重同步标记与定期对账在同一任务内从数据库重载租户。
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use prost::Message as _;
 use tb_proto::edqs::EdqsEventMsg;
+use tb_proto::edqs::edqs_event_msg::Event;
 use tb_queue::{QueueConsumer, QueueError, StreamQueueConsumer, TbTopic};
+use uuid::Uuid;
 
 use crate::state::EdqsState;
 
 pub const DEFAULT_GROUP: &str = "tb-edqs";
 const MAX_CONSECUTIVE_ERRORS: u32 = 3;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const RESYNC_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 
@@ -51,20 +56,116 @@ fn should_reconnect(error: &QueueError, consecutive_errors: u32) -> bool {
     stream_ended(error) || consecutive_errors >= MAX_CONSECUTIVE_ERRORS
 }
 
-async fn consume_until_reconnect(consumer: &mut StreamQueueConsumer, state: &EdqsState) -> bool {
+/// 待从数据库重载的租户；重载失败（数据库不可用）时保留，按间隔重试。
+#[derive(Debug, Default)]
+struct PendingResync {
+    tenants: BTreeSet<Uuid>,
+}
+
+impl PendingResync {
+    fn is_empty(&self) -> bool {
+        self.tenants.is_empty()
+    }
+
+    /// 在 consumer 任务内串行执行：重载期间不应用事件，之后的事件按 ts 规则幂等覆盖。
+    async fn drain(&mut self, state: &EdqsState) {
+        let Some(pool) = state.pool.clone() else {
+            if !self.tenants.is_empty() {
+                tracing::warn!(
+                    tenants = self.tenants.len(),
+                    "edqs resync requested but no database configured"
+                );
+                self.tenants.clear();
+            }
+            return;
+        };
+        while let Some(tenant_id) = self.tenants.first().copied() {
+            match crate::snapshot::reload_tenant(&pool, state, tenant_id).await {
+                Ok(()) => {
+                    self.tenants.remove(&tenant_id);
+                    state.consumer_health.beat();
+                }
+                Err(e) => {
+                    tracing::warn!(%tenant_id, pending = self.tenants.len(), "edqs tenant resync failed: {e}");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn resync_target(event: &EdqsEventMsg) -> Option<Uuid> {
+    let Some(Event::TenantResync(resync)) = &event.event else {
+        return None;
+    };
+    match Uuid::parse_str(&resync.tenant_id) {
+        Ok(tenant_id) if resync.tenant_id == event.tenant_id => Some(tenant_id),
+        _ => {
+            tracing::warn!(
+                tenant_id = event.tenant_id,
+                resync_tenant_id = resync.tenant_id,
+                "edqs resync with bad tenant_id"
+            );
+            None
+        }
+    }
+}
+
+async fn next_reconcile(timer: &mut Option<tokio::time::Interval>) {
+    match timer {
+        Some(timer) => {
+            timer.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+async fn consume_until_reconnect(
+    consumer: &mut StreamQueueConsumer,
+    state: &EdqsState,
+    pending: &mut PendingResync,
+) -> bool {
     let mut consecutive_errors = 0;
     let mut made_progress = false;
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut retry = tokio::time::interval(RESYNC_RETRY_INTERVAL);
+    retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut reconcile = state.reconcile_interval.map(|interval| {
+        let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        timer
+    });
     loop {
         tokio::select! {
             biased;
+            _ = retry.tick(), if !pending.is_empty() => {
+                pending.drain(state).await;
+            }
+            _ = next_reconcile(&mut reconcile) => {
+                if let Some(pool) = &state.pool {
+                    match crate::snapshot::reconcile_tenant_ids(pool, state).await {
+                        Ok(ids) => {
+                            tracing::info!(tenants = ids.len(), "edqs periodic reconcile");
+                            pending.tenants.extend(ids);
+                            pending.drain(state).await;
+                        }
+                        Err(e) => tracing::warn!("edqs reconcile tenant listing failed: {e}"),
+                    }
+                }
+            }
             received = consumer.recv() => {
                 match received {
                     Ok(msg) => {
                         state.consumer_health.beat();
                         match EdqsEventMsg::decode(msg.payload.as_ref()) {
-                            Ok(event) => state.apply_event(&event),
+                            Ok(event) => match resync_target(&event) {
+                                Some(tenant_id) => {
+                                    pending.tenants.insert(tenant_id);
+                                    pending.drain(state).await;
+                                }
+                                None => state.apply_event(&event),
+                            },
                             Err(e) => tracing::warn!("undecodable EdqsEventMsg; dropping: {e}"),
                         }
                         if let Err(e) = consumer.commit(&msg).await {
@@ -102,8 +203,9 @@ async fn run_consumer(
     mut consumer: StreamQueueConsumer,
 ) {
     let mut backoff = ReconnectBackoff::default();
+    let mut pending = PendingResync::default();
     loop {
-        if consume_until_reconnect(&mut consumer, &state).await {
+        if consume_until_reconnect(&mut consumer, &state, &mut pending).await {
             backoff.reset();
         }
         state.consumer_health.disconnect();

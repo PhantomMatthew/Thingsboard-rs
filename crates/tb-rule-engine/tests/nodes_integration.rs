@@ -822,6 +822,33 @@ async fn delete_attributes_node() {
         .unwrap();
     assert_eq!(left.len(), 1);
     assert_eq!(left[0].key, "b");
+
+    // 删除同步到 EDQS 读模型。
+    let mut events = StreamQueueConsumer::new_from_beginning(
+        "localhost:29092",
+        &format!("delete-attributes-edqs-{}", Uuid::now_v7().simple()),
+        &[TbTopic::EDQS_EVENTS],
+    )
+    .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let update = loop {
+        let msg = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("edqs attribute delete event")
+            .unwrap();
+        let event = tb_proto::edqs::EdqsEventMsg::decode(msg.payload).unwrap();
+        if let Some(tb_proto::edqs::edqs_event_msg::Event::AttributeUpdate(update)) = event.event
+            && update.entity_id == device.to_string()
+        {
+            break update;
+        }
+    };
+    assert_eq!(update.deleted_keys, vec!["a".to_string()]);
+    assert!(update.updated.is_empty());
+    assert_eq!(
+        update.scope,
+        tb_proto::common::AttributeScope::ServerScope as i32
+    );
 }
 
 #[tokio::test]

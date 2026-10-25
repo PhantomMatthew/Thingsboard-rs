@@ -79,6 +79,7 @@ ThingsBoard IoT 平台的 Rust 重写版（微服务架构，非兼容重设计�
 | `TB_LWM2M_BIND` | tb-transport-lwm2m | `0.0.0.0:5685` | LwM2M UDP 监听地址 |
 | `TB_NODE_ID` | transport | 自动生成 | 节点 ID（Kafka 下行 topic 路由键） |
 | `TB_EDQS_PORT` / `TB_EDQS_GROUP` | tb-edqs | 8090 / 默认组 | 查询端口 / 消费组 |
+| `TB_EDQS_RECONCILE_INTERVAL_SECS` | tb-edqs | 600 | 从 PostgreSQL 重载全部租户的对账周期（0=关闭）；增量丢失时另有按租户重同步 |
 | `TB_HOUSEKEEPER_INTERVAL_SEC` | tb-housekeeper | 3600 | 清理周期 |
 | `TB_TS_TTL_DAYS` / `TB_DEBUG_EVENT_TTL_DAYS` / `TB_ALARM_TTL_DAYS` / `TB_DEDUP_WINDOW_TTL_DAYS` / `TB_DELAY_TASK_TTL_DAYS` | tb-housekeeper | 0 / 7 / 0 / 7 / 7 | 各类数据保留天数（0=不清理；规则任务仅清终态） |
 

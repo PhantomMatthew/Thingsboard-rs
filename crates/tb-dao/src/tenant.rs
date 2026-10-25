@@ -68,6 +68,13 @@ impl TenantDao {
         Ok(res.rows_affected() > 0)
     }
 
+    pub async fn find_all_ids(&self) -> TbResult<Vec<Uuid>> {
+        sqlx::query_scalar("SELECT id FROM tenant ORDER BY id")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(TbError::db)
+    }
+
     pub async fn find_all(&self, page_link: &PageLink) -> TbResult<PageData<Tenant>> {
         let sort = page_link.sort_column(&["title", "email", "created_time"]);
         let order = page_link.sort_order_sql();

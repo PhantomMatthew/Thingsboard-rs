@@ -30,7 +30,8 @@ PostgreSQL 持久化 + Redis 缓存。协议层复用 ThingsBoard 设备接入�
 | `tb_transport.notifications.{nodeId}` | device_id | tb-core → transport（按节点） | `ToTransportMsg`（RPC 下行、属性更新、会话关闭、OTA 通知） |
 | `tb_rule_engine.{queueName}` | entity_id | tb-core/rule-engine → tb-rule-engine | `ToRuleEngineMsg`（`TbMsgProto`：遥测/属性/活性/告警事件） |
 | `tb_rule_engine.dlq` | entity_id | tb-rule-engine → （留存） | 处理失败消息（死信） |
-| `tb_edqs.events` | tenant_id | tb-core → tb-edqs | `EdqsEventMsg`（实体增删、属性更新、latest 遥测） |
+| `tb_core.dlq` | device_id | tb-core → （留存） | 无法解码或重试耗尽的 `tb_core`/RPC 回流/用量消息（JSON 信封，认领密钥脱敏） |
+| `tb_edqs.events` | tenant_id | tb-core/rule-engine → tb-edqs | `EdqsEventMsg`（实体增删、属性更新/删除、latest 遥测更新/删除、租户重同步） |
 | `tb_core.notifications` / `tb_rule_engine.notifications` / `tb_housekeeper` | — | 已在 `tb-queue` 定义、当前未启用（预留） | — |
 
 实体分区：设备/实体消息按实体 ID murmur3 分区，保证同实体消息有序；
@@ -73,6 +74,11 @@ REST /api/rpc/twoway/{device} / 属性写 SHARED_SCOPE
 tb-core（实体 CRUD / latest 写入）──▶ tb_edqs.events ──▶ tb-edqs 内存读模型
 查询方 ──▶ tb-core /api/edqs/query/entityData ──(TB_EDQS_URL 代理)──▶ tb-edqs /api/query/entityData
 ```
+
+增量发送有界重试；重试耗尽或发送队列满时丢弃该增量，并向 `tb_edqs.events` 补发租户重同步标记，
+tb-edqs 收到后在消费任务内从 PostgreSQL 重载该租户。进程崩溃等无法补发标记的情况由
+`TB_EDQS_RECONCILE_INTERVAL_SECS` 定期对账兜底。遥测范围删除在事务内重算 latest，
+EDQS 只移除时间戳落在删除范围内的 latest，再按时间戳规则应用重算值，不会覆盖并发写入的新值。
 
 ## 数据模型要点（PostgreSQL）
 

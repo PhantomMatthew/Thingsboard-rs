@@ -811,3 +811,119 @@ async fn ota_metadata_omits_data_and_chunks_read_only_requested_bytes() -> TbRes
     tenant_dao.delete_by_id(tenant.id).await?;
     Ok(())
 }
+
+fn point(key: &str, ts: i64, value: i64) -> tb_common::TsKvEntry {
+    tb_common::TsKvEntry {
+        ts,
+        key: key.into(),
+        value: tb_common::KvValue::Long(value),
+    }
+}
+
+#[tokio::test]
+async fn timeseries_delete_recomputes_latest() -> TbResult<()> {
+    let pool = setup().await;
+    let ts_dao = tb_dao::TimeseriesDao::new(pool.clone(), tb_dao::KeyDictionaryDao::new(pool));
+    let entity_id = Uuid::now_v7();
+    let (temp, hum) = (uniq("temp"), uniq("hum"));
+    ts_dao
+        .save(
+            entity_id,
+            &[
+                point(&temp, 100, 1),
+                point(&temp, 200, 2),
+                point(&temp, 300, 3),
+                point(&hum, 100, 50),
+            ],
+        )
+        .await?;
+    let latest = |key: String| {
+        let ts_dao = &ts_dao;
+        async move {
+            let keys = [key];
+            Ok::<_, tb_common::TbError>(
+                ts_dao
+                    .find_latest(entity_id, Some(&keys))
+                    .await?
+                    .into_iter()
+                    .next(),
+            )
+        }
+    };
+
+    // 删除最新点：latest 回退到剩余最新点。
+    let result = ts_dao
+        .delete(entity_id, std::slice::from_ref(&temp), Some((250, 400)))
+        .await?;
+    assert_eq!(result.deleted, 1);
+    assert_eq!(result.rewritten_latest, vec![point(&temp, 200, 2)]);
+    assert!(result.removed_latest.is_empty());
+    assert_eq!(latest(temp.clone()).await?, Some(point(&temp, 200, 2)));
+
+    // 删除旧点：latest 不变，边界为闭区间。
+    let result = ts_dao
+        .delete(entity_id, std::slice::from_ref(&temp), Some((0, 100)))
+        .await?;
+    assert_eq!(result.deleted, 1);
+    assert!(!result.latest_changed());
+    assert_eq!(latest(temp.clone()).await?, Some(point(&temp, 200, 2)));
+
+    // 范围覆盖全部剩余点：latest 删除。
+    let result = ts_dao
+        .delete(entity_id, std::slice::from_ref(&temp), Some((200, 200)))
+        .await?;
+    assert_eq!(result.deleted, 1);
+    assert_eq!(result.removed_latest, vec![temp.clone()]);
+    assert_eq!(latest(temp.clone()).await?, None);
+
+    // 全量删除。
+    let result = ts_dao
+        .delete(entity_id, std::slice::from_ref(&hum), None)
+        .await?;
+    assert_eq!(result.deleted, 1);
+    assert_eq!(result.removed_latest, vec![hum.clone()]);
+    assert_eq!(latest(hum.clone()).await?, None);
+
+    let err = ts_dao
+        .delete(entity_id, std::slice::from_ref(&temp), Some((10, 5)))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, tb_common::TbError::InvalidInput(_)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn timeseries_delete_and_concurrent_save_keep_latest_consistent() -> TbResult<()> {
+    let pool = setup().await;
+    let ts_dao = tb_dao::TimeseriesDao::new(pool.clone(), tb_dao::KeyDictionaryDao::new(pool));
+    let key = uniq("concurrent");
+    for round in 0..20 {
+        let entity_id = Uuid::now_v7();
+        ts_dao
+            .save(entity_id, &[point(&key, 100, 1), point(&key, 200, 2)])
+            .await?;
+        let new_ts = if round % 2 == 0 { 150 } else { 500 };
+        let concurrent = [point(&key, new_ts, 9)];
+        let (deleted, saved) = tokio::join!(
+            ts_dao.delete(entity_id, std::slice::from_ref(&key), Some((150, 300))),
+            ts_dao.save(entity_id, &concurrent)
+        );
+        deleted?;
+        saved?;
+        let history = ts_dao
+            .find_history(entity_id, &key, i64::MIN, i64::MAX, 10, false)
+            .await?;
+        let latest = ts_dao
+            .find_latest(entity_id, Some(std::slice::from_ref(&key)))
+            .await?;
+        assert_eq!(
+            latest.first(),
+            history.first(),
+            "round {round}: latest must equal the newest remaining point"
+        );
+        ts_dao
+            .delete(entity_id, std::slice::from_ref(&key), None)
+            .await?;
+    }
+    Ok(())
+}

@@ -14,7 +14,14 @@ message EdqsEventMsg {
     AttributeUpdateMsg attribute_update = 4;
     LatestTelemetryMsg latest_telemetry = 5;
     TenantDeleteMsg tenant_delete = 6;
+    LatestDeleteMsg latest_delete = 7;
+    TenantResyncMsg tenant_resync = 8;
   }
+}
+
+// 增量可能已丢失（发送失败/队列满）：EDQS 从 PostgreSQL 重载该租户。
+message TenantResyncMsg {
+  string tenant_id = 1;
 }
 
 message TenantDeleteMsg {
@@ -51,4 +58,15 @@ message LatestTelemetryMsg {
   string entity_id = 1;
   repeated tb.common.KeyValueProto values = 2;
   repeated int64 ts = 3;
+}
+
+// latest 删除：keys 中 ts 落在 [start_ts, end_ts] 的 latest 先移除，
+// 再按 ts 规则应用 replacements（范围删除后重算出的值，与 replacement_ts 下标对齐）。
+message LatestDeleteMsg {
+  string entity_id = 1;
+  repeated string keys = 2;
+  int64 start_ts = 3;
+  int64 end_ts = 4;
+  repeated tb.common.KeyValueProto replacements = 5;
+  repeated int64 replacement_ts = 6;
 }

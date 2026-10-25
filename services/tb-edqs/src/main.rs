@@ -29,7 +29,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .connect(&database_url)
         .await?;
 
-    let state = EdqsState::default();
+    let reconcile_secs: u64 = std::env::var("TB_EDQS_RECONCILE_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600);
+    let mut state = EdqsState::default().with_pool(pool.clone());
+    if reconcile_secs > 0 {
+        state = state.with_reconcile_interval(std::time::Duration::from_secs(reconcile_secs));
+    }
     tb_edqs::snapshot::load_snapshot(&pool, &state).await?;
     let consumer =
         tb_edqs::consumer::start_consumer_for_group_checked(&brokers, &group, state.clone())

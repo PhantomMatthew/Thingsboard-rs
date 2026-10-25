@@ -9,12 +9,15 @@ use serde::Deserialize;
 use tb_common::msg::{TbMsg, msg_type};
 use tb_common::{EntityId, EntityType, TbError, TbResult};
 use tb_dao::models::{Alarm, AlarmStatus};
+use tb_proto::common as common_pb;
 use tb_proto::core as core_pb;
+use tb_proto::edqs as edqs_pb;
 use tb_queue::TbTopic;
 use uuid::Uuid;
 
 use crate::context::NodeContext;
 use crate::node::Node;
+use crate::nodes::legacy::publish_edqs;
 use crate::nodes::{parse_config, parse_scope};
 
 /// action.clear_alarm：originator+type 的最新 ACTIVE 告警 → clear，产出 ALARM 消息（"Cleared"）；
@@ -127,7 +130,27 @@ impl Node for DeleteAttributesNode {
             .delete(msg.originator.id, scope, &self.keys)
             .await
         {
-            Ok(_) => "Success",
+            Ok(deleted) => {
+                if deleted > 0 {
+                    publish_edqs(
+                        ctx,
+                        msg.tenant_id,
+                        edqs_pb::EdqsEventMsg {
+                            tenant_id: msg.tenant_id.to_string(),
+                            event: Some(edqs_pb::edqs_event_msg::Event::AttributeUpdate(
+                                edqs_pb::AttributeUpdateMsg {
+                                    entity_id: msg.originator.id.to_string(),
+                                    scope: common_pb::AttributeScope::from(scope) as i32,
+                                    updated: vec![],
+                                    deleted_keys: self.keys.clone(),
+                                    update_ts: chrono::Utc::now().timestamp_millis(),
+                                },
+                            )),
+                        },
+                    );
+                }
+                "Success"
+            }
             Err(e) => {
                 tracing::warn!("delete attributes failed: {e}");
                 "Failure"

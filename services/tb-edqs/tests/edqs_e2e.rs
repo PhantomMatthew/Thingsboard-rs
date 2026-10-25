@@ -438,3 +438,154 @@ async fn edqs_asset_snapshot() {
     assert_eq!(resp["data"][0]["entityType"], "ASSET");
     assert_eq!(resp["data"][0]["values"]["label"], "hq");
 }
+
+async fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
+    for _ in 0..150 {
+        if check() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("{what} did not converge in time");
+}
+
+fn latest_long(state: &EdqsState, tenant_id: Uuid, entity_id: Uuid, key: &str) -> Option<i64> {
+    let repo = state.tenants.get(&tenant_id)?;
+    match repo.latest.get(&entity_id)?.get(key)? {
+        (_, KvValue::Long(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+/// 未发出增量的数据库变更：重同步标记触发单租户重载，定期对账兜底。
+#[tokio::test]
+async fn edqs_resync_and_reconcile_recover_lost_increments() {
+    let _guard = DB_LOCK.lock().await;
+    let pool = setup_pool().await;
+    let keys = KeyDictionaryDao::new(pool.clone());
+    let device_dao = DeviceDao::new(pool.clone());
+    let timeseries_dao = TimeseriesDao::new(pool.clone(), keys);
+    let tenant = TenantDao::new(pool.clone())
+        .save(&Tenant {
+            id: Uuid::now_v7(),
+            created_time: 0,
+            title: "Resync Tenant".into(),
+            region: None,
+            country: None,
+            state: None,
+            city: None,
+            address: None,
+            address2: None,
+            zip: None,
+            phone: None,
+            email: None,
+            additional_info: None,
+            tenant_profile_id: None,
+        })
+        .await
+        .unwrap();
+    let tenant_id = tenant.id;
+    let profile = DeviceProfileDao::new(pool.clone())
+        .save(&DeviceProfile {
+            id: Uuid::now_v7(),
+            created_time: 0,
+            tenant_id,
+            name: "default".into(),
+            description: None,
+            is_default: true,
+            transport_type: "DEFAULT".into(),
+            provision_type: "DISABLED".into(),
+            profile_data: json!({}),
+            firmware_id: None,
+            software_id: None,
+        })
+        .await
+        .unwrap();
+    let new_device = |name: &str| Device {
+        id: Uuid::now_v7(),
+        created_time: 0,
+        tenant_id,
+        customer_id: None,
+        device_profile_id: profile.id,
+        name: name.into(),
+        r#type: Some("sensor".into()),
+        label: None,
+        external_id: None,
+        firmware_id: None,
+        software_id: None,
+        additional_info: None,
+        device_data: json!({}),
+    };
+    let device = device_dao.save(&new_device("Resync A")).await.unwrap().id;
+    let temperature = |value: i64, ts: i64| {
+        [TsKvEntry {
+            ts,
+            key: "temperature".into(),
+            value: KvValue::Long(value),
+        }]
+    };
+    timeseries_dao
+        .save(device, &temperature(25, 1000))
+        .await
+        .unwrap();
+
+    let resync_state = EdqsState::default().with_pool(pool.clone());
+    let reconcile_state = EdqsState::default()
+        .with_pool(pool.clone())
+        .with_reconcile_interval(Duration::from_secs(1));
+    let mut consumers = vec![];
+    for state in [&resync_state, &reconcile_state] {
+        tb_edqs::snapshot::load_snapshot(&pool, state)
+            .await
+            .unwrap();
+        let group = format!("tb-edqs-resync-test-{}", Uuid::now_v7().simple());
+        consumers.push(
+            tb_edqs::consumer::start_consumer_for_group(BROKERS, &group, state.clone()).await,
+        );
+    }
+    assert_eq!(
+        latest_long(&resync_state, tenant_id, device, "temperature"),
+        Some(25)
+    );
+
+    // 变更 1：只写库，再发布重同步标记 → 重同步实例重载到新值与新设备。
+    timeseries_dao
+        .save(device, &temperature(99, 5000))
+        .await
+        .unwrap();
+    let second = device_dao.save(&new_device("Resync B")).await.unwrap().id;
+    let producer = KafkaQueueProducer::new(BROKERS, "edqs-resync-test").unwrap();
+    tb_queue::edqs::publish_event(
+        &producer,
+        tenant_id,
+        &tb_queue::edqs::tenant_resync_event(tenant_id),
+    )
+    .await
+    .unwrap();
+    wait_until("tenant resync", || {
+        latest_long(&resync_state, tenant_id, device, "temperature") == Some(99)
+            && resync_state
+                .tenants
+                .get(&tenant_id)
+                .is_some_and(|repo| repo.entities.contains_key(&second))
+    })
+    .await;
+
+    // 变更 2：只写库、不发任何事件 → 仅开启定期对账的实例收敛。
+    timeseries_dao
+        .save(device, &temperature(7, 9000))
+        .await
+        .unwrap();
+    wait_until("periodic reconcile", || {
+        latest_long(&reconcile_state, tenant_id, device, "temperature") == Some(7)
+    })
+    .await;
+    assert_eq!(
+        latest_long(&resync_state, tenant_id, device, "temperature"),
+        Some(99)
+    );
+
+    for consumer in consumers {
+        consumer.abort();
+    }
+}

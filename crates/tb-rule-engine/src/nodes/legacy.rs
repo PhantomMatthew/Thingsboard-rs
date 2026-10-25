@@ -136,14 +136,15 @@ impl Node for ScriptTransformNode {
     }
 }
 
-/// EDQS 读模型事件：fire-and-forget，失败仅 warn。
-fn publish_edqs(ctx: &NodeContext, tenant_id: Uuid, event: edqs_pb::EdqsEventMsg) {
+/// EDQS 读模型事件：后台有界重试，失败时请求租户重同步，不阻塞规则链。
+pub(crate) fn publish_edqs(ctx: &NodeContext, tenant_id: Uuid, event: edqs_pb::EdqsEventMsg) {
     let Some(producer) = ctx.edqs_producer.clone() else {
         return;
     };
     tokio::spawn(async move {
-        if let Err(e) = tb_queue::edqs::publish_event(&producer, tenant_id, &event).await {
-            tracing::warn!("edqs event publish failed: {e}");
+        if let Err(e) = tb_queue::edqs::publish_event_or_resync(&producer, tenant_id, &event).await
+        {
+            tracing::warn!(%tenant_id, "edqs event and resync publish failed: {e}");
         }
     });
 }

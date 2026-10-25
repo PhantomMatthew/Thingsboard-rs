@@ -5,10 +5,10 @@ use std::collections::HashMap;
 
 use sqlx::PgPool;
 use tb_common::{EntityType, TbResult};
-use tb_dao::{AssetDao, AttributesDao, DeviceDao, KeyDictionaryDao, TimeseriesDao};
+use tb_dao::{AssetDao, AttributesDao, DeviceDao, KeyDictionaryDao, TenantDao, TimeseriesDao};
 use uuid::Uuid;
 
-use crate::state::{EdqsState, EntityRecord};
+use crate::state::{EdqsState, EntityRecord, TenantRepo};
 
 const PAGE: i64 = 1000;
 
@@ -137,4 +137,70 @@ pub async fn load_snapshot(pool: &PgPool, state: &EdqsState) -> TbResult<Snapsho
         "edqs snapshot loaded"
     );
     Ok(stats)
+}
+
+/// 单租户读模型：重同步、定期对账与 core 的 PostgreSQL fallback 共用。
+pub async fn load_tenant_repo(pool: &PgPool, tenant_id: Uuid) -> TbResult<TenantRepo> {
+    let keys = KeyDictionaryDao::new(pool.clone());
+    let device_dao = DeviceDao::new(pool.clone());
+    let asset_dao = AssetDao::new(pool.clone());
+    let attributes_dao = AttributesDao::new(pool.clone(), keys.clone());
+    let timeseries_dao = TimeseriesDao::new(pool.clone(), keys);
+
+    let (devices, assets) = tokio::try_join!(
+        device_dao.find_all_by_tenant(tenant_id),
+        asset_dao.find_all_by_tenant(tenant_id)
+    )?;
+    let mut repo = TenantRepo::default();
+    for device in devices {
+        repo.upsert_entity(EntityRecord {
+            id: device.id,
+            entity_type: EntityType::Device,
+            customer_id: device.customer_id,
+            name: device.name,
+            type_or_profile: device.r#type.unwrap_or_default(),
+            label: device.label,
+            created_time: device.created_time,
+        });
+    }
+    for asset in assets {
+        repo.upsert_entity(EntityRecord {
+            id: asset.id,
+            entity_type: EntityType::Asset,
+            customer_id: asset.customer_id,
+            name: asset.name,
+            type_or_profile: String::new(),
+            label: asset.label,
+            created_time: asset.created_time,
+        });
+    }
+
+    let entity_ids: Vec<_> = repo.entities.keys().copied().collect();
+    let (attributes, latest) = tokio::try_join!(
+        attributes_dao.find_by_entity_ids(&entity_ids),
+        timeseries_dao.find_latest_by_entity_ids(&entity_ids)
+    )?;
+    for (entity_id, scope, entry) in attributes {
+        repo.apply_attribute_update(entity_id, scope, vec![(entry.key, entry.value)], &[], 0);
+    }
+    for (entity_id, entry) in latest {
+        repo.apply_latest(entity_id, vec![(entry.key, entry.ts, entry.value)]);
+    }
+    Ok(repo)
+}
+
+/// 从数据库重载并整体替换一个租户；调用方需暂停该租户的事件应用（consumer 内串行执行）。
+pub async fn reload_tenant(pool: &PgPool, state: &EdqsState, tenant_id: Uuid) -> TbResult<()> {
+    let repo = load_tenant_repo(pool, tenant_id).await?;
+    state.replace_tenant(tenant_id, repo);
+    Ok(())
+}
+
+/// 对账范围：数据库中的租户及内存中残留的租户（后者可能已被删除）。
+pub async fn reconcile_tenant_ids(pool: &PgPool, state: &EdqsState) -> TbResult<Vec<Uuid>> {
+    let mut ids = TenantDao::new(pool.clone()).find_all_ids().await?;
+    ids.extend(state.tenants.iter().map(|entry| *entry.key()));
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
 }

@@ -3,8 +3,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::time::Duration;
 
 use dashmap::DashMap;
+use sqlx::PgPool;
 use tb_common::{AttributeScope, EntityType, KvValue};
 use tb_proto::convert;
 use tb_proto::edqs::{EdqsEventMsg, edqs_event_msg::Event};
@@ -118,6 +120,28 @@ impl TenantRepo {
         }
     }
 
+    /// 移除 ts 落在 [start_ts, end_ts] 的 latest；更新的 latest（并发写入）保留。
+    pub fn delete_latest(&mut self, entity_id: Uuid, keys: &[String], start_ts: i64, end_ts: i64) {
+        let Some(latest) = self.latest.get_mut(&entity_id) else {
+            return;
+        };
+        for key in keys {
+            if latest
+                .get(key)
+                .is_some_and(|(ts, _)| (start_ts..=end_ts).contains(ts))
+            {
+                latest.remove(key);
+            }
+        }
+        if latest.is_empty() {
+            self.latest.remove(&entity_id);
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entities.is_empty() && self.attributes.is_empty() && self.latest.is_empty()
+    }
+
     /// 同 key 仅当新 ts >= 现存 ts 时覆盖（与 ts_kv_latest 语义一致）。
     pub fn apply_latest(&mut self, entity_id: Uuid, points: Vec<(String, i64, KvValue)>) {
         if points.is_empty() {
@@ -140,6 +164,9 @@ pub struct EdqsState {
     pub tenants: Arc<DashMap<Uuid, TenantRepo>>,
     pub(crate) consumer_health: Arc<ConsumerHealth>,
     api_key: Arc<str>,
+    /// 租户重同步与定期对账的数据源；None 时忽略重同步事件。
+    pub(crate) pool: Option<PgPool>,
+    pub(crate) reconcile_interval: Option<Duration>,
 }
 
 impl Default for EdqsState {
@@ -148,6 +175,8 @@ impl Default for EdqsState {
             tenants: Arc::new(DashMap::new()),
             consumer_health: Arc::new(ConsumerHealth::default()),
             api_key: Arc::from(std::env::var("TB_EDQS_API_KEY").unwrap_or_default()),
+            pool: None,
+            reconcile_interval: None,
         }
     }
 }
@@ -155,6 +184,17 @@ impl Default for EdqsState {
 impl EdqsState {
     pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
         self.api_key = Arc::from(api_key.into());
+        self
+    }
+
+    pub fn with_pool(mut self, pool: PgPool) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    /// 周期性从数据库重载全部租户，兜底进程崩溃等无法发出重同步标记的增量丢失。
+    pub fn with_reconcile_interval(mut self, interval: Duration) -> Self {
+        self.reconcile_interval = Some(interval);
         self
     }
 
@@ -307,6 +347,48 @@ impl EdqsState {
                     .or_default()
                     .apply_latest(entity_id, points);
             }
+            Event::LatestDelete(e) => {
+                if e.replacements.len() != e.replacement_ts.len() {
+                    tracing::warn!(
+                        replacements = e.replacements.len(),
+                        timestamps = e.replacement_ts.len(),
+                        "edqs latest delete replacements/ts length mismatch; dropping event"
+                    );
+                    return;
+                }
+                let Ok(entity_id) = Uuid::parse_str(&e.entity_id) else {
+                    return;
+                };
+                let Some(replacements) = e
+                    .replacements
+                    .iter()
+                    .zip(&e.replacement_ts)
+                    .map(|(kv, ts)| {
+                        convert::kv_from_proto(kv, kv.key.clone())
+                            .map(|(key, value)| (key, *ts, value))
+                    })
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    tracing::warn!(%tenant_id, %entity_id, "edqs latest delete with bad value");
+                    return;
+                };
+                let Some(mut repo) = self.tenants.get_mut(&tenant_id) else {
+                    return;
+                };
+                repo.delete_latest(entity_id, &e.keys, e.start_ts, e.end_ts);
+                repo.apply_latest(entity_id, replacements);
+            }
+            // 需要访问数据库，由 consumer 处理。
+            Event::TenantResync(_) => {}
+        }
+    }
+
+    /// 用数据库重载结果整体替换租户读模型；租户已无数据时移除。
+    pub fn replace_tenant(&self, tenant_id: Uuid, repo: TenantRepo) {
+        if repo.is_empty() {
+            self.tenants.remove(&tenant_id);
+        } else {
+            self.tenants.insert(tenant_id, repo);
         }
     }
 }
@@ -492,6 +574,96 @@ mod tests {
             vec![("temperature", 20)],
             vec![],
         ));
+        assert!(state.tenants.get(&tenant_id).is_none());
+    }
+
+    fn latest_delete(
+        tenant_id: Uuid,
+        entity_id: Uuid,
+        keys: &[&str],
+        range: (i64, i64),
+        replacements: Vec<(&str, i64, i64)>,
+    ) -> EdqsEventMsg {
+        event(
+            tenant_id,
+            Event::LatestDelete(tb_proto::edqs::LatestDeleteMsg {
+                entity_id: entity_id.to_string(),
+                keys: keys.iter().map(|k| k.to_string()).collect(),
+                start_ts: range.0,
+                end_ts: range.1,
+                replacement_ts: replacements.iter().map(|(_, ts, _)| *ts).collect(),
+                replacements: replacements
+                    .into_iter()
+                    .map(|(key, _, value)| {
+                        tb_proto::convert::kv_to_proto_named(0, key, &KvValue::Long(value))
+                    })
+                    .collect(),
+            }),
+        )
+    }
+
+    #[test]
+    fn latest_delete_rewrites_only_values_inside_the_range() {
+        let state = EdqsState::default();
+        let tenant_id = Uuid::now_v7();
+        let entity_id = Uuid::now_v7();
+        state.apply_event(&upsert(tenant_id, entity_id));
+        state.apply_event(&latest(
+            tenant_id,
+            entity_id,
+            vec![("temperature", 30), ("humidity", 50), ("pressure", 7)],
+            vec![300, 300, 300],
+        ));
+
+        // 范围删除命中 latest：替换为重算值（ts 更旧也生效）。
+        state.apply_event(&latest_delete(
+            tenant_id,
+            entity_id,
+            &["temperature"],
+            (250, 400),
+            vec![("temperature", 200, 20)],
+        ));
+        // 全量删除：无替换值时移除。
+        state.apply_event(&latest_delete(
+            tenant_id,
+            entity_id,
+            &["humidity"],
+            (i64::MIN, i64::MAX),
+            vec![],
+        ));
+        // 并发写入的新值不在删除范围内：保留，旧的替换值被 ts 规则拒绝。
+        state.apply_event(&latest(
+            tenant_id,
+            entity_id,
+            vec![("pressure", 9)],
+            vec![500],
+        ));
+        state.apply_event(&latest_delete(
+            tenant_id,
+            entity_id,
+            &["pressure"],
+            (250, 400),
+            vec![("pressure", 100, 1)],
+        ));
+
+        let repo = state.tenants.get(&tenant_id).unwrap();
+        let latest = repo.latest.get(&entity_id).unwrap();
+        assert_eq!(latest.get("temperature"), Some(&(200, KvValue::Long(20))));
+        assert_eq!(latest.get("humidity"), None);
+        assert_eq!(latest.get("pressure"), Some(&(500, KvValue::Long(9))));
+    }
+
+    #[test]
+    fn replace_tenant_swaps_repo_and_drops_empty_tenants() {
+        let state = EdqsState::default();
+        let tenant_id = Uuid::now_v7();
+        let entity_id = Uuid::now_v7();
+        state.apply_event(&upsert(tenant_id, entity_id));
+        let mut repo = TenantRepo::default();
+        repo.apply_latest(entity_id, vec![("temperature".into(), 1, KvValue::Long(1))]);
+        state.replace_tenant(tenant_id, repo);
+        assert!(state.tenants.get(&tenant_id).unwrap().entities.is_empty());
+        state.replace_tenant(tenant_id, TenantRepo::default());
         assert!(state.tenants.get(&tenant_id).is_none());
     }
 

@@ -43,6 +43,23 @@ impl Aggregation {
     }
 }
 
+/// 遥测删除结果：latest 的变化供缓存与 EDQS 同步使用。
+#[derive(Debug, Default, PartialEq)]
+pub struct TsDeleteResult {
+    /// ts_kv 删除行数。
+    pub deleted: usize,
+    /// latest 已被删除的 key（无剩余数据点）。
+    pub removed_latest: Vec<String>,
+    /// latest 已重写为剩余最新点的条目。
+    pub rewritten_latest: Vec<TsKvEntry>,
+}
+
+impl TsDeleteResult {
+    pub fn latest_changed(&self) -> bool {
+        !self.removed_latest.is_empty() || !self.rewritten_latest.is_empty()
+    }
+}
+
 pub struct TimeseriesDao {
     pool: PgPool,
     keys: KeyDictionaryDao,
@@ -267,51 +284,103 @@ impl TimeseriesDao {
         .map_err(TbError::db)
     }
 
-    /// 删除 ts_kv 数据点；range 为 None 时连同 ts_kv_latest 一并删除这些 key。
-    /// 返回 ts_kv 删除行数。
+    /// 删除 ts_kv 数据点，range 为闭区间 [start, end]；None 时删除这些 key 的全部点与 latest。
+    /// 范围删除命中 latest 时在同一事务内用剩余最新点重写 latest，无剩余点则删除 latest。
+    /// 先锁 latest 行，与并发 save 的 latest 推进串行化。
     pub async fn delete(
         &self,
         entity_id: Uuid,
         keys: &[String],
         range: Option<(i64, i64)>,
-    ) -> TbResult<usize> {
+    ) -> TbResult<TsDeleteResult> {
+        if let Some((start, end)) = range
+            && start > end
+        {
+            return Err(TbError::InvalidInput(format!(
+                "startTs {start} is after endTs {end}"
+            )));
+        }
         let mut tx = self.pool.begin().await.map_err(TbError::db)?;
-        let res = match range {
-            Some((start, end)) => sqlx::query(
-                "DELETE FROM ts_kv t USING key_dictionary d \
-                 WHERE d.key_id = t.key AND t.entity_id = $1 AND d.key = ANY($2) \
-                 AND t.ts >= $3 AND t.ts <= $4",
+        let locked: Vec<(i32, String, i64)> = sqlx::query_as(
+            "SELECT l.key, d.key, l.ts FROM ts_kv_latest l \
+             JOIN key_dictionary d ON d.key_id = l.key \
+             WHERE l.entity_id = $1 AND d.key = ANY($2) ORDER BY l.key FOR UPDATE OF l",
+        )
+        .bind(entity_id)
+        .bind(keys)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(TbError::db)?;
+
+        let (start, end) = range.unwrap_or((i64::MIN, i64::MAX));
+        let deleted = sqlx::query(
+            "DELETE FROM ts_kv t USING key_dictionary d \
+             WHERE d.key_id = t.key AND t.entity_id = $1 AND d.key = ANY($2) \
+             AND t.ts >= $3 AND t.ts <= $4",
+        )
+        .bind(entity_id)
+        .bind(keys)
+        .bind(start)
+        .bind(end)
+        .execute(&mut *tx)
+        .await
+        .map_err(TbError::db)?
+        .rows_affected() as usize;
+
+        let mut result = TsDeleteResult {
+            deleted,
+            ..Default::default()
+        };
+        for (key_id, key, ts) in locked {
+            if ts < start || ts > end {
+                continue;
+            }
+            let remaining = sqlx::query(
+                "SELECT t.ts, $3::text AS key_name, t.bool_v, t.str_v, t.long_v, t.dbl_v, t.json_v \
+                 FROM ts_kv t WHERE t.entity_id = $1 AND t.key = $2 \
+                 ORDER BY t.ts DESC LIMIT 1",
             )
             .bind(entity_id)
-            .bind(keys)
-            .bind(start)
-            .bind(end)
-            .execute(&mut *tx)
+            .bind(key_id)
+            .bind(&key)
+            .fetch_optional(&mut *tx)
             .await
-            .map_err(TbError::db)?,
-            None => {
-                sqlx::query(
-                    "DELETE FROM ts_kv_latest l USING key_dictionary d \
-                     WHERE d.key_id = l.key AND l.entity_id = $1 AND d.key = ANY($2)",
-                )
-                .bind(entity_id)
-                .bind(keys)
-                .execute(&mut *tx)
-                .await
-                .map_err(TbError::db)?;
-                sqlx::query(
-                    "DELETE FROM ts_kv t USING key_dictionary d \
-                     WHERE d.key_id = t.key AND t.entity_id = $1 AND d.key = ANY($2)",
-                )
-                .bind(entity_id)
-                .bind(keys)
-                .execute(&mut *tx)
-                .await
-                .map_err(TbError::db)?
+            .map_err(TbError::db)?;
+            match remaining {
+                Some(row) => {
+                    let entry = row_to_entry(&row)?;
+                    let cols = split_value(&entry.value);
+                    sqlx::query(
+                        "UPDATE ts_kv_latest SET ts=$3, bool_v=$4, str_v=$5, long_v=$6, \
+                         dbl_v=$7, json_v=$8, version = version + 1 \
+                         WHERE entity_id = $1 AND key = $2",
+                    )
+                    .bind(entity_id)
+                    .bind(key_id)
+                    .bind(entry.ts)
+                    .bind(cols.bool_v)
+                    .bind(&cols.str_v)
+                    .bind(cols.long_v)
+                    .bind(cols.dbl_v)
+                    .bind(&cols.json_v)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(TbError::db)?;
+                    result.rewritten_latest.push(entry);
+                }
+                None => {
+                    sqlx::query("DELETE FROM ts_kv_latest WHERE entity_id = $1 AND key = $2")
+                        .bind(entity_id)
+                        .bind(key_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(TbError::db)?;
+                    result.removed_latest.push(key);
+                }
             }
-        };
+        }
         tx.commit().await.map_err(TbError::db)?;
-        Ok(res.rows_affected() as usize)
+        Ok(result)
     }
     /// ts_kv_latest 全表分页扫描（EDQS 快照加载用）：返回 (entity_id, entry)。
     pub async fn scan_latest(&self, offset: i64, limit: i64) -> TbResult<Vec<(Uuid, TsKvEntry)>> {

@@ -193,6 +193,7 @@ services:
       TB_KAFKA_BROKERS: kafka:9092
       TB_EDQS_PORT: 8090
       TB_EDQS_API_KEY: ${TB_EDQS_API_KEY:?TB_EDQS_API_KEY required}
+      TB_EDQS_RECONCILE_INTERVAL_SECS: ${TB_EDQS_RECONCILE_INTERVAL_SECS:-600}
       RUST_LOG: ${RUST_LOG:-info}
     depends_on:
       postgres: { condition: service_healthy }

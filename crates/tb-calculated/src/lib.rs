@@ -306,8 +306,9 @@ fn publish_edqs(
         },
     };
     tokio::spawn(async move {
-        if let Err(e) = tb_queue::edqs::publish_event(&producer, tenant_id, &event).await {
-            tracing::warn!("edqs event publish failed: {e}");
+        if let Err(e) = tb_queue::edqs::publish_event_or_resync(&producer, tenant_id, &event).await
+        {
+            tracing::warn!(%tenant_id, "edqs event and resync publish failed: {e}");
         }
     });
 }

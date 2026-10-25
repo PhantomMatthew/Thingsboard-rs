@@ -363,13 +363,14 @@ async fn delete_timeseries(
             .into());
         }
     };
-    let deleted = state.timeseries_dao.delete(entity_id, &keys, range).await?;
+    let result = state.timeseries_dao.delete(entity_id, &keys, range).await?;
     if range.is_some() {
         telemetry_cache::invalidate_latest(&state, entity_id).await;
     } else {
         telemetry_cache::delete_latest(&state, entity_id, &keys).await;
     }
-    Ok(Json(json!({"deleted": deleted})))
+    crate::edqs::publish_latest_delete(&state, user.0.tenant_id, entity_id, &keys, range, &result);
+    Ok(Json(json!({"deleted": result.deleted})))
 }
 
 /// 写侧 scope 仅允许 SERVER_SCOPE/SHARED_SCOPE（CLIENT 由设备侧写入）。
