@@ -1,11 +1,61 @@
-/target
+# Rust
+/target/
 **/*.rs.bk
-.env
-.idea/
-.vscode/
-*.iml
-.DS_Store
+*.profraw
+
+# Java / Maven 互操作测试生成物
 services/tb-transport-lwm2m/tests/leshan/.m2/
 services/tb-transport-lwm2m/tests/leshan/target/
 services/tb-transport-lwm2m/tests/leshan/lib/
 services/tb-transport-lwm2m/tests/leshan/classpath.txt
+
+# 本地环境配置；模板可以提交
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# 私钥和密钥库
+*.key
+*.p8
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# 本地运行输出
+*.log
+*.pid
+
+# AI Agent 本地会话、缓存和私有设置；共享规则与技能可以提交
+.claude/settings.local.json
+.claude/sessions/
+.claude/projects/
+.claude/todos/
+.claude/cache/
+.claude/logs/
+.codex/
+.kimi/
+.kimi-code/
+.agents/sessions/
+.agents/cache/
+.agents/logs/
+.agents/tmp/
+.continue/sessions/
+.continue/index/
+.cursor/cache/
+.cursor/indexing/
+.cursor/logs/
+.windsurf/cache/
+.orca/
+.aider.chat.history.md
+.aider.input.history
+.aider.llm.history
+.aider.tags.cache.v*/
+
+# IDE 和操作系统
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db

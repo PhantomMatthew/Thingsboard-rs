@@ -4,11 +4,19 @@
 #        docker run --entrypoint tb-transport-mqtt thingsboard-rs:dev
 # 基础镜像/软件源可通过 build-arg 替换为镜像站：
 #   --build-arg RUST_IMAGE=... --build-arg DEBIAN_IMAGE=... --build-arg APT_MIRROR=mirrors.aliyun.com
+#   --build-arg CARGO_REGISTRY_MIRROR=sparse+https://mirrors.ustc.edu.cn/crates.io-index/
 
 # ---------- builder ----------
 ARG RUST_IMAGE=rust:1.90-slim-bookworm
 ARG DEBIAN_IMAGE=debian:bookworm-slim
 FROM ${RUST_IMAGE} AS builder
+
+ARG CARGO_REGISTRY_MIRROR=
+RUN if [ -n "$CARGO_REGISTRY_MIRROR" ]; then \
+        mkdir -p "$CARGO_HOME"; \
+        printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "%s"\n' \
+            "$CARGO_REGISTRY_MIRROR" > "$CARGO_HOME/config.toml"; \
+    fi
 
 # rdkafka-sys 需要 perl/make/cmake/g++/openssl；prost-build 0.14 需要系统 protoc。
 ARG APT_MIRROR=
