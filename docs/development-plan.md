@@ -46,6 +46,7 @@ CARGO_NET_OFFLINE=true cargo check --workspace --all-targets
 
 ```bash
 POSTGRES_PASSWORD=validation-only JWT_SECRET=validation-only TB_EDQS_API_KEY=validation-only \
+TB_SYSADMIN_PASSWORD=validation-only \
   docker compose -f docker-compose.prod.yml config --quiet
 ```
 

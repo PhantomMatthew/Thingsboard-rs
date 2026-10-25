@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tb_dao::migrate(&pool).await?;
     tracing::info!("migrations applied");
 
-    let factory = Arc::new(JwtTokenFactory::from_env());
+    let factory = Arc::new(JwtTokenFactory::from_env()?);
     let auth_service = AuthService::new(pool, factory.clone());
     let auth_state = AuthState::new(auth_service, factory);
     let app = axum::Router::new()

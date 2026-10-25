@@ -56,7 +56,9 @@ ThingsBoard IoT 平台的 Rust 重写版（微服务架构，非兼容重设计�
 | 变量 | 服务 | 默认 | 说明 |
 |---|---|---|---|
 | `TB_HTTP_PORT` | tb-core / tb-auth | 8080 / 8081 | HTTP 监听端口 |
-| `TB_JWT_SECRET` | tb-core / tb-auth | 内置开发值 | JWT 签名密钥，生产必须覆盖且两服务一致 |
+| `TB_ENV` | tb-core / tb-auth | development | `production` 时强制安全启动配置 |
+| `TB_JWT_SECRET` | tb-core / tb-auth | 内置开发值 | JWT 签名密钥；生产必填、至少 32 字节且两服务一致 |
+| `TB_SYSADMIN_PASSWORD` | tb-core | `sysadmin`（仅开发） | 首次 seed 的管理员密码；生产必填、至少 12 字节 |
 | `TB_JWT_ACCESS_EXPIRATION_SEC` / `TB_JWT_REFRESH_EXPIRATION_SEC` | tb-auth | 900 / 604800 | token 有效期 |
 | `TB_OAUTH2_ALLOW_INSECURE_HTTP` | tb-core / tb-auth | false | 仅本地开发：允许 OAuth2 HTTP/内网端点；生产保持 false |
 | `TB_REDIS_URL` | tb-core / tb-rule-engine | `redis://localhost:16379` | latest 遥测缓存 |
@@ -109,9 +111,13 @@ cargo run -p tb-transport-mqtt
 
 ```bash
 docker build -f docker/Dockerfile -t thingsboard-rs:latest .   # 单镜像含全部服务
-cp .env.prod.example .env.prod                                  # 填入 JWT_SECRET 等
+cp .env.prod.example .env.prod                                  # 填入下列生产密钥
+# 必须设置：JWT_SECRET（至少 32 字节）、TB_SYSADMIN_PASSWORD（至少 12 字节）、
+# POSTGRES_PASSWORD、TB_EDQS_API_KEY。不要把真实 .env.prod 提交到 Git。
 docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
 ```
+
+生产 compose 会设置 `TB_ENV=production`；直接运行二进制时也可显式设置该变量启用同样的启动校验。
 
 单一镜像通过 `--entrypoint`（compose 中为 `entrypoint:`）区分服务角色，默认入口 `tb-core`。
 详见 [docker-compose.prod.yml](docker-compose.prod.yml)。

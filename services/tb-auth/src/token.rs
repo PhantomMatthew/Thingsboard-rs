@@ -10,6 +10,30 @@ use uuid::Uuid;
 pub const DEFAULT_JWT_SECRET: &str = "tb-rs-dev-only-secret-do-not-use-in-production";
 pub const DEFAULT_ACCESS_EXPIRATION_SEC: i64 = 900;
 pub const DEFAULT_REFRESH_EXPIRATION_SEC: i64 = 604800;
+pub const MIN_PRODUCTION_JWT_SECRET_BYTES: usize = 32;
+
+pub fn is_production_env() -> bool {
+    std::env::var("TB_ENV").is_ok_and(|value| value.eq_ignore_ascii_case("production"))
+}
+
+fn secret_from_config(production: bool, configured: Option<String>) -> TbResult<String> {
+    let configured = configured.filter(|value| !value.trim().is_empty());
+    if production {
+        return configured
+            .filter(|value| {
+                value.len() >= MIN_PRODUCTION_JWT_SECRET_BYTES && value != DEFAULT_JWT_SECRET
+            })
+            .ok_or_else(|| {
+                TbError::InvalidInput(
+                    "TB_JWT_SECRET is required and must be at least 32 bytes in production".into(),
+                )
+            });
+    }
+    Ok(configured.unwrap_or_else(|| {
+        tracing::warn!("TB_JWT_SECRET 未设置，使用 dev-only 默认值；生产环境必须覆盖");
+        DEFAULT_JWT_SECRET.to_string()
+    }))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -100,11 +124,8 @@ impl JwtTokenFactory {
     }
 
     /// 从环境变量构建：TB_JWT_SECRET / TB_JWT_ACCESS_EXPIRATION_SEC / TB_JWT_REFRESH_EXPIRATION_SEC。
-    pub fn from_env() -> Self {
-        let secret = std::env::var("TB_JWT_SECRET").unwrap_or_else(|_| {
-            tracing::warn!("TB_JWT_SECRET 未设置，使用 dev-only 默认值；生产环境必须覆盖");
-            DEFAULT_JWT_SECRET.to_string()
-        });
+    pub fn from_env() -> TbResult<Self> {
+        let secret = secret_from_config(is_production_env(), std::env::var("TB_JWT_SECRET").ok())?;
         let access_exp = std::env::var("TB_JWT_ACCESS_EXPIRATION_SEC")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -113,7 +134,7 @@ impl JwtTokenFactory {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_REFRESH_EXPIRATION_SEC);
-        Self::new(secret, access_exp, refresh_exp)
+        Ok(Self::new(secret, access_exp, refresh_exp))
     }
 
     pub fn create_access_token(&self, user: &SecurityUser) -> TbResult<String> {
@@ -229,5 +250,22 @@ mod tests {
         let b = JwtTokenFactory::new("s2", 900, 604800);
         let token = a.create_access_token(&user()).unwrap();
         assert!(b.parse(&token).is_err());
+    }
+
+    #[test]
+    fn production_requires_a_strong_explicit_secret() {
+        for secret in [
+            None,
+            Some(String::new()),
+            Some("short".into()),
+            Some(DEFAULT_JWT_SECRET.into()),
+        ] {
+            assert!(secret_from_config(true, secret).is_err());
+        }
+        assert_eq!(
+            secret_from_config(true, Some("s".repeat(32))).unwrap(),
+            "s".repeat(32)
+        );
+        assert_eq!(secret_from_config(false, None).unwrap(), DEFAULT_JWT_SECRET);
     }
 }

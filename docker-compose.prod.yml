@@ -67,7 +67,9 @@ services:
       TB_EDQS_URL: http://tb-edqs:8090
       TB_EDQS_API_KEY: ${TB_EDQS_API_KEY:?TB_EDQS_API_KEY required}
       TB_HTTP_PORT: 8080
+      TB_ENV: production
       TB_JWT_SECRET: ${JWT_SECRET:?JWT_SECRET required}
+      TB_SYSADMIN_PASSWORD: ${TB_SYSADMIN_PASSWORD:?TB_SYSADMIN_PASSWORD required}
       RUST_LOG: ${RUST_LOG:-info}
     ports:
       - "8080:8080"
@@ -84,6 +86,7 @@ services:
     environment:
       TB_DATABASE_URL: postgres://${POSTGRES_USER:-thingsboard}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-thingsboard}
       TB_HTTP_PORT: 8081
+      TB_ENV: production
       TB_JWT_SECRET: ${JWT_SECRET:?JWT_SECRET required}
       RUST_LOG: ${RUST_LOG:-info}
     ports:

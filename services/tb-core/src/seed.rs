@@ -1,7 +1,7 @@
 //! 启动种子数据（幂等）：默认 tenant profile、系统租户 + sysadmin。
 
 use serde_json::json;
-use tb_common::TbResult;
+use tb_common::{TbError, TbResult};
 use tb_dao::models::{Authority, Tenant, TenantProfile, User, UserCredentials};
 use uuid::Uuid;
 
@@ -9,6 +9,22 @@ use crate::AppState;
 
 pub const SYSADMIN_EMAIL: &str = "sysadmin@thingsboard.org";
 pub const SYSADMIN_DEFAULT_PASSWORD: &str = "sysadmin";
+pub const MIN_PRODUCTION_SYSADMIN_PASSWORD_BYTES: usize = 12;
+
+fn sysadmin_password_from_config(production: bool, configured: Option<String>) -> TbResult<String> {
+    let configured = configured.filter(|value| !value.trim().is_empty());
+    if production {
+        return configured
+            .filter(|value| value.len() >= MIN_PRODUCTION_SYSADMIN_PASSWORD_BYTES)
+            .ok_or_else(|| {
+                TbError::InvalidInput(
+                    "TB_SYSADMIN_PASSWORD is required and must be at least 12 bytes in production"
+                        .into(),
+                )
+            });
+    }
+    Ok(configured.unwrap_or_else(|| SYSADMIN_DEFAULT_PASSWORD.into()))
+}
 
 pub async fn seed(state: &AppState) -> TbResult<()> {
     if state.tenant_profile_dao.find_default().await?.is_none() {
@@ -30,6 +46,10 @@ pub async fn seed(state: &AppState) -> TbResult<()> {
         .await?
         .is_none()
     {
+        let sysadmin_password = sysadmin_password_from_config(
+            tb_auth::token::is_production_env(),
+            std::env::var("TB_SYSADMIN_PASSWORD").ok(),
+        )?;
         let tenant = Tenant {
             id: Uuid::now_v7(),
             created_time: 0,
@@ -67,7 +87,7 @@ pub async fn seed(state: &AppState) -> TbResult<()> {
             created_time: 0,
             user_id: user.id,
             enabled: true,
-            password: Some(tb_auth::password::hash_password(SYSADMIN_DEFAULT_PASSWORD)?),
+            password: Some(tb_auth::password::hash_password(&sysadmin_password)?),
             activate_token: None,
             reset_token: None,
             failed_login_attempts: 0,
@@ -78,4 +98,24 @@ pub async fn seed(state: &AppState) -> TbResult<()> {
         tracing::info!(email = SYSADMIN_EMAIL, "seeded system tenant and sysadmin");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn production_sysadmin_password_is_explicit_and_strong() {
+        for password in [None, Some(String::new()), Some("sysadmin".into())] {
+            assert!(sysadmin_password_from_config(true, password).is_err());
+        }
+        assert_eq!(
+            sysadmin_password_from_config(true, Some("production-secret".into())).unwrap(),
+            "production-secret"
+        );
+        assert_eq!(
+            sysadmin_password_from_config(false, None).unwrap(),
+            SYSADMIN_DEFAULT_PASSWORD
+        );
+    }
 }
