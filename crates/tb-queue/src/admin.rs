@@ -1,6 +1,5 @@
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
-use rdkafka::config::ClientConfig;
 
 use crate::QueueError;
 
@@ -15,9 +14,8 @@ pub async fn ensure_topic_with_replication(
     partitions: i32,
     replication: i32,
 ) -> Result<(), QueueError> {
-    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
-        .set("bootstrap.servers", brokers)
-        .create()?;
+    let admin: AdminClient<DefaultClientContext> =
+        crate::config::client_config(brokers).create()?;
     let new_topic = NewTopic::new(topic, partitions, TopicReplication::Fixed(replication));
     let results = admin
         .create_topics([new_topic].iter(), &AdminOptions::new())

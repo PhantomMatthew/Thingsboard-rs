@@ -3,7 +3,6 @@ use bytes::Bytes;
 use futures::StreamExt;
 use rdkafka::Offset;
 use rdkafka::TopicPartitionList;
-use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::Message;
 
@@ -65,9 +64,8 @@ impl StreamQueueConsumer {
         offset_reset: &str,
         enable_auto_commit: bool,
     ) -> Result<Self, QueueError> {
-        let mut config = ClientConfig::new();
+        let mut config = crate::config::client_config(brokers);
         config
-            .set("bootstrap.servers", brokers)
             .set("group.id", group_id)
             .set(
                 "enable.auto.commit",

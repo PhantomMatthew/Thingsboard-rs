@@ -4,6 +4,9 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[features]
+kafka-tls = ["rdkafka/ssl"]
+
 [dependencies]
 tokio.workspace = true
 futures.workspace = true

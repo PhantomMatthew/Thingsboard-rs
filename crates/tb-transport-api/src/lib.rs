@@ -816,8 +816,12 @@ mod tests {
     #[tokio::test]
     async fn shared_limit_spans_transport_instances() {
         let url = std::env::var("TB_REDIS_URL").unwrap_or_else(|_| DEFAULT_REDIS_URL.into());
-        let node_a = test_client_with_shared(0, shared_limiter(&url, 2));
-        let node_b = test_client_with_shared(0, shared_limiter(&url, 2));
+        let (shared_a, shared_b) = (shared_limiter(&url, 2), shared_limiter(&url, 2));
+        for shared in [&shared_a, &shared_b] {
+            assert!(shared.as_ref().unwrap().wait_connected().await);
+        }
+        let node_a = test_client_with_shared(0, shared_a);
+        let node_b = test_client_with_shared(0, shared_b);
         let tenant = Uuid::now_v7().to_string();
 
         assert!(node_a.rate_limit_check(&tenant, 1).await);

@@ -18,7 +18,8 @@ RUN if [ -n "$CARGO_REGISTRY_MIRROR" ]; then \
             "$CARGO_REGISTRY_MIRROR" > "$CARGO_HOME/config.toml"; \
     fi
 
-# rdkafka-sys 需要 perl/make/cmake/g++/openssl；prost-build 0.14 需要系统 protoc。
+# rdkafka-sys 需要 perl/make/cmake/g++/openssl（镜像启用 tb-queue/kafka-tls 以支持 Kafka TLS）；
+# prost-build 0.14 需要系统 protoc。
 ARG APT_MIRROR=
 RUN if [ -n "$APT_MIRROR" ]; then \
         sed -i "s|deb.debian.org|${APT_MIRROR}|g; s|security.debian.org|${APT_MIRROR}|g" \
@@ -64,7 +65,7 @@ RUN set -e; \
         echo "" > "$d/src/lib.rs"; \
         echo "fn main() {}" > "$d/src/main.rs"; \
     done; \
-    cargo build --release --workspace; \
+    cargo build --release --workspace --features tb-queue/kafka-tls; \
     rm -rf crates services tools target/release/.fingerprint/tb-*
 
 # --- 源码层：真实代码全量构建 ---
@@ -74,7 +75,7 @@ COPY crates crates
 COPY services services
 COPY tools tools
 
-RUN cargo build --release --workspace
+RUN cargo build --release --workspace --features tb-queue/kafka-tls
 
 # ---------- runtime ----------
 FROM ${DEBIAN_IMAGE}

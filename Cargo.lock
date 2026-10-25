@@ -2158,6 +2158,7 @@ dependencies = [
  "libc",
  "libz-sys",
  "num_enum",
+ "openssl-sys",
  "pkg-config",
 ]
 
@@ -2175,6 +2176,7 @@ dependencies = [
  "futures-channel",
  "futures-util",
  "itoa",
+ "native-tls",
  "num-bigint",
  "percent-encoding",
  "pin-project-lite",
@@ -2182,6 +2184,7 @@ dependencies = [
  "sha1_smol",
  "socket2",
  "tokio",
+ "tokio-native-tls",
  "tokio-util",
  "url",
 ]

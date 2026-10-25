@@ -13,6 +13,7 @@
 //! 并在消息处理成功后调用 `QueueConsumer::commit`；后续各服务将逐个切换。
 
 pub mod admin;
+pub mod config;
 pub mod consumer;
 pub mod edqs;
 pub mod producer;

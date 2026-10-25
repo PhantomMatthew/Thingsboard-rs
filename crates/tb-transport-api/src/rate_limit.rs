@@ -3,7 +3,8 @@
 //! - `RateLimiter`：进程内，每个传输实例独立计数。
 //! - `SharedRateLimiter`：Redis 上按租户共享，所有传输实例合计不超过 rate。
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -93,7 +94,8 @@ struct Lease {
 /// 因此全部实例的消耗之和不超过共享桶的发放量。
 pub struct SharedRateLimiter {
     client: redis::Client,
-    conn: tokio::sync::OnceCell<redis::aio::ConnectionManager>,
+    conn: Arc<OnceLock<redis::aio::ConnectionManager>>,
+    connecting: Arc<AtomicBool>,
     script: redis::Script,
     max_per_sec: u32,
     lease_size: u32,
@@ -106,7 +108,8 @@ impl SharedRateLimiter {
         assert!(max_per_sec > 0);
         Self {
             client,
-            conn: tokio::sync::OnceCell::new(),
+            conn: Arc::new(OnceLock::new()),
+            connecting: Arc::new(AtomicBool::new(false)),
             script: redis::Script::new(TAKE_TOKENS_LUA),
             max_per_sec,
             lease_size: (max_per_sec / LEASE_DIVISOR).max(1),
@@ -115,7 +118,33 @@ impl SharedRateLimiter {
         }
     }
 
-    /// 取 count 枚令牌。None 表示 Redis 不可用（失败后退避 5 秒），调用方只按本地限流处理。
+    /// 后台建立连接，失败后退避 5 秒才允许再次尝试；建连不受单次请求超时约束。
+    fn connect_in_background(&self) {
+        if self.connecting.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let client = self.client.clone();
+        let conn = self.conn.clone();
+        let connecting = self.connecting.clone();
+        tokio::spawn(async move {
+            match redis::aio::ConnectionManager::new(client).await {
+                Ok(manager) => {
+                    let _ = conn.set(manager);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "shared transport rate limiter cannot connect to Redis: {error}; \
+                         using per-instance limit only"
+                    );
+                    tokio::time::sleep(REDIS_BACKOFF).await;
+                }
+            }
+            connecting.store(false, Ordering::Release);
+        });
+    }
+
+    /// 取 count 枚令牌。None 表示 Redis 尚未连上或不可用（调用失败后退避 5 秒），
+    /// 调用方只按本地限流处理。
     pub async fn check_n(&self, key: &str, count: u32) -> Option<bool> {
         if count == 0 {
             return Some(true);
@@ -128,10 +157,14 @@ impl SharedRateLimiter {
             lease.tokens -= count;
             return Some(true);
         }
+        let Some(conn) = self.conn.get() else {
+            self.connect_in_background();
+            return None;
+        };
         if self.in_backoff(now) {
             return None;
         }
-        let granted = match tokio::time::timeout(REDIS_TIMEOUT, self.take(key, count)).await {
+        let granted = match tokio::time::timeout(REDIS_TIMEOUT, self.take(conn, key, count)).await {
             Ok(Ok(granted)) => granted,
             Ok(Err(error)) => {
                 self.start_backoff(now, &error.to_string());
@@ -159,11 +192,24 @@ impl SharedRateLimiter {
         }
     }
 
-    async fn take(&self, key: &str, count: u32) -> redis::RedisResult<u32> {
-        let conn = self
-            .conn
-            .get_or_try_init(|| redis::aio::ConnectionManager::new(self.client.clone()))
-            .await?;
+    #[cfg(test)]
+    pub(crate) async fn wait_connected(&self) -> bool {
+        for _ in 0..100 {
+            if self.conn.get().is_some() {
+                return true;
+            }
+            self.connect_in_background();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    async fn take(
+        &self,
+        conn: &redis::aio::ConnectionManager,
+        key: &str,
+        count: u32,
+    ) -> redis::RedisResult<u32> {
         self.script
             .key(format!("{SHARED_KEY_PREFIX}{key}"))
             .arg(self.max_per_sec)
@@ -238,6 +284,7 @@ mod tests {
         let tenant = uuid::Uuid::now_v7().to_string();
         let node_a = SharedRateLimiter::new(redis_client(), 40);
         let node_b = SharedRateLimiter::new(redis_client(), 40);
+        assert!(node_a.wait_connected().await && node_b.wait_connected().await);
         let mut allowed = 0;
         for _ in 0..60 {
             for node in [&node_a, &node_b] {
@@ -257,18 +304,42 @@ mod tests {
     async fn shared_budget_refills() {
         let tenant = uuid::Uuid::now_v7().to_string();
         let limiter = SharedRateLimiter::new(redis_client(), 20);
+        assert!(limiter.wait_connected().await);
         while limiter.check_n(&tenant, 1).await == Some(true) {}
         tokio::time::sleep(Duration::from_millis(1100)).await;
         assert_eq!(limiter.check_n(&tenant, 1).await, Some(true));
     }
 
+    #[test]
+    fn tls_redis_urls_are_supported() {
+        assert!(redis::Client::open("rediss://:secret@redis.example:6380/").is_ok());
+    }
+
+    /// 显式运行：`TB_TEST_REDIS_TLS_URL=rediss://:<口令>@host:port/#insecure cargo test ... -- --ignored`
     #[tokio::test]
-    async fn unavailable_redis_backs_off_without_blocking() {
+    #[ignore]
+    async fn shared_budget_over_tls() {
+        let url = std::env::var("TB_TEST_REDIS_TLS_URL").expect("TB_TEST_REDIS_TLS_URL");
+        let limiter = SharedRateLimiter::new(redis::Client::open(url).unwrap(), 1);
+        assert!(limiter.wait_connected().await);
+        let tenant = uuid::Uuid::now_v7().to_string();
+        assert_eq!(limiter.check_n(&tenant, 1).await, Some(true));
+        assert_eq!(limiter.check_n(&tenant, 1).await, Some(false));
+    }
+
+    #[tokio::test]
+    async fn unavailable_redis_falls_back_without_blocking() {
         let limiter =
             SharedRateLimiter::new(redis::Client::open("redis://127.0.0.1:1").unwrap(), 5);
-        assert_eq!(limiter.check_n("tenant", 1).await, None);
         let started = Instant::now();
-        assert_eq!(limiter.check_n("tenant", 1).await, None);
-        assert!(started.elapsed() < Duration::from_millis(50));
+        for _ in 0..3 {
+            assert_eq!(limiter.check_n("tenant", 1).await, None);
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+        assert!(started.elapsed() < Duration::from_millis(1500));
+        assert!(
+            limiter.connecting.load(Ordering::Acquire),
+            "connect retry must back off"
+        );
     }
 }

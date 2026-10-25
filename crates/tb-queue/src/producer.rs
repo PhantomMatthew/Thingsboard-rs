@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use std::time::Duration;
 
@@ -19,8 +18,7 @@ pub struct KafkaQueueProducer {
 
 impl KafkaQueueProducer {
     pub fn new(brokers: &str, client_id: &str) -> Result<Self, QueueError> {
-        let inner = ClientConfig::new()
-            .set("bootstrap.servers", brokers)
+        let inner = crate::config::client_config(brokers)
             .set("client.id", client_id)
             .set("message.timeout.ms", "10000")
             // 遥测需由全部同步副本确认，避免 leader 故障时丢失已确认写入。

@@ -5,11 +5,19 @@
 
 name: thingsboard-rs-prod
 
+# Kafka 客户端：SASL/PLAIN 认证（KAFKA_PASSWORD 仅用 URL/JAAS 安全字符，如 openssl rand -hex 32）。
+x-kafka-client: &kafka-client
+  TB_KAFKA_BROKERS: kafka:9092
+  TB_KAFKA_SECURITY_PROTOCOL: SASL_PLAINTEXT
+  TB_KAFKA_SASL_MECHANISM: PLAIN
+  TB_KAFKA_SASL_USERNAME: ${KAFKA_USERNAME:-thingsboard}
+  TB_KAFKA_SASL_PASSWORD: ${KAFKA_PASSWORD:?KAFKA_PASSWORD required}
+
 # 传输层租户限流（msg/s，0=不限）：共享桶经 Redis 跨全部传输实例合计，
 # 每实例桶为补充上限（Redis 不可用时仍生效）。
 x-transport-rate-limit: &transport-rate-limit
   TB_ENV: production
-  TB_REDIS_URL: redis://redis:6379
+  TB_REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD required}@redis:6379
   TB_TRANSPORT_SHARED_RATE_LIMIT_PER_TENANT: ${TB_TRANSPORT_SHARED_RATE_LIMIT_PER_TENANT:-1000}
   TB_TRANSPORT_RATE_LIMIT_PER_TENANT: ${TB_TRANSPORT_RATE_LIMIT_PER_TENANT:-1000}
 
@@ -31,34 +39,77 @@ services:
     restart: unless-stopped
     # 不暴露端口：仅供容器网络内访问。
 
+  # 客户端监听 SASL_PLAINTEXT（PLAIN 认证），关闭自动建 topic，由 kafka-init 受控创建。
   kafka:
     image: apache/kafka:3.9.0
+    command:
+      - /bin/bash
+      - -c
+      - |
+        umask 077
+        printf 'KafkaServer {\n  org.apache.kafka.common.security.plain.PlainLoginModule required\n  username="%s" password="%s"\n  user_%s="%s";\n};\n' \
+          "$$TB_KAFKA_SASL_USERNAME" "$$TB_KAFKA_SASL_PASSWORD" "$$TB_KAFKA_SASL_USERNAME" "$$TB_KAFKA_SASL_PASSWORD" > /tmp/kafka_jaas.conf
+        printf 'security.protocol=SASL_PLAINTEXT\nsasl.mechanism=PLAIN\nsasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="%s" password="%s";\n' \
+          "$$TB_KAFKA_SASL_USERNAME" "$$TB_KAFKA_SASL_PASSWORD" > /tmp/client.properties
+        exec /etc/kafka/docker/run
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_LISTENERS: SASL_PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: SASL_PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,SASL_PLAINTEXT:SASL_PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: SASL_PLAINTEXT
+      KAFKA_SASL_ENABLED_MECHANISMS: PLAIN
+      KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL: PLAIN
+      KAFKA_OPTS: -Djava.security.auth.login.config=/tmp/kafka_jaas.conf
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
       CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      TB_KAFKA_SASL_USERNAME: ${KAFKA_USERNAME:-thingsboard}
+      TB_KAFKA_SASL_PASSWORD: ${KAFKA_PASSWORD:?KAFKA_PASSWORD required}
     volumes:
       - kafkadata:/var/lib/kafka/data
     healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --command-config /tmp/client.properties --list"]
       interval: 5s
       timeout: 10s
       retries: 30
     restart: unless-stopped
 
+  # 一次性创建平台固定 topic（按节点的响应/通知 topic 由各服务启动时创建）。
+  kafka-init:
+    image: apache/kafka:3.9.0
+    command:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+        umask 077
+        printf 'security.protocol=SASL_PLAINTEXT\nsasl.mechanism=PLAIN\nsasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="%s" password="%s";\n' \
+          "$$TB_KAFKA_SASL_USERNAME" "$$TB_KAFKA_SASL_PASSWORD" > /tmp/client.properties
+        for spec in tb_transport.api.requests:10 tb_rule_engine.Main:10 tb_rule_engine.dlq:10 \
+                    tb_core:10 tb_core.dlq:10 tb_usage_stats:10 tb_edqs.events:10; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --command-config /tmp/client.properties \
+            --create --if-not-exists --topic "$${spec%%:*}" --partitions "$${spec##*:}" --replication-factor 1
+        done
+    environment:
+      TB_KAFKA_SASL_USERNAME: ${KAFKA_USERNAME:-thingsboard}
+      TB_KAFKA_SASL_PASSWORD: ${KAFKA_PASSWORD:?KAFKA_PASSWORD required}
+    depends_on:
+      kafka: { condition: service_healthy }
+    restart: "no"
+
   redis:
     image: redis:7-alpine
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?REDIS_PASSWORD required}"]
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?REDIS_PASSWORD required}
     volumes:
       - redisdata:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -70,8 +121,8 @@ services:
     entrypoint: ["tb-core"]
     environment:
       TB_DATABASE_URL: postgres://${POSTGRES_USER:-thingsboard}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-thingsboard}
-      TB_KAFKA_BROKERS: kafka:9092
-      TB_REDIS_URL: redis://redis:6379
+      <<: *kafka-client
+      TB_REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
       TB_EDQS_URL: http://tb-edqs:8090
       TB_EDQS_API_KEY: ${TB_EDQS_API_KEY:?TB_EDQS_API_KEY required}
       TB_HTTP_PORT: 8080
@@ -83,7 +134,7 @@ services:
       - "8080:8080"
     depends_on:
       postgres: { condition: service_healthy }
-      kafka: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
       redis: { condition: service_healthy }
       tb-edqs: { condition: service_started }
     restart: unless-stopped
@@ -108,8 +159,8 @@ services:
     entrypoint: ["tb-rule-engine"]
     environment:
       TB_DATABASE_URL: postgres://${POSTGRES_USER:-thingsboard}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-thingsboard}
-      TB_KAFKA_BROKERS: kafka:9092
-      TB_REDIS_URL: redis://redis:6379
+      <<: *kafka-client
+      TB_REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
       TB_RE_QUEUE: Main
       TB_RE_ALLOWED_HOSTS: ${TB_RE_ALLOWED_HOSTS:-}
       TB_RE_ALLOW_PRIVATE_NETWORK: ${TB_RE_ALLOW_PRIVATE_NETWORK:-false}
@@ -117,7 +168,7 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
     depends_on:
       postgres: { condition: service_healthy }
-      kafka: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
       redis: { condition: service_healthy }
     restart: unless-stopped
 
@@ -125,15 +176,14 @@ services:
     image: ${APP_IMAGE:-thingsboard-rs:latest}
     entrypoint: ["tb-transport-mqtt"]
     environment:
-      <<: *transport-rate-limit
-      TB_KAFKA_BROKERS: kafka:9092
+      <<: [*kafka-client, *transport-rate-limit]
       TB_MQTT_BIND: 0.0.0.0:1883
       TB_NODE_ID: mqtt-1
       RUST_LOG: ${RUST_LOG:-info}
     ports:
       - "1883:1883"
     depends_on:
-      kafka: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
       redis: { condition: service_healthy }
       tb-core: { condition: service_started }
     restart: unless-stopped
@@ -142,15 +192,14 @@ services:
     image: ${APP_IMAGE:-thingsboard-rs:latest}
     entrypoint: ["tb-transport-http"]
     environment:
-      <<: *transport-rate-limit
-      TB_KAFKA_BROKERS: kafka:9092
+      <<: [*kafka-client, *transport-rate-limit]
       TB_TRANSPORT_HTTP_PORT: 8088
       TB_NODE_ID: http-1
       RUST_LOG: ${RUST_LOG:-info}
     ports:
       - "8088:8088"
     depends_on:
-      kafka: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
       redis: { condition: service_healthy }
       tb-core: { condition: service_started }
     restart: unless-stopped
@@ -159,8 +208,7 @@ services:
     image: ${APP_IMAGE:-thingsboard-rs:latest}
     entrypoint: ["tb-transport-coap"]
     environment:
-      <<: *transport-rate-limit
-      TB_KAFKA_BROKERS: kafka:9092
+      <<: [*kafka-client, *transport-rate-limit]
       TB_COAP_BIND: 0.0.0.0:5683
       TB_COAP_MAX_REQUESTS_PER_SEC: ${TB_COAP_MAX_REQUESTS_PER_SEC:-10000}
       TB_NODE_ID: coap-1
@@ -168,7 +216,7 @@ services:
     ports:
       - "5683:5683/udp"
     depends_on:
-      kafka: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
       redis: { condition: service_healthy }
       tb-core: { condition: service_started }
     restart: unless-stopped
@@ -177,12 +225,11 @@ services:
     image: ${APP_IMAGE:-thingsboard-rs:latest}
     entrypoint: ["tb-transport-snmp"]
     environment:
-      <<: *transport-rate-limit
-      TB_KAFKA_BROKERS: kafka:9092
+      <<: [*kafka-client, *transport-rate-limit]
       TB_NODE_ID: snmp-1
       RUST_LOG: ${RUST_LOG:-info}
     depends_on:
-      kafka: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
       redis: { condition: service_healthy }
       tb-core: { condition: service_started }
     restart: unless-stopped
@@ -191,15 +238,14 @@ services:
     image: ${APP_IMAGE:-thingsboard-rs:latest}
     entrypoint: ["tb-transport-lwm2m"]
     environment:
-      <<: *transport-rate-limit
-      TB_KAFKA_BROKERS: kafka:9092
+      <<: [*kafka-client, *transport-rate-limit]
       TB_LWM2M_BIND: 0.0.0.0:5685
       TB_NODE_ID: lwm2m-1
       RUST_LOG: ${RUST_LOG:-info}
     ports:
       - "5685:5685/udp"
     depends_on:
-      kafka: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
       redis: { condition: service_healthy }
       tb-core: { condition: service_started }
     restart: unless-stopped
@@ -209,14 +255,14 @@ services:
     entrypoint: ["tb-edqs"]
     environment:
       TB_DATABASE_URL: postgres://${POSTGRES_USER:-thingsboard}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-thingsboard}
-      TB_KAFKA_BROKERS: kafka:9092
+      <<: *kafka-client
       TB_EDQS_PORT: 8090
       TB_EDQS_API_KEY: ${TB_EDQS_API_KEY:?TB_EDQS_API_KEY required}
       TB_EDQS_RECONCILE_INTERVAL_SECS: ${TB_EDQS_RECONCILE_INTERVAL_SECS:-600}
       RUST_LOG: ${RUST_LOG:-info}
     depends_on:
       postgres: { condition: service_healthy }
-      kafka: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
     restart: unless-stopped
 
   tb-housekeeper:

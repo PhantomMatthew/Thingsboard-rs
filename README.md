@@ -61,7 +61,10 @@ ThingsBoard IoT 平台的 Rust 重写版（微服务架构，非兼容重设计�
 | `TB_SYSADMIN_PASSWORD` | tb-core | `sysadmin`（仅开发） | 首次 seed 的管理员密码；生产必填、至少 12 字节 |
 | `TB_JWT_ACCESS_EXPIRATION_SEC` / `TB_JWT_REFRESH_EXPIRATION_SEC` | tb-auth | 900 / 604800 | token 有效期 |
 | `TB_OAUTH2_ALLOW_INSECURE_HTTP` | tb-core / tb-auth | false | 仅本地开发：允许 OAuth2 HTTP/内网端点；生产保持 false |
-| `TB_REDIS_URL` | tb-core / tb-rule-engine / transport | `redis://localhost:16379` | latest 遥测缓存；transport 用于共享租户限流 |
+| `TB_REDIS_URL` | tb-core / tb-rule-engine / transport | `redis://localhost:16379` | latest 遥测缓存；transport 用于共享租户限流。口令写作 `redis://:<口令>@host:port`，TLS 用 `rediss://` |
+| `TB_KAFKA_SECURITY_PROTOCOL` | 全部 Kafka 客户端 | `plaintext` | `sasl_plaintext` / `ssl` / `sasl_ssl`；SASL 机制 `TB_KAFKA_SASL_MECHANISM` 默认 `PLAIN` |
+| `TB_KAFKA_SASL_USERNAME` / `TB_KAFKA_SASL_PASSWORD` | 全部 Kafka 客户端 | 空 | SASL 凭据 |
+| `TB_KAFKA_SSL_CA_LOCATION` / `TB_KAFKA_SSL_CERTIFICATE_LOCATION` / `TB_KAFKA_SSL_KEY_LOCATION` | 全部 Kafka 客户端 | 空 | TLS CA 与客户端证书/私钥 PEM 路径（需 `kafka-tls` 构建） |
 | `TB_EDQS_URL` | tb-core | `http://localhost:8090` | EDQS 代理目标 |
 | `TB_EDQS_API_KEY` | tb-core / tb-edqs | 空 | 内部 API 密钥，生产必须配置且两服务一致 |
 | `TB_INGEST_ENABLED` | tb-core | false | 开启旧直通遥测落库（Phase 4 起由 rule-engine 接管，默认关） |
@@ -123,11 +126,13 @@ cargo run -p tb-transport-mqtt
 docker build -f docker/Dockerfile -t thingsboard-rs:latest .   # 单镜像含全部服务
 cp .env.prod.example .env.prod                                  # 填入下列生产密钥
 # 必须设置：JWT_SECRET（至少 32 字节）、TB_SYSADMIN_PASSWORD（至少 12 字节）、
-# POSTGRES_PASSWORD、TB_EDQS_API_KEY。不要把真实 .env.prod 提交到 Git。
+# POSTGRES_PASSWORD、TB_EDQS_API_KEY、REDIS_PASSWORD、KAFKA_PASSWORD。不要把真实 .env.prod 提交到 Git。
 docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
 ```
 
 生产 compose 会设置 `TB_ENV=production`；直接运行二进制时也可显式设置该变量启用同样的启动校验。
+
+生产 compose 中 Redis 启用口令（服务经 `TB_REDIS_URL=redis://:<口令>@redis:6379` 连接），Kafka 客户端监听为 `SASL_PLAINTEXT` 并要求 SASL/PLAIN 认证，关闭 `auto.create.topics`：一次性服务 `kafka-init` 先创建平台固定 topic（`tb_transport.api.requests`、`tb_rule_engine.Main`/`.dlq`、`tb_core`/`.dlq`、`tb_usage_stats`、`tb_edqs.events`），应用服务在它成功退出后才启动，按节点的响应/通知 topic 由各服务启动时创建。两套凭据会拼入 URL 与 JAAS 配置，只使用字母数字。跨主机部署时把 Redis 改为 `rediss://`、Kafka 改为 `TB_KAFKA_SECURITY_PROTOCOL=SASL_SSL` 并配置 CA；Kafka TLS 需要以 `tb-queue/kafka-tls` feature 构建（生产镜像默认开启，本地默认构建不含 OpenSSL）。
 
 单一镜像通过 `--entrypoint`（compose 中为 `entrypoint:`）区分服务角色，默认入口 `tb-core`。
 详见 [docker-compose.prod.yml](docker-compose.prod.yml)。
