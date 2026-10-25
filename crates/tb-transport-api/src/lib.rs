@@ -4,8 +4,10 @@
 //!   响应走 `tb_transport.api.responses.<node_id>`，后台 task 按 request_id 路由到 oneshot。
 //! - 异步上行：publish_* 把遥测/属性/RPC 封装为 ToRuleEngineMsg 发到 `tb_rule_engine.Main`
 //!   （key=device_id，保证同设备分区有序）。
-//! - 租户级限流：`TB_TRANSPORT_RATE_LIMIT_PER_TENANT`（msg/s，默认 0=不限），
-//!   超限返回 TbError::RateLimitExceeded。
+//! - 租户级限流（msg/s，显式 0=不限；未设置时 `TB_ENV=production` 默认 1000，否则不限），
+//!   超限返回 TbError::RateLimitExceeded：
+//!   `TB_TRANSPORT_SHARED_RATE_LIMIT_PER_TENANT` 经 `TB_REDIS_URL` 在全部传输实例间共享；
+//!   `TB_TRANSPORT_RATE_LIMIT_PER_TENANT` 为每实例上限，Redis 不可用时仍生效。
 
 pub mod rate_limit;
 
@@ -25,10 +27,44 @@ use tb_queue::{
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-use crate::rate_limit::RateLimiter;
+use crate::rate_limit::{RateLimiter, SharedRateLimiter};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const CACHE_TTL: Duration = Duration::from_secs(60);
+const PRODUCTION_RATE_LIMIT_PER_TENANT: u32 = 1000;
+const DEFAULT_REDIS_URL: &str = "redis://localhost:16379";
+
+pub fn is_production_env() -> bool {
+    std::env::var("TB_ENV").is_ok_and(|value| value.eq_ignore_ascii_case("production"))
+}
+
+fn rate_limit_value(raw: Option<&str>, production: bool) -> u32 {
+    raw.and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(if production {
+            PRODUCTION_RATE_LIMIT_PER_TENANT
+        } else {
+            0
+        })
+}
+
+fn rate_limit_from_env(key: &str) -> u32 {
+    rate_limit_value(std::env::var(key).ok().as_deref(), is_production_env())
+}
+
+fn shared_rate_limiter_from_env() -> Option<SharedRateLimiter> {
+    let rate = rate_limit_from_env("TB_TRANSPORT_SHARED_RATE_LIMIT_PER_TENANT");
+    if rate == 0 {
+        return None;
+    }
+    let url = std::env::var("TB_REDIS_URL").unwrap_or_else(|_| DEFAULT_REDIS_URL.into());
+    match redis::Client::open(url) {
+        Ok(client) => Some(SharedRateLimiter::new(client, rate)),
+        Err(e) => {
+            tracing::error!("invalid TB_REDIS_URL, shared transport rate limit disabled: {e}");
+            None
+        }
+    }
+}
 
 type PendingMap = Arc<Mutex<HashMap<String, oneshot::Sender<pb::TransportApiResponseMsg>>>>;
 
@@ -60,6 +96,7 @@ struct Inner {
     pending: PendingMap,
     cache: moka::future::Cache<String, Arc<(pb::DeviceInfoProto, pb::DeviceProfileProto)>>,
     rate_limiter: Mutex<Option<RateLimiter>>,
+    shared_rate_limiter: Option<SharedRateLimiter>,
     router_task: tokio::task::JoinHandle<()>,
 }
 
@@ -116,11 +153,8 @@ impl TransportApiClient {
             .max_capacity(100_000)
             .time_to_live(CACHE_TTL)
             .build();
-        let rate_limiter = std::env::var("TB_TRANSPORT_RATE_LIMIT_PER_TENANT")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|&n| n > 0)
-            .map(RateLimiter::new);
+        let rate_limit = rate_limit_from_env("TB_TRANSPORT_RATE_LIMIT_PER_TENANT");
+        let rate_limiter = (rate_limit > 0).then(|| RateLimiter::new(rate_limit));
         Ok(Self {
             inner: Arc::new(Inner {
                 node_id: node_id.to_string(),
@@ -128,22 +162,30 @@ impl TransportApiClient {
                 pending,
                 cache,
                 rate_limiter: Mutex::new(rate_limiter),
+                shared_rate_limiter: shared_rate_limiter_from_env(),
                 router_task,
             }),
         })
     }
 
-    /// 测试/定制用：覆盖环境变量配置的限流阈值（0 = 不限）。
+    /// 测试/定制用：覆盖环境变量配置的每实例限流阈值（0 = 不限）。
     pub fn set_rate_limit(&self, max_msgs_per_sec_per_tenant: u32) {
         let limiter = (max_msgs_per_sec_per_tenant > 0)
             .then(|| RateLimiter::new(max_msgs_per_sec_per_tenant));
         *mutex_lock(&self.inner.rate_limiter) = limiter;
     }
 
-    /// 租户令牌桶取 msg_count 枚；未配置限流时恒 true。
-    fn rate_limit_check(&self, tenant_id: &str, msg_count: u32) -> bool {
-        match &*mutex_lock(&self.inner.rate_limiter) {
+    /// 先扣每实例桶，再扣共享桶；共享桶不可用时只按每实例桶判定。
+    async fn rate_limit_check(&self, tenant_id: &str, msg_count: u32) -> bool {
+        let local_ok = match &*mutex_lock(&self.inner.rate_limiter) {
             Some(limiter) => limiter.check_n(tenant_id, msg_count),
+            None => true,
+        };
+        if !local_ok {
+            return false;
+        }
+        match &self.inner.shared_rate_limiter {
+            Some(shared) => shared.check_n(tenant_id, msg_count).await.unwrap_or(true),
             None => true,
         }
     }
@@ -438,7 +480,7 @@ impl TransportApiClient {
             group.insert(e.key, serde_json::to_value(&e.value).unwrap_or_default());
         }
         let msg_count = u32::try_from(order.len()).unwrap_or(u32::MAX);
-        if !self.rate_limit_check(&device.tenant_id, msg_count) {
+        if !self.rate_limit_check(&device.tenant_id, msg_count).await {
             return Err(TbError::RateLimitExceeded(format!(
                 "tenant {} telemetry rate limit exceeded",
                 device.tenant_id
@@ -458,7 +500,7 @@ impl TransportApiClient {
         device: &pb::DeviceInfoProto,
         entries: Vec<KvEntry>,
     ) -> TbResult<()> {
-        if !self.rate_limit_check(&device.tenant_id, 1) {
+        if !self.rate_limit_check(&device.tenant_id, 1).await {
             return Err(TbError::RateLimitExceeded(format!(
                 "tenant {} attributes rate limit exceeded",
                 device.tenant_id
@@ -481,7 +523,7 @@ impl TransportApiClient {
         params: serde_json::Value,
         timeout_ms: i64,
     ) -> TbResult<()> {
-        if !self.rate_limit_check(&device.tenant_id, 1) {
+        if !self.rate_limit_check(&device.tenant_id, 1).await {
             return Err(TbError::RateLimitExceeded(format!(
                 "tenant {} to-server RPC rate limit exceeded",
                 device.tenant_id
@@ -675,6 +717,10 @@ mod tests {
     use tb_common::KvValue;
 
     fn test_client(rate: u32) -> TransportApiClient {
+        test_client_with_shared(rate, None)
+    }
+
+    fn test_client_with_shared(rate: u32, shared: Option<SharedRateLimiter>) -> TransportApiClient {
         TransportApiClient {
             inner: Arc::new(Inner {
                 node_id: "test-node".into(),
@@ -685,6 +731,7 @@ mod tests {
                     .time_to_live(CACHE_TTL)
                     .build(),
                 rate_limiter: Mutex::new((rate > 0).then(|| RateLimiter::new(rate))),
+                shared_rate_limiter: shared,
                 router_task: tokio::spawn(async {}),
             }),
         }
@@ -738,12 +785,54 @@ mod tests {
     async fn to_server_rpc_is_rate_limited() {
         let client = test_client(1);
         let device = device();
-        assert!(client.rate_limit_check(&device.tenant_id, 1));
+        assert!(client.rate_limit_check(&device.tenant_id, 1).await);
 
         let result = client
             .publish_to_server_rpc(&device, "ping", serde_json::json!({}), 1_000)
             .await;
 
         assert!(matches!(result, Err(TbError::RateLimitExceeded(_))));
+    }
+
+    #[test]
+    fn production_defaults_apply_only_when_unset() {
+        assert_eq!(rate_limit_value(None, false), 0);
+        assert_eq!(
+            rate_limit_value(None, true),
+            PRODUCTION_RATE_LIMIT_PER_TENANT
+        );
+        assert_eq!(rate_limit_value(Some("0"), true), 0);
+        assert_eq!(rate_limit_value(Some(" 250 "), true), 250);
+        assert_eq!(rate_limit_value(Some("abc"), false), 0);
+    }
+
+    fn shared_limiter(url: &str, rate: u32) -> Option<SharedRateLimiter> {
+        Some(SharedRateLimiter::new(
+            redis::Client::open(url).unwrap(),
+            rate,
+        ))
+    }
+
+    #[tokio::test]
+    async fn shared_limit_spans_transport_instances() {
+        let url = std::env::var("TB_REDIS_URL").unwrap_or_else(|_| DEFAULT_REDIS_URL.into());
+        let node_a = test_client_with_shared(0, shared_limiter(&url, 2));
+        let node_b = test_client_with_shared(0, shared_limiter(&url, 2));
+        let tenant = Uuid::now_v7().to_string();
+
+        assert!(node_a.rate_limit_check(&tenant, 1).await);
+        assert!(node_b.rate_limit_check(&tenant, 1).await);
+        assert!(!node_a.rate_limit_check(&tenant, 1).await);
+        assert!(!node_b.rate_limit_check(&tenant, 1).await);
+    }
+
+    #[tokio::test]
+    async fn redis_outage_falls_back_to_instance_limit() {
+        let shared = shared_limiter("redis://127.0.0.1:1", 1).unwrap();
+        assert_eq!(shared.check_n("tenant-1", 1).await, None);
+        let client = test_client_with_shared(2, Some(shared));
+        assert!(client.rate_limit_check("tenant-1", 1).await);
+        assert!(client.rate_limit_check("tenant-1", 1).await);
+        assert!(!client.rate_limit_check("tenant-1", 1).await);
     }
 }

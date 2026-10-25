@@ -56,12 +56,12 @@ ThingsBoard IoT 平台的 Rust 重写版（微服务架构，非兼容重设计�
 | 变量 | 服务 | 默认 | 说明 |
 |---|---|---|---|
 | `TB_HTTP_PORT` | tb-core / tb-auth | 8080 / 8081 | HTTP 监听端口 |
-| `TB_ENV` | tb-core / tb-auth | development | `production` 时强制安全启动配置 |
+| `TB_ENV` | tb-core / tb-auth / transport | development | `production` 时强制安全启动配置，并启用传输限流生产默认值 |
 | `TB_JWT_SECRET` | tb-core / tb-auth | 内置开发值 | JWT 签名密钥；生产必填、至少 32 字节且两服务一致 |
 | `TB_SYSADMIN_PASSWORD` | tb-core | `sysadmin`（仅开发） | 首次 seed 的管理员密码；生产必填、至少 12 字节 |
 | `TB_JWT_ACCESS_EXPIRATION_SEC` / `TB_JWT_REFRESH_EXPIRATION_SEC` | tb-auth | 900 / 604800 | token 有效期 |
 | `TB_OAUTH2_ALLOW_INSECURE_HTTP` | tb-core / tb-auth | false | 仅本地开发：允许 OAuth2 HTTP/内网端点；生产保持 false |
-| `TB_REDIS_URL` | tb-core / tb-rule-engine | `redis://localhost:16379` | latest 遥测缓存 |
+| `TB_REDIS_URL` | tb-core / tb-rule-engine / transport | `redis://localhost:16379` | latest 遥测缓存；transport 用于共享租户限流 |
 | `TB_EDQS_URL` | tb-core | `http://localhost:8090` | EDQS 代理目标 |
 | `TB_EDQS_API_KEY` | tb-core / tb-edqs | 空 | 内部 API 密钥，生产必须配置且两服务一致 |
 | `TB_INGEST_ENABLED` | tb-core | false | 开启旧直通遥测落库（Phase 4 起由 rule-engine 接管，默认关） |
@@ -76,6 +76,9 @@ ThingsBoard IoT 平台的 Rust 重写版（微服务架构，非兼容重设计�
 | `TB_CLAIM_DURATION_MS` / `TB_CLAIM_MAX_DURATION_MS` | tb-core | 86400000 / 86400000 | 默认登记时长及设备可申请的最大时长 |
 | `TB_TRANSPORT_HTTP_PORT` | tb-transport-http | 8088 | HTTP transport 端口 |
 | `TB_COAP_BIND` | tb-transport-coap | `0.0.0.0:5683` | CoAP 监听地址 |
+| `TB_TRANSPORT_SHARED_RATE_LIMIT_PER_TENANT` | transport | 生产 1000，否则 0 | 每租户上行 msg/s，经 Redis 在全部传输实例间合计（0=不限）；Redis 不可用时退回每实例限流 |
+| `TB_TRANSPORT_RATE_LIMIT_PER_TENANT` | transport | 生产 1000，否则 0 | 每租户上行 msg/s 的每实例上限（0=不限） |
+| `TB_COAP_MAX_REQUESTS_PER_SEC` | tb-transport-coap | 生产 10000，否则 0 | 本实例全部源地址合计的 CoAP 请求上限（0=不限），另有每源地址 100 req/s |
 | `TB_LWM2M_BIND` | tb-transport-lwm2m | `0.0.0.0:5685` | LwM2M UDP 监听地址 |
 | `TB_NODE_ID` | transport | 自动生成 | 节点 ID（Kafka 下行 topic 路由键） |
 | `TB_SNMP_DISCOVERY_INTERVAL_SEC` | tb-transport-snmp | 60 | SNMP 设备发现刷新周期（最小 1）：分页拉取全部 SNMP 设备，启动新增、重启配置变化、停止已删除设备 |

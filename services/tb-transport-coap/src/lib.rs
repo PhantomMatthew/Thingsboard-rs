@@ -41,17 +41,20 @@ const OBSERVE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const HANDLER_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_CONCURRENT_HANDLERS: usize = 1024;
 const ADDRESS_RATE_PER_SECOND: f64 = 100.0;
+const PRODUCTION_INSTANCE_RATE_PER_SECOND: u32 = 10_000;
 const CON_DEDUP_TTL: Duration = Duration::from_secs(60);
 
-struct AddressRateLimiter {
+struct RequestBucket {
     tokens: f64,
+    rate: f64,
     last_refill: Instant,
 }
 
-impl AddressRateLimiter {
-    fn new(now: Instant) -> Self {
+impl RequestBucket {
+    fn new(rate: f64, now: Instant) -> Self {
         Self {
-            tokens: ADDRESS_RATE_PER_SECOND,
+            tokens: rate,
+            rate,
             last_refill: now,
         }
     }
@@ -61,8 +64,7 @@ impl AddressRateLimiter {
             .checked_duration_since(self.last_refill)
             .unwrap_or_default()
             .as_secs_f64();
-        self.tokens =
-            (self.tokens + elapsed * ADDRESS_RATE_PER_SECOND).min(ADDRESS_RATE_PER_SECOND);
+        self.tokens = (self.tokens + elapsed * self.rate).min(self.rate);
         self.last_refill = now;
         if self.tokens < 1.0 {
             return false;
@@ -70,6 +72,34 @@ impl AddressRateLimiter {
         self.tokens -= 1.0;
         true
     }
+}
+
+/// `TB_COAP_MAX_REQUESTS_PER_SEC`：本实例全部源地址合计的请求上限（显式 0=不限；
+/// 未设置时 `TB_ENV=production` 默认 10000，否则不限）。
+fn instance_rate_from_env() -> u32 {
+    std::env::var("TB_COAP_MAX_REQUESTS_PER_SEC")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(if tb_transport_api::is_production_env() {
+            PRODUCTION_INSTANCE_RATE_PER_SECOND
+        } else {
+            0
+        })
+}
+
+/// 先按源地址（每地址 100 req/s）再按实例总量放行，换源地址无法绕过实例上限。
+fn admit_request(
+    per_address: &DashMap<SocketAddr, RequestBucket>,
+    instance: Option<&std::sync::Mutex<RequestBucket>>,
+    peer: SocketAddr,
+    now: Instant,
+) -> bool {
+    let address_ok = per_address
+        .entry(peer)
+        .or_insert_with(|| RequestBucket::new(ADDRESS_RATE_PER_SECOND, now))
+        .allow(now);
+    address_ok
+        && instance.is_none_or(|bucket| bucket.lock().unwrap_or_else(|e| e.into_inner()).allow(now))
 }
 
 struct CachedConResponse {
@@ -158,12 +188,14 @@ pub struct TransportState {
     pub observers: Arc<DashMap<String, Arc<Observer>>>,
     pub next_mid: Arc<AtomicU16>,
     handler_permits: Arc<Semaphore>,
-    rate_limiters: Arc<DashMap<SocketAddr, AddressRateLimiter>>,
+    rate_limiters: Arc<DashMap<SocketAddr, RequestBucket>>,
+    instance_limiter: Option<Arc<std::sync::Mutex<RequestBucket>>>,
     con_responses: Arc<ConResponseCache>,
 }
 
 impl TransportState {
     pub fn new(brokers: &str, node_id: &str) -> Result<Self, QueueError> {
+        let instance_rate = instance_rate_from_env();
         Ok(Self {
             transport_api: TransportApiClient::new(brokers, node_id)?,
             producer: KafkaQueueProducer::new(brokers, &format!("tb-transport-coap-{node_id}"))?,
@@ -173,6 +205,12 @@ impl TransportState {
             next_mid: Arc::new(AtomicU16::new(1)),
             handler_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_HANDLERS)),
             rate_limiters: Arc::new(DashMap::new()),
+            instance_limiter: (instance_rate > 0).then(|| {
+                Arc::new(std::sync::Mutex::new(RequestBucket::new(
+                    f64::from(instance_rate),
+                    Instant::now(),
+                )))
+            }),
             con_responses: Arc::new(ConResponseCache::default()),
         })
     }
@@ -237,14 +275,12 @@ async fn handle_packet(
 
     let request = CoapRequest::from_packet(packet, peer);
     touch_observers(&state, peer);
-    let now = Instant::now();
-    let allowed = {
-        let mut limiter = state
-            .rate_limiters
-            .entry(peer)
-            .or_insert_with(|| AddressRateLimiter::new(now));
-        limiter.allow(now)
-    };
+    let allowed = admit_request(
+        &state.rate_limiters,
+        state.instance_limiter.as_deref(),
+        peer,
+        Instant::now(),
+    );
     let result = if allowed {
         tokio::time::timeout(HANDLER_TIMEOUT, dispatch(&state, &request))
             .await
@@ -956,12 +992,34 @@ mod tests {
     #[test]
     fn address_token_bucket_limits_and_refills() {
         let now = Instant::now();
-        let mut limiter = AddressRateLimiter::new(now);
+        let mut limiter = RequestBucket::new(ADDRESS_RATE_PER_SECOND, now);
         for _ in 0..ADDRESS_RATE_PER_SECOND as usize {
             assert!(limiter.allow(now));
         }
         assert!(!limiter.allow(now));
         assert!(limiter.allow(now + Duration::from_millis(20)));
+    }
+
+    #[test]
+    fn rotating_source_addresses_hit_instance_limit() {
+        let now = Instant::now();
+        let per_address = DashMap::new();
+        let instance = std::sync::Mutex::new(RequestBucket::new(5.0, now));
+        let admitted = (0..50u16)
+            .filter(|port| {
+                let peer = SocketAddr::from(([10, 0, 0, 1], 10_000 + port));
+                admit_request(&per_address, Some(&instance), peer, now)
+            })
+            .count();
+        assert_eq!(admitted, 5);
+
+        let unlimited = (0..50u16)
+            .filter(|port| {
+                let peer = SocketAddr::from(([10, 0, 0, 2], 10_000 + port));
+                admit_request(&per_address, None, peer, now)
+            })
+            .count();
+        assert_eq!(unlimited, 50);
     }
 
     #[test]

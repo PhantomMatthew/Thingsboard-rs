@@ -3366,6 +3366,7 @@ dependencies = [
  "dashmap",
  "moka",
  "prost",
+ "redis",
  "serde_json",
  "tb-common",
  "tb-proto",

@@ -5,6 +5,14 @@
 
 name: thingsboard-rs-prod
 
+# 传输层租户限流（msg/s，0=不限）：共享桶经 Redis 跨全部传输实例合计，
+# 每实例桶为补充上限（Redis 不可用时仍生效）。
+x-transport-rate-limit: &transport-rate-limit
+  TB_ENV: production
+  TB_REDIS_URL: redis://redis:6379
+  TB_TRANSPORT_SHARED_RATE_LIMIT_PER_TENANT: ${TB_TRANSPORT_SHARED_RATE_LIMIT_PER_TENANT:-1000}
+  TB_TRANSPORT_RATE_LIMIT_PER_TENANT: ${TB_TRANSPORT_RATE_LIMIT_PER_TENANT:-1000}
+
 services:
   # ---------- 基础设施 ----------
   postgres:
@@ -117,6 +125,7 @@ services:
     image: ${APP_IMAGE:-thingsboard-rs:latest}
     entrypoint: ["tb-transport-mqtt"]
     environment:
+      <<: *transport-rate-limit
       TB_KAFKA_BROKERS: kafka:9092
       TB_MQTT_BIND: 0.0.0.0:1883
       TB_NODE_ID: mqtt-1
@@ -125,6 +134,7 @@ services:
       - "1883:1883"
     depends_on:
       kafka: { condition: service_healthy }
+      redis: { condition: service_healthy }
       tb-core: { condition: service_started }
     restart: unless-stopped
 
@@ -132,6 +142,7 @@ services:
     image: ${APP_IMAGE:-thingsboard-rs:latest}
     entrypoint: ["tb-transport-http"]
     environment:
+      <<: *transport-rate-limit
       TB_KAFKA_BROKERS: kafka:9092
       TB_TRANSPORT_HTTP_PORT: 8088
       TB_NODE_ID: http-1
@@ -140,6 +151,7 @@ services:
       - "8088:8088"
     depends_on:
       kafka: { condition: service_healthy }
+      redis: { condition: service_healthy }
       tb-core: { condition: service_started }
     restart: unless-stopped
 
@@ -147,14 +159,17 @@ services:
     image: ${APP_IMAGE:-thingsboard-rs:latest}
     entrypoint: ["tb-transport-coap"]
     environment:
+      <<: *transport-rate-limit
       TB_KAFKA_BROKERS: kafka:9092
       TB_COAP_BIND: 0.0.0.0:5683
+      TB_COAP_MAX_REQUESTS_PER_SEC: ${TB_COAP_MAX_REQUESTS_PER_SEC:-10000}
       TB_NODE_ID: coap-1
       RUST_LOG: ${RUST_LOG:-info}
     ports:
       - "5683:5683/udp"
     depends_on:
       kafka: { condition: service_healthy }
+      redis: { condition: service_healthy }
       tb-core: { condition: service_started }
     restart: unless-stopped
 
@@ -162,11 +177,13 @@ services:
     image: ${APP_IMAGE:-thingsboard-rs:latest}
     entrypoint: ["tb-transport-snmp"]
     environment:
+      <<: *transport-rate-limit
       TB_KAFKA_BROKERS: kafka:9092
       TB_NODE_ID: snmp-1
       RUST_LOG: ${RUST_LOG:-info}
     depends_on:
       kafka: { condition: service_healthy }
+      redis: { condition: service_healthy }
       tb-core: { condition: service_started }
     restart: unless-stopped
 
@@ -174,6 +191,7 @@ services:
     image: ${APP_IMAGE:-thingsboard-rs:latest}
     entrypoint: ["tb-transport-lwm2m"]
     environment:
+      <<: *transport-rate-limit
       TB_KAFKA_BROKERS: kafka:9092
       TB_LWM2M_BIND: 0.0.0.0:5685
       TB_NODE_ID: lwm2m-1
@@ -182,6 +200,7 @@ services:
       - "5685:5685/udp"
     depends_on:
       kafka: { condition: service_healthy }
+      redis: { condition: service_healthy }
       tb-core: { condition: service_started }
     restart: unless-stopped
 

@@ -15,6 +15,7 @@ prost.workspace = true
 bytes.workspace = true
 moka.workspace = true
 dashmap.workspace = true
+redis.workspace = true
 tb-common = { path = "../tb-common" }
 tb-proto = { path = "../tb-proto" }
 tb-queue = { path = "../tb-queue" }
