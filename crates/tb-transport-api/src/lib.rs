@@ -529,23 +529,19 @@ impl TransportApiClient {
         }
     }
 
-    /// 查该档案下可更新的 OTA 包元数据；404 → Ok(None)。
+    /// 查设备当前绑定（设备级优先于档案级）的 OTA 包元数据；无绑定 → Ok(None)。
     pub async fn get_ota_package(
         &self,
         tenant_id: &str,
-        device_profile_id: &str,
+        device_id: &str,
         ota_type: tb_proto::common::OtaPackageType,
-        current_title: &str,
-        current_version: &str,
     ) -> TbResult<Option<pb::OtaPackageProto>> {
         let resp = self
             .request(pb::transport_api_request_msg::Request::GetOtaPackage(
                 pb::GetOtaPackageRequest {
                     tenant_id: tenant_id.to_string(),
-                    device_profile_id: device_profile_id.to_string(),
                     r#type: ota_type as i32,
-                    current_title: current_title.to_string(),
-                    current_version: current_version.to_string(),
+                    device_id: device_id.to_string(),
                 },
             ))
             .await?;

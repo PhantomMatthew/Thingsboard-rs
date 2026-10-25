@@ -97,12 +97,12 @@ message GetOrCreateGatewayDeviceRequest {
   string device_type = 4;     // 可选，默认 "default"
 }
 
+// 设备当前生效的显式绑定（设备级优先于档案级）；无绑定返回 404。
 message GetOtaPackageRequest {
+  reserved 2, 4, 5;
   string tenant_id = 1;
-  string device_profile_id = 2;
   tb.common.OtaPackageType type = 3;
-  string current_title = 4;
-  string current_version = 5;
+  string device_id = 6;
 }
 
 message GetOtaChunkRequest {

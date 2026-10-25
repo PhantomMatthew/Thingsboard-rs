@@ -99,11 +99,13 @@
 | 方法 | 路径 | 权限 | 说明 |
 |---|---|---|---|
 | POST | /api/otaPackage | TA | 创建 OTA 包（multipart 上传） |
-| GET/DELETE | /api/otaPackage/{id} | TA | 查/删 |
+| GET/DELETE | /api/otaPackage/{id} | TA | 查/删（仍被设备或档案绑定时删除返回 409） |
 | GET | /api/otaPackage/{id}/download | TA | 下载固件 |
 | GET | /api/otaPackages | TA | 分页（?type=FIRMWARE\|SOFTWARE） |
-| POST | /api/device/{deviceId}/firmware/{otaId} / software/{otaId} | TA | 给设备指派固件/软件 |
+| POST | /api/device/{deviceId}/firmware/{otaId} / software/{otaId} | TA | 给设备指派固件/软件（设备级优先于档案级） |
+| DELETE | /api/device/{deviceId}/firmware / software | TA | 解除设备级绑定，回落到档案绑定 |
 | POST | /api/deviceProfile/{profileId}/firmware/{otaId} / software/{otaId} | TA | 给配置指派固件/软件 |
+| DELETE | /api/deviceProfile/{profileId}/firmware / software | TA | 解除档案级绑定 |
 | GET | /api/oauth2/clients | SA/TA | 客户端分页 |
 | POST | /api/oauth2/client | SA | 创建/更新客户端 |
 | GET | /api/oauth2/client/{id} | SA/TA | 查客户端（TA 限本租户） |
@@ -129,13 +131,20 @@
 | POST | /api/v1/{token}/claim | 设备认领 |
 | POST/GET | /api/v1/{token}/rpc | 上行 RPC / 长轮询下行 RPC |
 | POST | /api/v1/{token}/rpc/{requestId} | RPC 响应 |
-| GET | /api/v1/{token}/firmware | OTA 分块下载（?title=&version=&chunk=） |
+| GET | /api/v1/{token}/firmware、/software | OTA 分块下载（?title=&version=&chunk=&size=；title/version 为 fw_*/sw_* 属性给出的目标包，未绑定 404，不一致 400） |
 | POST | /api/v1/provision | 设备自注册 |
 
 设备侧 MQTT（:1883）topic：`v1/devices/me/telemetry`、`v1/devices/me/attributes`、
 `v1/devices/me/rpc/request/+` / `response/+`、`v1/devices/me/attributes/response/+`、
-`v1/gateway/*`、`v1/devices/me/firmware/*`、`/provision`，用户名 = accessToken。
-设备侧 CoAP（:5683/udp）语义同 HTTP。
+`v1/gateway/*`、`v2/{fw,sw}/response/+`（订阅时推目标包元信息）、
+`v2/{fw,sw}/request/{requestId}/chunk/{n}`（回 `v2/{fw,sw}/response/{requestId}/chunk/{n}`，
+未绑定回 `v2/{fw,sw}/error`）、`/provision`，用户名 = accessToken。
+设备侧 CoAP（:5683/udp）语义同 HTTP（OTA 下载除外）。
+
+OTA 状态回写：生效包（设备级绑定优先，其次档案级，无绑定即无包）变化时，core 写入遥测
+`target_{fw,sw}_title/version/tag/ts` 与 `{fw,sw}_state`（QUEUED → INITIATED），并保存、推送
+shared 属性 `{fw,sw}_title/version/tag/size/checksum_algorithm/checksum`；解绑时删除这些属性。
+设备随后自行上报 `current_{fw,sw}_*`、`{fw,sw}_state`、`{fw,sw}_error` 遥测。
 
 ## MQTTS X509 证书链 provisioning
 

@@ -105,26 +105,14 @@ impl OtaPackageDao {
         Ok(res.rows_affected() > 0)
     }
 
-    /// 该档案下指定类型的最新 OTA 包：同 title（非空时）且版本与当前不同。
-    pub async fn find_latest(
-        &self,
-        tenant_id: Uuid,
-        device_profile_id: Uuid,
-        r#type: &str,
-        current_title: &str,
-        current_version: &str,
-    ) -> TbResult<Option<OtaPackage>> {
-        sqlx::query_as::<_, OtaPackage>(&format!(
-            "SELECT {META_COLUMNS} FROM ota_package WHERE tenant_id = $1 \
-             AND device_profile_id = $2 AND type = $3 AND ($4 = '' OR title = $4) \
-             AND version != $5 ORDER BY created_time DESC LIMIT 1"
-        ))
-        .bind(tenant_id)
-        .bind(device_profile_id)
-        .bind(r#type)
-        .bind(current_title)
-        .bind(current_version)
-        .fetch_optional(&self.pool)
+    /// 是否仍被设备或设备档案绑定（被绑定的包不可删除）。
+    pub async fn is_referenced(&self, id: Uuid) -> TbResult<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM device WHERE firmware_id = $1 OR software_id = $1) \
+             OR EXISTS (SELECT 1 FROM device_profile WHERE firmware_id = $1 OR software_id = $1)",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
         .await
         .map_err(TbError::db)
     }

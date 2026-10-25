@@ -104,6 +104,7 @@ pub fn build_router(state: TransportState) -> Router {
         .route("/api/v1/{token}/rpc", post(post_rpc).get(get_rpc))
         .route("/api/v1/{token}/rpc/{requestId}", post(post_rpc_response))
         .route("/api/v1/{token}/firmware", get(get_firmware))
+        .route("/api/v1/{token}/software", get(get_software))
         .route("/api/v1/provision", post(provision))
         .with_state(state)
 }
@@ -596,24 +597,54 @@ struct FirmwareQuery {
     size: Option<i32>,
 }
 
-/// GET firmware：按设备当前 title/version 查可更新包，返回指定分块二进制。
 async fn get_firmware(
     State(state): State<TransportState>,
     Path(token): Path<String>,
     Query(query): Query<FirmwareQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let device = validate(&state, &token).await?;
+    ota_chunk(
+        &state,
+        &token,
+        &query,
+        tb_proto::common::OtaPackageType::Firmware,
+    )
+    .await
+}
+
+async fn get_software(
+    State(state): State<TransportState>,
+    Path(token): Path<String>,
+    Query(query): Query<FirmwareQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    ota_chunk(
+        &state,
+        &token,
+        &query,
+        tb_proto::common::OtaPackageType::Software,
+    )
+    .await
+}
+
+/// Java 语义：title/version 为设备从 fw_*/sw_* 属性拿到的目标包；未绑定 404，
+/// 与当前绑定包不一致 400，一致则返回指定分块二进制。
+async fn ota_chunk(
+    state: &TransportState,
+    token: &str,
+    query: &FirmwareQuery,
+    ota_type: tb_proto::common::OtaPackageType,
+) -> Result<axum::response::Response, ApiError> {
+    let device = validate(state, token).await?;
     let package = state
         .transport_api
-        .get_ota_package(
-            &device.tenant_id,
-            &device.device_profile_id,
-            tb_proto::common::OtaPackageType::Firmware,
-            &query.title,
-            &query.version,
-        )
+        .get_ota_package(&device.tenant_id, &device.device_id, ota_type)
         .await?
-        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no firmware update".into()))?;
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no ota package assigned".into()))?;
+    if package.title != query.title || package.version != query.version {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "requested title/version does not match the assigned package".into(),
+        ));
+    }
     let chunk = state
         .transport_api
         .get_ota_chunk(
@@ -625,7 +656,8 @@ async fn get_firmware(
     Ok((
         [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
         chunk,
-    ))
+    )
+        .into_response())
 }
 
 #[derive(Debug, Deserialize)]

@@ -618,7 +618,10 @@ pub async fn validate_or_create_x509(
             .save_device_with_credentials(&device, &credentials)
             .await
         {
-            Ok((_, credentials)) => return build_valid_response(state, &credentials).await,
+            Ok((saved, credentials)) => {
+                crate::ota::spawn_new_device_sync(state, &saved, profile);
+                return build_valid_response(state, &credentials).await;
+            }
             Err(e) => {
                 tracing::debug!("X509 provision create conflict or failure, rereading: {e}");
             }
@@ -782,6 +785,7 @@ async fn get_or_create_gateway_device(
         state.device_dao.delete_by_id(saved.id).await?;
         return Err(e);
     }
+    crate::ota::spawn_new_device_sync(state, &saved, &profile);
     Ok(device_proto(&saved))
 }
 
@@ -798,32 +802,26 @@ pub(crate) fn ota_proto(p: &OtaPackage) -> pb::OtaPackageProto {
     }
 }
 
-/// 该档案下指定类型、与设备当前版本不同的最新 OTA 包（不含 data）。
+/// 设备当前生效的显式绑定包（不含 data）；设备不存在或不属于该租户视为无包。
 async fn get_ota_package(
     state: &AppState,
     r: &pb::GetOtaPackageRequest,
 ) -> TbResult<Option<pb::OtaPackageProto>> {
-    use tb_proto::common::OtaPackageType;
     let tenant_id =
         Uuid::parse_str(&r.tenant_id).map_err(|_| TbError::InvalidInput("bad tenant_id".into()))?;
-    let profile_id = Uuid::parse_str(&r.device_profile_id)
-        .map_err(|_| TbError::InvalidInput("bad device_profile_id".into()))?;
-    let ota_type = match OtaPackageType::try_from(r.r#type) {
-        Ok(OtaPackageType::Firmware) => "FIRMWARE",
-        Ok(OtaPackageType::Software) => "SOFTWARE",
-        _ => return Ok(None),
+    let device_id =
+        Uuid::parse_str(&r.device_id).map_err(|_| TbError::InvalidInput("bad device_id".into()))?;
+    let Some(kind) = crate::ota::OtaKind::from_proto(r.r#type) else {
+        return Ok(None);
     };
-    let pkg = state
-        .ota_package_dao
-        .find_latest(
-            tenant_id,
-            profile_id,
-            ota_type,
-            &r.current_title,
-            &r.current_version,
-        )
-        .await?;
-    Ok(pkg.as_ref().map(ota_proto))
+    let Some(device) = state.device_dao.find_by_id(device_id).await? else {
+        return Ok(None);
+    };
+    if device.tenant_id != tenant_id {
+        return Ok(None);
+    }
+    let package = crate::ota::assigned_package(state, &device, kind).await?;
+    Ok(package.as_ref().map(ota_proto))
 }
 
 const MAX_OTA_CHUNK_SIZE: i32 = 1024 * 1024;
@@ -1011,7 +1009,10 @@ async fn provision_device(
                 .save_device_with_credentials(&device, &credentials)
                 .await
             {
-                Ok((d, _)) => d,
+                Ok((d, _)) => {
+                    crate::ota::spawn_new_device_sync(state, &d, &profile);
+                    d
+                }
                 Err(e) => {
                     tracing::warn!("provision create device failed: {e}");
                     return failure("internal error");

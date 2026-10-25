@@ -129,7 +129,7 @@ fn now_ms() -> i64 {
 
 /// SHARED_SCOPE 变更下行：推给该设备所有订阅了属性更新的在线会话（按各自 node 发 Kafka）。
 /// value 为 None 表示删除通知。
-async fn notify_shared_attribute_update(
+pub(crate) async fn notify_shared_attribute_update(
     state: &AppState,
     entity_type: EntityType,
     entity_id: Uuid,

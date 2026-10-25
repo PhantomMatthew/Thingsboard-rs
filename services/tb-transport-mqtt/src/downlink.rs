@@ -147,34 +147,19 @@ async fn handle(state: &TransportState, payload: Bytes) -> Result<(), String> {
             };
             send(&target.tx, topic, body.to_string().into_bytes(), qos).await?;
         }
+        // 只刷新会话包缓存；{fw,sw}_* 属性由随后同分区的 shared 属性通知推给设备。
         core_pb::to_transport_msg::Msg::OtaUpdate(n) => {
-            let Some((target, qos)) = registry.get(&msg.session_id).map(|handle| {
-                (
-                    DownlinkTarget {
-                        tx: handle.tx.clone(),
-                        gateway_device: handle.gateway_device.clone(),
-                    },
-                    handle.attributes_qos.load(Ordering::Relaxed),
-                )
-            }) else {
+            let Some(kind) = crate::ota::OtaKind::from_proto(n.ota_type) else {
                 return Ok(());
             };
-            let Some(pkg) = n.ota_package else {
+            if !registry.contains_key(&msg.session_id) {
                 return Ok(());
-            };
-            state
-                .ota_packages
-                .insert(msg.session_id.clone(), pkg.clone())
-                .await;
-            let body = crate::ota::fw_attributes_body(&pkg);
-            let qos = if qos == UNSUBSCRIBED { 0 } else { qos };
-            send(
-                &target.tx,
-                session::TOPIC_ATTRIBUTES.to_string(),
-                body.to_string().into_bytes(),
-                qos,
-            )
-            .await?;
+            }
+            let key = (msg.session_id.clone(), kind);
+            match n.ota_package {
+                Some(pkg) => state.ota_packages.insert(key, pkg).await,
+                None => state.ota_packages.invalidate(&key).await,
+            }
         }
         core_pb::to_transport_msg::Msg::SessionCloseNotification(n) => {
             tracing::info!(

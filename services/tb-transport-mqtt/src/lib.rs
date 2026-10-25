@@ -63,8 +63,9 @@ pub struct TransportState {
     pub node_id: String,
     pub brokers: String,
     pub sessions: SessionRegistry,
-    /// session_id → 当前可更新的固件包元数据（OTA 分块请求用）。
-    pub ota_packages: moka::future::Cache<String, tb_proto::transport::OtaPackageProto>,
+    /// (session_id, 包类型) → 设备当前绑定的 OTA 包元数据（分块请求用；core 绑定变更时刷新）。
+    pub ota_packages:
+        moka::future::Cache<(String, crate::ota::OtaKind), tb_proto::transport::OtaPackageProto>,
     /// (session_id, request_id) → 发起 RPC 的 core 实例。
     pub rpc_reply_nodes: moka::future::Cache<(String, i32), String>,
 }

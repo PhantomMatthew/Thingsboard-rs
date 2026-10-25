@@ -66,7 +66,12 @@ pub async fn run_with_x509(
     // 网关断开：全部子设备逻辑会话一并关闭。
     crate::gateway::close_all_sub_devices(&state, &mut session, &reason).await;
     state.sessions.remove(&session_id);
-    state.ota_packages.invalidate(&session_id).await;
+    for kind in crate::ota::OtaKind::ALL {
+        state
+            .ota_packages
+            .invalidate(&(session_id.clone(), kind))
+            .await;
+    }
     send_core(
         &state,
         &session.device,
@@ -496,15 +501,16 @@ async fn handle(
                         }
                         crate::gateway::subscribe_rpc(state, session, granted_qos).await;
                     }
-                    crate::ota::TOPIC_FW_SUBSCRIBE => {
-                        // 订阅即视为 OTA 就绪：主动检查并推 fw_* 元信息。
-                        crate::ota::check_firmware(framed, state, session).await;
-                    }
-                    other => {
-                        tracing::debug!(topic = other, "rejected unknown subscribe");
-                        granted.push(0x80);
-                        continue;
-                    }
+                    other => match crate::ota::OtaKind::from_subscribe_filter(other) {
+                        Some(kind) => {
+                            crate::ota::check_package(framed, state, session, kind).await;
+                        }
+                        None => {
+                            tracing::debug!(topic = other, "rejected unknown subscribe");
+                            granted.push(0x80);
+                            continue;
+                        }
+                    },
                 }
                 granted.push(granted_qos);
             }
@@ -581,9 +587,9 @@ async fn handle_publish(
         }
         return Ok(());
     }
-    if let Some(rest) = topic.strip_prefix(crate::ota::TOPIC_FW_REQUEST_PREFIX) {
+    if let Some((kind, rest)) = crate::ota::OtaKind::from_request_topic(topic) {
         let packet_id = (p.qos == 1).then_some(p.packet_id).flatten();
-        crate::ota::handle_chunk_request(framed, state, session, rest, &p.payload).await;
+        crate::ota::handle_chunk_request(framed, state, session, kind, rest, &p.payload).await;
         if let Some(packet_id) = packet_id {
             send(framed, MqttPacket::PubAck(packet_id)).await;
         }

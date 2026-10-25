@@ -15,7 +15,7 @@
 - MQTT、HTTP、CoAP 接入，access token、MQTT basic、证书钉扎、租户私有 CA 证书链认证与设备自动注册。
 - LwM2M NoSec 注册、Read、TLV、SINGLE Observe；SNMP v2c UDP GET 周期采集。
 - 网关的 connect、disconnect、telemetry、attributes、attributes request、rpc。
-- MQTT/HTTP firmware OTA 分块、MQTT/HTTP provision、设备认领；software 和 CoAP OTA/provision 尚未覆盖。
+- MQTT/HTTP firmware/software OTA 分块（显式绑定选包与状态回写）、MQTT/HTTP provision、设备认领；CoAP OTA/provision 尚未覆盖。
 - 简化版 EDQS、简化版计算字段、审计日志、housekeeper 清理。
 
 默认根规则链只连接「消息类型开关 → 保存遥测 / 保存属性」，不处理连接、断开、RPC 和告警规则。
@@ -49,7 +49,7 @@ Java 社区版还有、这里未完整覆盖的接入：
 | LwM2M | 已有 UDP NoSec 注册、Read、TLV、SINGLE Observe；缺 DTLS、Bootstrap、Composite、Write/Execute/Discover/Create/Delete、下行 RPC、Queue Mode 和 OTA |
 | SNMP | 已有 v2c UDP GET 周期采集；缺 v1/v3、TCP、SET、Trap、RPC 和运行期设备刷新；启动发现仅取第一页最多 1000 台 |
 | CoAP | 缺 DTLS、provision 和 firmware/software OTA |
-| OTA | MQTT/HTTP 仅覆盖 firmware 主路径；缺 software 分发、CoAP 分发和完整状态回写，设备/Profile 显式绑定也未正确参与选包 |
+| OTA | MQTT/HTTP 已覆盖 firmware 与 software 分块分发；选包只看设备级、其次 Profile 级显式绑定（校验租户、类型、Profile 与数据），生效包变化时回写 `target_*`、`{fw,sw}_state`（QUEUED/INITIATED）和 `{fw,sw}_*` shared 属性，解绑删除；缺 CoAP/LwM2M 分发、按 Profile 批量限速推送和下载进度类服务端状态 |
 | MQTT/HTTP 兼容项 | 已实现路径保持 topic/path 兼容；缺 MQTT v2 短 topic、JSON/Protobuf、MQTT over WebSocket，HTTP attributes 长轮询未实现（Java 已弃用） |
 | 离线持久 RPC | RPC 要求设备在线且已订阅，超时即失败 |
 | Profile 不活动超时 | 消息活动会节流更新 `active`、`lastActivityTime`，连接/断开也会写活动属性；没有「超过 N 分钟无消息则离线」的 Profile 状态机 |
@@ -101,4 +101,4 @@ OAuth2 是简化的授权码换邮箱，没有 Java 的 mapper（按域名归入
 
 ## 差距摘要
 
-缺的主要是管理界面、实时订阅、完整 LwM2M/SNMP/OTA 协议面、Profile 告警、离线 RPC、通知和邮件，以及 Java 规则链和 REST 的直接兼容。设备上报、落库、REST 查询、在线 RPC、LwM2M/SNMP 有限采集、firmware OTA、MQTT/HTTP provision 和认领已经有主路径。
+缺的主要是管理界面、实时订阅、完整 LwM2M/SNMP/OTA 协议面、Profile 告警、离线 RPC、通知和邮件，以及 Java 规则链和 REST 的直接兼容。设备上报、落库、REST 查询、在线 RPC、LwM2M/SNMP 有限采集、MQTT/HTTP firmware/software OTA、MQTT/HTTP provision 和认领已经有主路径。

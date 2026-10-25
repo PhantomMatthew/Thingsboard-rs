@@ -116,7 +116,7 @@ message ToTransportMsg {
   }
 }
 
-// OTA 固件/软件绑定更新通知：transport 向设备推送 fw_* 元信息。
+// OTA 生效包变更通知：transport 刷新会话的包缓存（设备侧经 shared 属性通知获知 fw_*/sw_*）。
 message OtaUpdateNotification {
   tb.common.OtaPackageType ota_type = 1;
   tb.transport.OtaPackageProto ota_package = 2; // 空（缺省）表示解绑

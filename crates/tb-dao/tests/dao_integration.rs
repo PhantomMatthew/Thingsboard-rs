@@ -791,11 +791,6 @@ async fn ota_metadata_omits_data_and_chunks_read_only_requested_bytes() -> TbRes
         )
         .await?;
     assert!(page.data.iter().all(|p| p.data.is_none()));
-    let latest = ota_dao
-        .find_latest(tenant.id, profile.id, "FIRMWARE", "fw", "0")
-        .await?
-        .unwrap();
-    assert!(latest.data.is_none());
     let chunk = ota_dao
         .find_data_chunk(package.id, 16385, 16384)
         .await?
@@ -807,6 +802,72 @@ async fn ota_metadata_omits_data_and_chunks_read_only_requested_bytes() -> TbRes
         .unwrap();
     assert!(beyond.is_empty());
 
+    ota_dao.delete_by_id(package.id).await?;
+    tenant_dao.delete_by_id(tenant.id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn ota_bindings_track_references_and_inheriting_devices() -> TbResult<()> {
+    let pool = setup().await;
+    let tenant_dao = TenantDao::new(pool.clone());
+    let profile_dao = DeviceProfileDao::new(pool.clone());
+    let device_dao = DeviceDao::new(pool.clone());
+    let ota_dao = tb_dao::OtaPackageDao::new(pool);
+    let tenant = tenant_dao.save(&new_tenant(&uniq("tenant"))).await?;
+    let mut profile = profile_dao
+        .save(&new_device_profile(tenant.id, &uniq("profile"), false))
+        .await?;
+    let package = ota_dao
+        .save(&OtaPackage {
+            id: Uuid::now_v7(),
+            created_time: 0,
+            tenant_id: tenant.id,
+            device_profile_id: profile.id,
+            r#type: "SOFTWARE".into(),
+            title: "sw".into(),
+            version: "1".into(),
+            tag: None,
+            file_name: None,
+            content_type: None,
+            checksum_algorithm: None,
+            checksum: None,
+            size: Some(1),
+            data: Some(vec![1]),
+            additional_info: None,
+        })
+        .await?;
+    assert!(!ota_dao.is_referenced(package.id).await?);
+
+    let inheriting = device_dao
+        .save(&new_device(tenant.id, profile.id, &uniq("inherits")))
+        .await?;
+    let mut bound = new_device(tenant.id, profile.id, &uniq("bound"));
+    bound.software_id = Some(package.id);
+    let bound = device_dao.save(&bound).await?;
+    assert!(ota_dao.is_referenced(package.id).await?);
+    assert_eq!(
+        device_dao.find_ids_inheriting_ota(profile.id, true).await?,
+        vec![inheriting.id]
+    );
+    let mut firmware_inheriting = device_dao
+        .find_ids_inheriting_ota(profile.id, false)
+        .await?;
+    firmware_inheriting.sort();
+    let mut all = vec![inheriting.id, bound.id];
+    all.sort();
+    assert_eq!(firmware_inheriting, all);
+
+    device_dao.delete_by_id(bound.id).await?;
+    assert!(!ota_dao.is_referenced(package.id).await?);
+    profile.software_id = Some(package.id);
+    profile = profile_dao.save(&profile).await?;
+    assert!(ota_dao.is_referenced(package.id).await?);
+    profile.software_id = None;
+    profile_dao.save(&profile).await?;
+    assert!(!ota_dao.is_referenced(package.id).await?);
+
+    device_dao.delete_by_id(inheriting.id).await?;
     ota_dao.delete_by_id(package.id).await?;
     tenant_dao.delete_by_id(tenant.id).await?;
     Ok(())

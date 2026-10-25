@@ -20,6 +20,7 @@ use uuid::Uuid;
 use crate::AppState;
 use crate::audit::audit;
 use crate::auth_middleware::{check_tenant_scope, require_authority};
+use crate::ota::OtaKind;
 use crate::routes::PageQuery;
 use crate::routes::customer::load_customer;
 
@@ -192,6 +193,29 @@ async fn save_device(
         check_tenant_scope(&user, customer.tenant_id)?;
     }
 
+    // 换档案：设备级 OTA 绑定须兼容新档案；记下换档前的生效包供之后回写比较。
+    let mut ota_before = None;
+    if let Some(existing) = existing
+        .as_ref()
+        .filter(|device| device.device_profile_id != profile_id)
+    {
+        let moved = Device {
+            device_profile_id: profile_id,
+            ..existing.clone()
+        };
+        crate::ota::validate_device_bindings(&state, &moved).await?;
+        let old_profile = state
+            .device_profile_dao
+            .find_by_id(existing.device_profile_id)
+            .await?;
+        ota_before = Some(OtaKind::ALL.map(|kind| {
+            (
+                kind,
+                crate::ota::effective_binding(kind, existing, old_profile.as_ref()),
+            )
+        }));
+    }
+
     let mut device = existing.unwrap_or(Device {
         id: Uuid::now_v7(),
         created_time: 0,
@@ -264,6 +288,14 @@ async fn save_device(
         saved.label.as_deref(),
         saved.created_time,
     );
+    if is_new {
+        crate::ota::spawn_new_device_sync(&state, &saved, &profile);
+    }
+    for (kind, before) in ota_before.into_iter().flatten() {
+        if let Err(e) = crate::ota::sync_device(&state, &saved, kind, before).await {
+            tracing::warn!(device_id = %saved.id, "ota state sync after profile change failed: {e}");
+        }
+    }
     if !is_new && rotate_credentials {
         close_device_sessions(&state, &saved, "device credentials updated").await?;
     }

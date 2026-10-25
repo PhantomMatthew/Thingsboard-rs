@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::AppState;
 use crate::audit::audit;
 use crate::auth_middleware::{check_tenant_scope, require_authority};
+use crate::ota::OtaKind;
 use crate::routes::PageQuery;
 
 pub fn router() -> Router<AppState> {
@@ -50,21 +51,28 @@ async fn save_profile(
 ) -> Result<Json<DeviceProfile>, ApiError> {
     require_authority(&user, &[Authority::TenantAdmin])?;
     let is_new = req.id.is_none();
-    let (id, created_time) = match req.id {
+    let (id, created_time, previous) = match req.id {
         Some(id) => {
             let existing = load_profile(&state, id).await?;
             check_tenant_scope(&user, existing.tenant_id)?;
-            (id, existing.created_time)
+            (id, existing.created_time, Some(existing))
         }
-        None => (Uuid::now_v7(), 0),
+        None => (Uuid::now_v7(), 0, None),
     };
-    for ota_id in [req.firmware_id, req.software_id].into_iter().flatten() {
+    for (kind, ota_id) in [
+        (OtaKind::Firmware, req.firmware_id),
+        (OtaKind::Software, req.software_id),
+    ] {
+        let Some(ota_id) = ota_id else {
+            continue;
+        };
         let package = state
             .ota_package_dao
             .find_meta_by_id(ota_id)
             .await?
             .ok_or_else(|| TbError::NotFound(format!("ota package {ota_id}")))?;
         check_tenant_scope(&user, package.tenant_id)?;
+        crate::ota::validate_binding(&package, kind, user.0.tenant_id, id)?;
     }
     let mut profile_data = req.profile_data.unwrap_or_else(|| json!({}));
     if let Some(certificate) = req.certificate {
@@ -111,6 +119,14 @@ async fn save_profile(
         }
     }
     let saved = state.device_profile_dao.save(&profile).await?;
+    if let Some(previous) = &previous {
+        for kind in OtaKind::ALL {
+            let before = kind.profile_binding(previous);
+            if before != kind.profile_binding(&saved) {
+                crate::ota::spawn_profile_sync(&state, saved.id, kind, before);
+            }
+        }
+    }
     audit(
         &state,
         &user,

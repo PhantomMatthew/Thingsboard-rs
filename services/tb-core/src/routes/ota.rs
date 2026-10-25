@@ -1,27 +1,23 @@
-//! /api/otaPackage(s)：OTA 包管理（multipart 上传/下载/分页）与设备、档案级绑定。
-//! 绑定后设备在线时经 tb_transport.notifications.<node_id> 推 ota_update。
+//! /api/otaPackage(s)：OTA 包管理（multipart 上传/下载/分页）与设备、档案级绑定/解绑。
+//! 绑定校验与状态回写见 crate::ota；被绑定的包不可删除。
 
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use bytes::Bytes;
-use prost::Message as _;
 use serde::Deserialize;
 use sha2::Digest as _;
 use tb_auth::{ApiError, AuthUser};
 use tb_common::{EntityType, TbError, TbResult};
 use tb_dao::models::{Authority, OtaPackage};
 use tb_dao::{PageData, PageLink};
-use tb_proto::common::OtaPackageType;
-use tb_proto::core as core_pb;
-use tb_queue::{QueueProducer as _, TbTopic};
 use uuid::Uuid;
 
 use crate::AppState;
 use crate::audit::audit;
 use crate::auth_middleware::{check_tenant_scope, require_authority};
+use crate::ota::OtaKind;
 
 pub(crate) const MAX_OTA_PACKAGE_SIZE: usize = 256 * 1024 * 1024;
 
@@ -55,12 +51,28 @@ pub fn router() -> Router<AppState> {
             post(assign_device_software),
         )
         .route(
+            "/api/device/{deviceId}/firmware",
+            delete(unassign_device_firmware),
+        )
+        .route(
+            "/api/device/{deviceId}/software",
+            delete(unassign_device_software),
+        )
+        .route(
             "/api/deviceProfile/{profileId}/firmware/{otaId}",
             post(assign_profile_firmware),
         )
         .route(
             "/api/deviceProfile/{profileId}/software/{otaId}",
             post(assign_profile_software),
+        )
+        .route(
+            "/api/deviceProfile/{profileId}/firmware",
+            delete(unassign_profile_firmware),
+        )
+        .route(
+            "/api/deviceProfile/{profileId}/software",
+            delete(unassign_profile_software),
         )
 }
 
@@ -187,6 +199,12 @@ async fn delete_ota_package(
     require_authority(&user, &[Authority::TenantAdmin])?;
     let package = load_ota(&state, id).await?;
     check_tenant_scope(&user, package.tenant_id)?;
+    if state.ota_package_dao.is_referenced(id).await? {
+        return Err(TbError::Conflict(
+            "ota package is assigned to a device or device profile".into(),
+        )
+        .into());
+    }
     state.ota_package_dao.delete_by_id(id).await?;
     audit(
         &state,
@@ -251,60 +269,41 @@ async fn list_ota_packages(
     ))
 }
 
-/// 向设备全部在线会话推 ota_update（跨节点逐 session 发送）。
-async fn notify_ota_update(
+/// 校验并加载待绑定的包：同租户（403）、类型/档案一致且有数据（400）。
+async fn load_bindable(
     state: &AppState,
-    device_id: Uuid,
-    ota_type: OtaPackageType,
-    package: Option<&OtaPackage>,
-) -> TbResult<()> {
-    let sessions = state.device_sessions.any_sessions(device_id).await?;
-    if sessions.is_empty() {
-        return Ok(());
-    }
-    let producer = state.queue_producer().await?;
-    for session in sessions {
-        let msg = core_pb::ToTransportMsg {
-            session_id: session.session_id.clone(),
-            entity_id: device_id.to_string(),
-            msg: Some(core_pb::to_transport_msg::Msg::OtaUpdate(
-                core_pb::OtaUpdateNotification {
-                    ota_type: ota_type as i32,
-                    ota_package: package.map(crate::transport_api::ota_proto),
-                },
-            )),
-        };
-        let topic = TbTopic::transport_notifications(&session.node_id);
-        producer
-            .send(
-                &topic,
-                &session.session_id,
-                Bytes::from(msg.encode_to_vec()),
-            )
-            .await
-            .map_err(TbError::internal)?;
-    }
-    Ok(())
+    user: &AuthUser,
+    ota_id: Uuid,
+    kind: OtaKind,
+    profile_id: Uuid,
+) -> TbResult<OtaPackage> {
+    let package = load_ota(state, ota_id).await?;
+    check_tenant_scope(user, package.tenant_id)?;
+    crate::ota::validate_binding(&package, kind, user.0.tenant_id, profile_id)?;
+    Ok(package)
 }
 
-async fn assign_device_ota(
+/// 设备级绑定（None = 解绑，回落到档案绑定）；生效包变化时同步回写状态。
+async fn bind_device_ota(
     state: &AppState,
     user: &AuthUser,
     device_id: Uuid,
-    ota_id: Uuid,
-    ota_type: OtaPackageType,
+    ota_id: Option<Uuid>,
+    kind: OtaKind,
 ) -> TbResult<()> {
     let mut device = crate::routes::device::load_device(state, device_id).await?;
     check_tenant_scope(user, device.tenant_id)?;
-    let package = load_ota(state, ota_id).await?;
-    check_tenant_scope(user, package.tenant_id)?;
-    match ota_type {
-        OtaPackageType::Firmware => device.firmware_id = Some(ota_id),
-        OtaPackageType::Software => device.software_id = Some(ota_id),
-        _ => return Err(TbError::InvalidInput("bad ota type".into())),
+    if let Some(ota_id) = ota_id {
+        load_bindable(state, user, ota_id, kind, device.device_profile_id).await?;
     }
-    state.device_dao.save(&device).await?;
-    notify_ota_update(state, device_id, ota_type, Some(&package)).await
+    let profile = state
+        .device_profile_dao
+        .find_by_id(device.device_profile_id)
+        .await?;
+    let previous = crate::ota::effective_binding(kind, &device, profile.as_ref());
+    kind.set_device_binding(&mut device, ota_id);
+    let saved = state.device_dao.save(&device).await?;
+    crate::ota::sync_device(state, &saved, kind, previous).await
 }
 
 async fn assign_device_firmware(
@@ -313,7 +312,7 @@ async fn assign_device_firmware(
     Path((device_id, ota_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
     require_authority(&user, &[Authority::TenantAdmin])?;
-    assign_device_ota(&state, &user, device_id, ota_id, OtaPackageType::Firmware).await?;
+    bind_device_ota(&state, &user, device_id, Some(ota_id), OtaKind::Firmware).await?;
     Ok(StatusCode::OK)
 }
 
@@ -323,16 +322,37 @@ async fn assign_device_software(
     Path((device_id, ota_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
     require_authority(&user, &[Authority::TenantAdmin])?;
-    assign_device_ota(&state, &user, device_id, ota_id, OtaPackageType::Software).await?;
+    bind_device_ota(&state, &user, device_id, Some(ota_id), OtaKind::Software).await?;
     Ok(StatusCode::OK)
 }
 
-async fn assign_profile_ota(
+async fn unassign_device_firmware(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(device_id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    require_authority(&user, &[Authority::TenantAdmin])?;
+    bind_device_ota(&state, &user, device_id, None, OtaKind::Firmware).await?;
+    Ok(StatusCode::OK)
+}
+
+async fn unassign_device_software(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(device_id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    require_authority(&user, &[Authority::TenantAdmin])?;
+    bind_device_ota(&state, &user, device_id, None, OtaKind::Software).await?;
+    Ok(StatusCode::OK)
+}
+
+/// 档案级绑定（None = 解绑）；继承该绑定的设备在后台同步回写状态。
+async fn bind_profile_ota(
     state: &AppState,
     user: &AuthUser,
     profile_id: Uuid,
-    ota_id: Uuid,
-    ota_type: OtaPackageType,
+    ota_id: Option<Uuid>,
+    kind: OtaKind,
 ) -> TbResult<()> {
     let mut profile = state
         .device_profile_dao
@@ -340,16 +360,14 @@ async fn assign_profile_ota(
         .await?
         .ok_or_else(|| TbError::NotFound(format!("device profile {profile_id}")))?;
     check_tenant_scope(user, profile.tenant_id)?;
-    let package = load_ota(state, ota_id).await?;
-    check_tenant_scope(user, package.tenant_id)?;
-    match ota_type {
-        OtaPackageType::Firmware => profile.firmware_id = Some(ota_id),
-        OtaPackageType::Software => profile.software_id = Some(ota_id),
-        _ => return Err(TbError::InvalidInput("bad ota type".into())),
+    if let Some(ota_id) = ota_id {
+        load_bindable(state, user, ota_id, kind, profile_id).await?;
     }
+    let previous = kind.profile_binding(&profile);
+    kind.set_profile_binding(&mut profile, ota_id);
     state.device_profile_dao.save(&profile).await?;
-    for device_id in state.device_dao.find_ids_by_profile_id(profile_id).await? {
-        notify_ota_update(state, device_id, ota_type, Some(&package)).await?;
+    if previous != ota_id {
+        crate::ota::spawn_profile_sync(state, profile_id, kind, previous);
     }
     Ok(())
 }
@@ -360,7 +378,7 @@ async fn assign_profile_firmware(
     Path((profile_id, ota_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
     require_authority(&user, &[Authority::TenantAdmin])?;
-    assign_profile_ota(&state, &user, profile_id, ota_id, OtaPackageType::Firmware).await?;
+    bind_profile_ota(&state, &user, profile_id, Some(ota_id), OtaKind::Firmware).await?;
     Ok(StatusCode::OK)
 }
 
@@ -370,7 +388,27 @@ async fn assign_profile_software(
     Path((profile_id, ota_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
     require_authority(&user, &[Authority::TenantAdmin])?;
-    assign_profile_ota(&state, &user, profile_id, ota_id, OtaPackageType::Software).await?;
+    bind_profile_ota(&state, &user, profile_id, Some(ota_id), OtaKind::Software).await?;
+    Ok(StatusCode::OK)
+}
+
+async fn unassign_profile_firmware(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(profile_id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    require_authority(&user, &[Authority::TenantAdmin])?;
+    bind_profile_ota(&state, &user, profile_id, None, OtaKind::Firmware).await?;
+    Ok(StatusCode::OK)
+}
+
+async fn unassign_profile_software(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(profile_id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    require_authority(&user, &[Authority::TenantAdmin])?;
+    bind_profile_ota(&state, &user, profile_id, None, OtaKind::Software).await?;
     Ok(StatusCode::OK)
 }
 

@@ -96,6 +96,24 @@ impl DeviceDao {
             .map_err(TbError::db)
     }
 
+    /// 该档案下没有设备级 OTA 绑定、继承档案绑定的设备。
+    pub async fn find_ids_inheriting_ota(
+        &self,
+        device_profile_id: Uuid,
+        software: bool,
+    ) -> TbResult<Vec<Uuid>> {
+        let sql = if software {
+            "SELECT id FROM device WHERE device_profile_id = $1 AND software_id IS NULL"
+        } else {
+            "SELECT id FROM device WHERE device_profile_id = $1 AND firmware_id IS NULL"
+        };
+        sqlx::query_scalar(sql)
+            .bind(device_profile_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(TbError::db)
+    }
+
     pub async fn delete_by_id(&self, id: Uuid) -> TbResult<bool> {
         let res = sqlx::query("DELETE FROM device WHERE id = $1")
             .bind(id)
