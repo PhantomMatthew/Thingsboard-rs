@@ -10,4 +10,5 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 moka = { workspace = true, features = ["sync"] }
+regex = "1"
 tb-common = { path = "../tb-common" }

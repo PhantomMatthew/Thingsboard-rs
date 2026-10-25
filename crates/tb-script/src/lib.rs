@@ -2,11 +2,12 @@
 //! 编译结果按脚本内容缓存（容量 1000）；执行限制 max_operations=100_000，表达式深度
 //! 32（函数体内 16）、调用栈 16 层，与构建模式无关。
 //! Rhai 默认不带文件/系统 IO，本 crate 也不注册任何危险 API。
-//! `print`/`debug` 输出每行截断到 512 字符并转义控制字符，每个引擎每秒最多 20 行，
-//! 超出部分丢弃，并在下一条放行日志前以 warn 汇报丢弃条数。
+//! `print`/`debug` 输出先遮蔽口令/token/密钥类键值、Bearer 与 JWT，再截断到 512 字符并
+//! 转义控制字符；每个引擎每秒最多 20 行，超出部分丢弃，并在下一条放行日志前以 warn
+//! 汇报丢弃条数。
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use rhai::{Dynamic, Engine, Scope};
@@ -91,9 +92,27 @@ impl ScriptLogLimiter {
     }
 }
 
+static SENSITIVE_VALUE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r#"(?i)\b((?:access_?|refresh_?|auth_?)?token|password|passwd|pwd|(?:client_?)?secret|api_?key|authorization|credentials(?:_?value)?)(["']?\s*[:=]\s*["']?)[^\s"',;}\]]+"#,
+    )
+    .unwrap()
+});
+static BEARER_OR_JWT: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+|\beyJ[A-Za-z0-9_.-]{10,}").unwrap()
+});
+
 fn sanitize_log_line(line: &str) -> String {
-    let mut out = String::with_capacity(line.len().min(MAX_LOG_LINE_CHARS));
-    let mut chars = line.chars();
+    // 只扫描有界前缀；截断点之后的内容本就不输出。
+    let prefix_end = line
+        .char_indices()
+        .nth(2 * MAX_LOG_LINE_CHARS)
+        .map_or(line.len(), |(i, _)| i);
+    let redacted = BEARER_OR_JWT.replace_all(&line[..prefix_end], "***");
+    let redacted = SENSITIVE_VALUE.replace_all(&redacted, "$1$2***");
+    let truncated_input = prefix_end < line.len();
+    let mut out = String::with_capacity(redacted.len().min(MAX_LOG_LINE_CHARS));
+    let mut chars = redacted.chars();
     for c in chars.by_ref().take(MAX_LOG_LINE_CHARS) {
         if c.is_control() {
             out.extend(c.escape_default());
@@ -101,7 +120,7 @@ fn sanitize_log_line(line: &str) -> String {
             out.push(c);
         }
     }
-    if chars.next().is_some() {
+    if chars.next().is_some() || truncated_input {
         out.push_str("...[truncated]");
     }
     out
@@ -599,6 +618,38 @@ mod tests {
             sanitize_log_line(&"x".repeat(MAX_LOG_LINE_CHARS)).len(),
             512
         );
+    }
+
+    #[test]
+    fn log_lines_redact_credentials() {
+        assert_eq!(
+            sanitize_log_line(r#"#{"password": "hunter2", "accessToken": "A1B2", "t": 21}"#),
+            r#"#{"password": "***", "accessToken": "***", "t": 21}"#
+        );
+        assert_eq!(
+            sanitize_log_line("api_key=abc123; secret: s3cr3t user=bob"),
+            "api_key=***; secret: *** user=bob"
+        );
+        assert_eq!(
+            sanitize_log_line("Authorization Bearer abc.def-ghi"),
+            "Authorization ***"
+        );
+        assert_eq!(
+            sanitize_log_line("Authorization: Bearer abc.def-ghi"),
+            "Authorization: ***"
+        );
+        assert_eq!(
+            sanitize_log_line("jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig done"),
+            "jwt *** done"
+        );
+        let padded = format!("{} token={}", "x".repeat(500), "v".repeat(600));
+        let sanitized = sanitize_log_line(&padded);
+        assert!(
+            !sanitized.contains('v'),
+            "secret crossing the cut is masked"
+        );
+        assert!(sanitized.ends_with("...[truncated]"));
+        assert_eq!(sanitize_log_line("temperature=21"), "temperature=21");
     }
 
     #[test]

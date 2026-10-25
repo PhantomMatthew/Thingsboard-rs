@@ -3353,6 +3353,7 @@ name = "tb-script"
 version = "0.1.0"
 dependencies = [
  "moka",
+ "regex",
  "rhai",
  "serde_json",
  "tb-common",
