@@ -54,7 +54,7 @@ pub use rule_node_delay::{DelayEnqueueResult, DelayTask, DelayTaskState, RuleNod
 pub use sqlx::PgPool;
 pub use tenant::{TenantDao, TenantProfileDao};
 pub use timeseries::{Aggregation, TimeseriesDao, TsDeleteResult};
-pub use user::{UserCredentialsDao, UserDao};
+pub use user::{LoginAttempt, UserCredentialsDao, UserDao};
 
 /// 连接中断、连接池耗尽、事务冲突与资源不足等可重试的数据库故障；
 /// 约束冲突、数据格式等错误重试也不会成功，返回 false。

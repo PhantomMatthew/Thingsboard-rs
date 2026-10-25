@@ -1,4 +1,4 @@
-//! 认证服务：登录 / 刷新 / 改密，含登录失败锁定（内存 TTL map）。
+//! 认证服务：登录 / 刷新 / 改密，含登录失败锁定（PostgreSQL 原子计数与锁定期，跨实例共享）。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,13 +7,13 @@ use serde::Serialize;
 use sqlx::PgPool;
 use tb_common::{TbError, TbResult};
 use tb_dao::models::{User, UserCredentials};
-use tb_dao::{UserCredentialsDao, UserDao};
+use tb_dao::{LoginAttempt, UserCredentialsDao, UserDao};
 use uuid::Uuid;
 
 use crate::password::{hash_password, verify_password};
 use crate::token::{JwtTokenFactory, SecurityUser, TokenType};
 
-const MAX_FAILED_ATTEMPTS: u32 = 5;
+const MAX_FAILED_ATTEMPTS: i32 = 5;
 const LOCK_DURATION: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone, Serialize)]
@@ -30,8 +30,6 @@ pub struct AuthService {
     pub(crate) pool: PgPool,
     /// OAuth2 code 换 token / userinfo 拉取（5s 超时）。
     pub(crate) http: reqwest::Client,
-    /// user_id → 锁定期内存在记录即视为锁定。
-    lockout: moka::future::Cache<Uuid, ()>,
 }
 
 impl AuthService {
@@ -46,9 +44,6 @@ impl AuthService {
                 .build()
                 .expect("valid oauth2 HTTP client configuration"),
             pool,
-            lockout: moka::future::Cache::builder()
-                .time_to_live(LOCK_DURATION)
-                .build(),
         })
     }
 
@@ -59,19 +54,17 @@ impl AuthService {
     pub async fn login(&self, email: &str, password: &str) -> TbResult<TokenPair> {
         let authenticated_at = chrono::Utc::now().timestamp_millis();
         let invalid = || TbError::Unauthenticated("invalid username or password".into());
+        let locked = || {
+            TbError::RateLimitExceeded(format!(
+                "account locked for {} minutes due to too many failed attempts",
+                LOCK_DURATION.as_secs() / 60
+            ))
+        };
         let user = self
             .user_dao
             .find_by_email(email)
             .await?
             .ok_or_else(invalid)?;
-
-        if self.lockout.get(&user.id).await.is_some() {
-            return Err(TbError::RateLimitExceeded(format!(
-                "account locked for {} minutes due to too many failed attempts",
-                LOCK_DURATION.as_secs() / 60
-            )));
-        }
-
         let creds = self
             .creds_dao
             .find_by_user_id(user.id)
@@ -83,26 +76,37 @@ impl AuthService {
             ));
         }
         let hash = creds.password.clone().ok_or_else(invalid)?;
+
+        let lock_until = || authenticated_at.saturating_add(LOCK_DURATION.as_millis() as i64);
+        let attempt = self
+            .creds_dao
+            .reserve_login_attempt(user.id, authenticated_at, MAX_FAILED_ATTEMPTS, lock_until())
+            .await?;
+        if attempt == LoginAttempt::Locked {
+            return Err(locked());
+        }
         if !verify_password(password, &hash)? {
-            self.register_failure(user.id).await?;
+            self.creds_dao
+                .lock_if_exhausted(user.id, MAX_FAILED_ATTEMPTS, lock_until())
+                .await?;
             return Err(invalid());
         }
 
-        let creds = self
+        match self
             .creds_dao
-            .record_login_success(user.id, chrono::Utc::now().timestamp_millis(), &hash)
+            .record_login_success(user.id, authenticated_at, &hash)
             .await?
-            .ok_or_else(invalid)?;
-        self.issue_tokens_for_credentials(&user, &creds, authenticated_at)
-    }
-
-    async fn register_failure(&self, user_id: Uuid) -> TbResult<()> {
-        let failures = self.creds_dao.record_login_failure(user_id).await?;
-        if failures as u32 >= MAX_FAILED_ATTEMPTS {
-            self.lockout.insert(user_id, ()).await;
-            self.creds_dao.reset_failed_login_attempts(user_id).await?;
+        {
+            Some(creds) => self.issue_tokens_for_credentials(&user, &creds, authenticated_at),
+            None if self
+                .creds_dao
+                .is_login_locked(user.id, authenticated_at)
+                .await? =>
+            {
+                Err(locked())
+            }
+            None => Err(invalid()),
         }
-        Ok(())
     }
 
     pub async fn refresh(&self, refresh_token: &str) -> TbResult<TokenPair> {

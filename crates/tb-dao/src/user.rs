@@ -153,6 +153,12 @@ pub struct UserCredentialsDao {
     pool: PgPool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginAttempt {
+    Allowed,
+    Locked,
+}
+
 impl UserCredentialsDao {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -186,6 +192,7 @@ impl UserCredentialsDao {
         .map_err(TbError::db)
     }
 
+    /// 登录成功：仅在启用、密码未变且未处于锁定期时清零失败计数。
     pub async fn record_login_success(
         &self,
         user_id: Uuid,
@@ -194,7 +201,8 @@ impl UserCredentialsDao {
     ) -> TbResult<Option<UserCredentials>> {
         sqlx::query_as::<_, UserCredentials>(
             "UPDATE user_credentials SET failed_login_attempts=0, last_login_ts=$2 \
-             WHERE user_id=$1 AND enabled AND password=$3 RETURNING *",
+             WHERE user_id=$1 AND enabled AND password=$3 \
+             AND (locked_until IS NULL OR locked_until <= $2) RETURNING *",
         )
         .bind(user_id)
         .bind(last_login_ts)
@@ -204,24 +212,66 @@ impl UserCredentialsDao {
         .map_err(TbError::db)
     }
 
-    pub async fn record_login_failure(&self, user_id: Uuid) -> TbResult<i32> {
-        sqlx::query_scalar(
-            "UPDATE user_credentials SET failed_login_attempts=failed_login_attempts+1 \
-             WHERE user_id=$1 RETURNING failed_login_attempts",
+    /// 校验密码前原子预占一次尝试（计数先加，成功后清零）：锁定期内拒绝；
+    /// 未决尝试已达上限时就地上锁并拒绝，跨实例并发也不会超出尝试预算。
+    pub async fn reserve_login_attempt(
+        &self,
+        user_id: Uuid,
+        now: i64,
+        max_attempts: i32,
+        lock_until: i64,
+    ) -> TbResult<LoginAttempt> {
+        let locked_until: Option<Option<i64>> = sqlx::query_scalar(
+            "UPDATE user_credentials SET \
+             failed_login_attempts = CASE WHEN failed_login_attempts >= $3 THEN 0 \
+                                          ELSE failed_login_attempts + 1 END, \
+             locked_until = CASE WHEN failed_login_attempts >= $3 THEN $4 ELSE locked_until END \
+             WHERE user_id=$1 AND (locked_until IS NULL OR locked_until <= $2) \
+             RETURNING locked_until",
         )
         .bind(user_id)
+        .bind(now)
+        .bind(max_attempts)
+        .bind(lock_until)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(TbError::db)?;
+        Ok(match locked_until {
+            Some(until) if until.is_none_or(|until| until <= now) => LoginAttempt::Allowed,
+            _ => LoginAttempt::Locked,
+        })
+    }
+
+    /// 预占的尝试密码错误：失败数已达上限则上锁并清零，返回是否上锁。
+    pub async fn lock_if_exhausted(
+        &self,
+        user_id: Uuid,
+        max_attempts: i32,
+        lock_until: i64,
+    ) -> TbResult<bool> {
+        let res = sqlx::query(
+            "UPDATE user_credentials SET failed_login_attempts=0, locked_until=$3 \
+             WHERE user_id=$1 AND failed_login_attempts >= $2",
+        )
+        .bind(user_id)
+        .bind(max_attempts)
+        .bind(lock_until)
+        .execute(&self.pool)
+        .await
+        .map_err(TbError::db)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    pub async fn is_login_locked(&self, user_id: Uuid, now: i64) -> TbResult<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM user_credentials \
+             WHERE user_id=$1 AND locked_until > $2)",
+        )
+        .bind(user_id)
+        .bind(now)
         .fetch_one(&self.pool)
         .await
         .map_err(TbError::db)
-    }
-
-    pub async fn reset_failed_login_attempts(&self, user_id: Uuid) -> TbResult<()> {
-        sqlx::query("UPDATE user_credentials SET failed_login_attempts=0 WHERE user_id=$1")
-            .bind(user_id)
-            .execute(&self.pool)
-            .await
-            .map_err(TbError::db)?;
-        Ok(())
     }
 
     pub async fn update_password(

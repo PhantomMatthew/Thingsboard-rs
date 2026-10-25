@@ -168,6 +168,77 @@ async fn password_change_rejects_old_refresh_and_accepts_new_login() -> TbResult
 }
 
 #[tokio::test]
+async fn login_lockout_is_shared_across_instances_and_restarts() -> TbResult<()> {
+    let pool = setup().await;
+    let (user, _) = create_user(&pool, true).await?;
+    let instances = [auth_service(&pool), auth_service(&pool)];
+
+    // 未达上限时成功登录清零计数。
+    for i in 0..4 {
+        let err = instances[i % 2]
+            .login(&user.email, "wrong-password")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TbError::Unauthenticated(_)), "{err:?}");
+    }
+    instances[0].login(&user.email, OLD_PASSWORD).await?;
+
+    // 交替实例连续 5 次失败：两个实例及新实例（重启）连正确密码也拒绝。
+    for i in 0..5 {
+        let err = instances[i % 2]
+            .login(&user.email, "wrong-password")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TbError::Unauthenticated(_)), "{err:?}");
+    }
+    for auth in [&instances[0], &instances[1], &auth_service(&pool)] {
+        let err = auth.login(&user.email, OLD_PASSWORD).await.unwrap_err();
+        assert!(matches!(err, TbError::RateLimitExceeded(_)), "{err:?}");
+    }
+
+    // 锁定期过后恢复。
+    sqlx::query("UPDATE user_credentials SET locked_until = 1 WHERE user_id = $1")
+        .bind(user.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    instances[1].login(&user.email, OLD_PASSWORD).await?;
+
+    delete_user_tenant(&pool, &user).await
+}
+
+#[tokio::test]
+async fn concurrent_wrong_passwords_cannot_exceed_attempt_budget() -> TbResult<()> {
+    let pool = setup().await;
+    let (user, _) = create_user(&pool, true).await?;
+    let instances = [auth_service(&pool), auth_service(&pool)];
+
+    let mut attempts = tokio::task::JoinSet::new();
+    for i in 0..20 {
+        let auth = instances[i % 2].clone();
+        let email = user.email.clone();
+        attempts.spawn(async move { auth.login(&email, "wrong-password").await });
+    }
+    let (mut verified, mut locked) = (0, 0);
+    while let Some(result) = attempts.join_next().await {
+        match result.unwrap().unwrap_err() {
+            TbError::Unauthenticated(_) => verified += 1,
+            TbError::RateLimitExceeded(_) => locked += 1,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert!(verified <= 5, "{verified} wrong passwords were verified");
+    assert_eq!(verified + locked, 20);
+    let err = instances[0]
+        .login(&user.email, OLD_PASSWORD)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TbError::RateLimitExceeded(_)), "{err:?}");
+
+    delete_user_tenant(&pool, &user).await
+}
+
+#[tokio::test]
 async fn access_token_uses_current_identity_and_rejects_deleted_user() -> TbResult<()> {
     let pool = setup().await;
     let auth = auth_service(&pool);
